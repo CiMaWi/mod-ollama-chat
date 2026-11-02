@@ -613,6 +613,9 @@ OllamaChat.SentimentPromptTemplate = "Your relationship sentiment with {player_n
 # --------------------------------------------
 # CHAT/PROMPT TEMPLATES
 # --------------------------------------------
+# NOTE (since F2): the numeric placeholders ({player_distance}, {bot_gold}, {player_gold}, {level_gap}, levels, bank gold,
+# free slots, ...) are passed as text at every strictness level, so a numeric format spec in a custom template
+# such as {bot_gold:d} or {player_distance:.0f} no longer formats. Plain {name} placeholders work.
 
 # OllamaChat.ChatPromptTemplate
 #   Description: The main template for bot chat prompts sent to the LLM.
