@@ -192,10 +192,10 @@ namespace
                            fmt::arg("player_name", subject->GetName()),
                            fmt::arg("player_class", ClassName(subject)),
                            fmt::arg("player_race", RaceName(subject)),
-                           fmt::arg("player_level", subject->GetLevel()),
+                           fmt::arg("player_level", Roleplay_LevelText(subject->GetLevel())),
                            fmt::arg("player_state", DescribePlayerState(subject)),
-                           fmt::arg("level_gap",
-                                    int32(subject->GetLevel()) - int32(bot->GetLevel()))));
+                           fmt::arg("level_gap", Roleplay_LevelGapText(int32(subject->GetLevel()) -
+                                                                       int32(bot->GetLevel())))));
         }
 
         // Group members by name and what they are doing.
@@ -217,7 +217,7 @@ namespace
                                fmt::arg("member_name", m->GetName()),
                                fmt::arg("member_class", ClassName(m)),
                                fmt::arg("member_state", DescribePlayerState(m)),
-                               fmt::arg("member_level", m->GetLevel())));
+                               fmt::arg("member_level", Roleplay_LevelText(m->GetLevel()))));
             }
 
             // Somebody in the group needs something.
@@ -260,7 +260,7 @@ namespace
                     SafeFormat(PickOne(g_EnvCommentGuildMemberOnline),
                                fmt::arg("member_name", g->GetName()),
                                fmt::arg("member_class", ClassName(g)),
-                               fmt::arg("member_level", g->GetLevel())));
+                               fmt::arg("member_level", Roleplay_LevelText(g->GetLevel()))));
             }
         }
 
@@ -334,9 +334,9 @@ namespace
             Add(out, TopicCategory::World, key, list,
                 SafeFormat(PickOne(list),
                            fmt::arg("creature_name", interesting->GetName()),
-                           fmt::arg("creature_level", interesting->GetLevel()),
-                           fmt::arg("level_delta",
-                                    int32(interesting->GetLevel()) - int32(bot->GetLevel()))));
+                           fmt::arg("creature_level", Roleplay_LevelText(interesting->GetLevel())),
+                           fmt::arg("level_delta", Roleplay_LevelGapText(int32(interesting->GetLevel()) -
+                                                                         int32(bot->GetLevel())))));
 
             // A meaningfully stronger enemy nearby is worth its own remark.
             if (!interesting->isDead() && interesting->IsHostileTo(bot) &&
@@ -346,8 +346,8 @@ namespace
                 Add(out, TopicCategory::Activity, "danger", g_EnvCommentDanger,
                     SafeFormat(PickOne(g_EnvCommentDanger),
                                fmt::arg("creature_name", interesting->GetName()),
-                               fmt::arg("level_delta",
-                                        int32(interesting->GetLevel()) - int32(bot->GetLevel()))));
+                               fmt::arg("level_delta", Roleplay_LevelGapText(int32(interesting->GetLevel()) -
+                                                                             int32(bot->GetLevel())))));
             }
         }
 
@@ -602,7 +602,8 @@ namespace
                     ++freeSlots;
 
             Add(out, TopicCategory::Self, "bag_slots", g_EnvCommentBagSlots,
-                SafeFormat(PickOne(g_EnvCommentBagSlots), fmt::arg("bag_slots", freeSlots)));
+                SafeFormat(PickOne(g_EnvCommentBagSlots),
+                           fmt::arg("bag_slots", Roleplay_BagSlotsText(freeSlots))));
         }
     }
 
@@ -627,7 +628,8 @@ namespace
 
         addGuild("guild_bank", g_GuildEnvCommentGuildBank,
                  SafeFormat(PickOne(g_GuildEnvCommentGuildBank),
-                            fmt::arg("bank_gold", guild->GetTotalBankMoney() / 10000)));
+                            fmt::arg("bank_gold", Roleplay_GoldText(
+                                static_cast<uint32_t>(guild->GetTotalBankMoney() / 10000)))));
 
         addGuild("guild_raid",      g_GuildEnvCommentGuildRaid,      PickOne(g_GuildEnvCommentGuildRaid));
         addGuild("guild_endgame",   g_GuildEnvCommentGuildEndgame,   PickOne(g_GuildEnvCommentGuildEndgame));

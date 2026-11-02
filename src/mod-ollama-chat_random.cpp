@@ -144,7 +144,7 @@ namespace
         std::string prompt = SafeFormat(
             g_RandomChatterPromptTemplate,
             fmt::arg("bot_name", bot->GetName()),
-            fmt::arg("bot_level", bot->GetLevel()),
+            fmt::arg("bot_level", Roleplay_LevelText(bot->GetLevel())),
             fmt::arg("bot_class", botAI->GetChatHelper()->FormatClass(bot->getClass())),
             fmt::arg("bot_race", botAI->GetChatHelper()->FormatRace(bot->getRace())),
             fmt::arg("bot_gender", bot->getGender() == 0 ? "Male" : "Female"),

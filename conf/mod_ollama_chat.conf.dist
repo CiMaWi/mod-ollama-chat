@@ -1477,6 +1477,29 @@ OllamaChat.Roleplay.Enable = 0
 #        2 = Hard in character. The roleplay chatter lists replace the shipped
 #            out-of-character ones, injuries and distances are described rather
 #            than quoted as figures, and think mode is used where supported.
+#        3 = In world. As 2, plus:
+#            - the built-in "stay in character" instruction is worded without
+#              naming servers, specs or experience points (a small model tends
+#              to talk about whatever a prompt names);
+#            - numeric placeholders become words in every template:
+#                {bot_level} {player_level} {member_level} {creature_level}
+#                    -> fresh-faced, green, capable, tested, seasoned,
+#                       hardened, veteran, battle-worn, renowned
+#                    (an adjective: write "a {bot_level} {bot_class}")
+#                {level_gap} {level_delta}
+#                    -> far weaker than you ... far stronger than you
+#                {bot_gold} {player_gold} {bank_gold}
+#                    -> an empty purse ... a small fortune
+#                {player_distance}
+#                    -> right beside you ... far off
+#                {bag_slots}
+#                    -> no room left in your packs ... plenty of room
+#              The shipped templates below say "Level: {bot_level}" and
+#              "{level_delta} levels above you"; rewrite them in-world when you
+#              use 3. These placeholders are text then, so a format spec such
+#              as {player_distance:.0f} does not apply to them.
+#            - the level-up event carries the word, not the number.
+#            The chat snapshot (EnableChatBotSnapshotTemplate) is not covered.
 #        Default: 1
 OllamaChat.Roleplay.Strictness = 1
 

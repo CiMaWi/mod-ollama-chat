@@ -118,7 +118,8 @@ namespace
         if (type == g_EventTypeCompletedQuest)
             return SafeFormat("{} finished the task '{}'", actor, detail);
         if (type == g_EventTypeLeveledUp)
-            return SafeFormat("{} grew stronger, now level {}", actor, detail);
+            return Roleplay_InWorld() ? SafeFormat("{} grew stronger", actor)
+                                      : SafeFormat("{} grew stronger, now level {}", actor, detail);
         if (type == g_EventTypeAchievement)
             return SafeFormat("{} earned recognition for {}", actor, detail);
         if (type == g_EventTypeWonDuel)
@@ -317,7 +318,7 @@ std::string OllamaBotEventChatter::BuildPrompt(Player* bot, std::string promptTe
     std::string prompt = SafeFormat(
         promptTemplate,
         fmt::arg("bot_name", bot->GetName()),
-        fmt::arg("bot_level", bot->GetLevel()),
+        fmt::arg("bot_level", Roleplay_LevelText(bot->GetLevel())),
         fmt::arg("bot_class", ai->GetChatHelper()->FormatClass(bot->getClass())),
         fmt::arg("bot_race", ai->GetChatHelper()->FormatRace(bot->getRace())),
         fmt::arg("bot_gender", bot->getGender() == GENDER_MALE ? "Male" : "Female"),
@@ -482,7 +483,8 @@ void ChatOnLevelUp::OnPlayerLevelChanged(Player* player, uint8 /*oldLevel*/)
     if (!player)
         return;
 
-    const std::string level = std::to_string(player->GetLevel());
+    // In-world mode carries a word ("seasoned"), not the number, into the event prompt.
+    const std::string level = Roleplay_LevelText(player->GetLevel());
     eventChatter.DispatchGameEvent(player, g_EventTypeLeveledUp, level);
 
     if (player->GetGuild() && g_EnableGuildEventChatter && !g_GuildEventTypeLevelUp.empty())

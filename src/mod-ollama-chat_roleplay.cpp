@@ -193,14 +193,23 @@ std::string Roleplay_BuildVoicePrompt(Player* bot)
             out += " " + it->second;
     }
 
-    if (g_RoleplayStrictness >= 1)
+    if (g_RoleplayStrictness >= 3)
+    {
+        // In-world wording. The older lines below name the very things they
+        // forbid, and a small model tends to pick up whatever a prompt names.
+        out += " Stay in character at all times. You live in this world and know nothing beyond "
+               "it. Speak only of what a person here could see, hear, remember or believe.";
+        out += " Describe wounds, distances, wealth and danger the way a person would, in plain "
+               "words and never as figures. Do not break character for any reason.";
+    }
+    else if (g_RoleplayStrictness >= 1)
     {
         out += " Stay in character at all times. You are a person living in this world, not a "
                "player of a game: never mention servers, patches, classes as 'specs', damage "
                "numbers, experience points, or anything outside the world itself.";
     }
 
-    if (g_RoleplayStrictness >= 2)
+    if (g_RoleplayStrictness == 2)
     {
         out += " Describe injuries, distances and dangers the way a person would, never as "
                "figures. Do not break character for any reason.";
@@ -288,4 +297,76 @@ bool Roleplay_UseRoleplayVariations()
 {
     return g_RoleplayEnable && g_RoleplayStrictness >= 2 &&
            !g_RoleplayPromptVariations.empty();
+}
+
+bool Roleplay_InWorld()
+{
+    return g_RoleplayEnable && g_RoleplayStrictness >= 3;
+}
+
+// The phrases below start with a consonant so a template can write
+// "a {bot_level} {bot_class}" without an article mismatch.
+std::string Roleplay_LevelText(uint32_t level)
+{
+    if (!Roleplay_InWorld())
+        return fmt::format("{}", level);
+
+    if (level < 10) return "fresh-faced";
+    if (level < 20) return "green";
+    if (level < 30) return "capable";
+    if (level < 40) return "tested";
+    if (level < 50) return "seasoned";
+    if (level < 60) return "hardened";
+    if (level < 70) return "veteran";
+    if (level < 80) return "battle-worn";
+    return "renowned";
+}
+
+std::string Roleplay_LevelGapText(int32_t gap)
+{
+    if (!Roleplay_InWorld())
+        return fmt::format("{}", gap);
+
+    if (gap <= -10) return "far weaker than you";
+    if (gap <= -3)  return "weaker than you";
+    if (gap < 3)    return "about as strong as you";
+    if (gap < 10)   return "stronger than you";
+    return "far stronger than you";
+}
+
+std::string Roleplay_GoldText(uint32_t gold)
+{
+    if (!Roleplay_InWorld())
+        return fmt::format("{}", gold);
+
+    if (gold == 0)    return "an empty purse";
+    if (gold < 10)    return "a few coins";
+    if (gold < 100)   return "a modest purse";
+    if (gold < 1000)  return "a comfortable purse";
+    if (gold < 10000) return "a heavy purse";
+    return "a small fortune";
+}
+
+std::string Roleplay_DistanceText(float yards)
+{
+    if (!Roleplay_InWorld())
+        return fmt::format("{}", yards);
+
+    if (yards < 0.0f)   return "somewhere out of sight";
+    if (yards < 5.0f)   return "right beside you";
+    if (yards < 15.0f)  return "close by";
+    if (yards < 40.0f)  return "a stone's throw away";
+    if (yards < 100.0f) return "a short walk away";
+    return "far off";
+}
+
+std::string Roleplay_BagSlotsText(uint32_t freeSlots)
+{
+    if (!Roleplay_InWorld())
+        return fmt::format("{}", freeSlots);
+
+    if (freeSlots == 0) return "no room left in your packs";
+    if (freeSlots < 4)  return "almost no room left in your packs";
+    if (freeSlots < 11) return "some room left in your packs";
+    return "plenty of room in your packs";
 }
