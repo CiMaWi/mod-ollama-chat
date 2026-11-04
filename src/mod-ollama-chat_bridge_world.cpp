@@ -2,9 +2,89 @@
 
 #include <algorithm>
 #include <limits>
+#include <utility>
 
 namespace OllamaBridge
 {
+std::atomic<std::size_t> DispatchSlot::_used{0};
+
+DispatchSlot::~DispatchSlot() { Release(); }
+DispatchSlot::DispatchSlot(DispatchSlot&& other) noexcept : _held(std::exchange(other._held, false)) {}
+
+DispatchSlot& DispatchSlot::operator=(DispatchSlot&& other) noexcept
+{
+    if (this != &other)
+    {
+        Release();
+        _held = std::exchange(other._held, false);
+    }
+    return *this;
+}
+
+void DispatchSlot::Release()
+{
+    if (std::exchange(_held, false))
+        --_used;
+}
+
+DispatchSlot DispatchSlot::Acquire()
+{
+    DispatchSlot slot;
+    auto used = _used.load();
+    while (used < MaxWorldPending)
+        if (_used.compare_exchange_weak(used, used + 1))
+        {
+            slot._held = true;
+            break;
+        }
+    return slot;
+}
+
+std::size_t DispatchSlot::Used() { return _used.load(); }
+
+bool DispatchGuardCurrent(WorldTicket const& ticket, DispatchGuard const& captured, DispatchGuard const& current,
+                          Clock now)
+{
+    if (!ticket.generation || Expired(ticket.request.deadline, now) || !(ticket.scope == captured.scope) ||
+        !(captured.scope == current.scope) || !current.humanSpeaker || !current.authority || !current.perceptible ||
+        !current.audienceOnline || !captured.humanSpeaker || !captured.authority || !captured.perceptible ||
+        !captured.audienceOnline || current.source == DispatchSource::Unsupported ||
+        current.source != captured.source || !current.speakerGuid || current.speakerGuid != captured.speakerGuid ||
+        current.speakerGuid != ticket.request.input.speakerGuid || current.groupGuid != captured.groupGuid ||
+        current.mapId != captured.mapId || current.instanceId != captured.instanceId || !current.phaseMask ||
+        current.phaseMask != captured.phaseMask || current.audience != captured.audience || current.audience.empty() ||
+        current.audience.size() > 40 || !std::is_sorted(current.audience.begin(), current.audience.end()) ||
+        current.audience.front() == 0 ||
+        std::adjacent_find(current.audience.begin(), current.audience.end()) != current.audience.end() ||
+        !std::binary_search(current.audience.begin(), current.audience.end(), current.speakerGuid) ||
+        !std::binary_search(current.audience.begin(), current.audience.end(), ticket.request.botGuid))
+        return false;
+    if (current.source == DispatchSource::Party)
+        return current.groupGuid && current.nonRaid && captured.nonRaid && ticket.scope.channel == "party";
+    return ticket.scope.channel == "direct";
+}
+
+TerminalAction DispatchTerminal(WorldOutcome outcome, bool addressedHuman)
+{
+    switch (outcome)
+    {
+        case WorldOutcome::Success:
+            return TerminalAction::Reply;
+        case WorldOutcome::Unavailable:
+        case WorldOutcome::Empty:
+        case WorldOutcome::Filtered:
+        case WorldOutcome::Malformed:
+        case WorldOutcome::Timeout:
+        case WorldOutcome::CircuitOpen:
+        case WorldOutcome::QueueFull:
+            return addressedHuman ? TerminalAction::Outage : TerminalAction::Silence;
+        default:
+            return TerminalAction::Silence;
+    }
+}
+
+char const* DispatchOutageText() { return "Give me a moment to gather my thoughts."; }
+
 bool WorldScope::operator==(WorldScope const& other) const
 {
     return version == other.version && instance == other.instance && provider == other.provider &&
@@ -163,7 +243,7 @@ bool WorldPolicy::Complete(WorldTicket const& ticket, WorldOutcome outcome, Cloc
     if (!Current(ticket, now))
         return false;
     auto& entry = _pending.at(ticket.request.requestId);
-    if (entry.stage == Stage::Completed || (entry.stage == Stage::Reserved && outcome != WorldOutcome::QueueFull))
+    if (entry.stage != Stage::Queued && !(entry.stage == Stage::Reserved && outcome == WorldOutcome::QueueFull))
         return false;
     if (outcome == WorldOutcome::Cancelled)
     {
@@ -178,8 +258,8 @@ bool WorldPolicy::Consume(WorldTicket const& ticket, Clock now)
 {
     if (!Current(ticket, now) || _pending.at(ticket.request.requestId).stage != Stage::Completed)
         return false;
-    _pending.erase(ticket.request.requestId);
-    return true;  // Caller still revalidates real game authority/perception immediately before effect.
+    _pending.at(ticket.request.requestId).stage = Stage::Consumed;
+    return true;  // Retain scope freshness until caller finishes all effects and cancels this claim.
 }
 
 void WorldPolicy::Cancel(WorldTicket const& ticket)

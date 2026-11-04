@@ -43,7 +43,8 @@ namespace
 
     struct Task
     {
-        TaskType          type = TaskType::ChatReply;
+        OllamaBridge::DispatchSlot bridgeSlot;
+        TaskType type = TaskType::ChatReply;
         OllamaChatRequest request;
 
         // Sentiment-only payload.
@@ -61,6 +62,9 @@ namespace
 
     struct Completion
     {
+        OllamaBridge::DispatchSlot bridgeSlot;
+        OllamaBridge::WorldOutcome bridgeOutcome = OllamaBridge::WorldOutcome::Cancelled;
+        bool bridgePrepared = false;
         OllamaChatRequest request;
         std::string       text;
         uint32_t          emoteId = 0;
@@ -81,6 +85,7 @@ namespace
 
     // Policy and selection are world-thread only; worker counters/tags carry no game references.
     OllamaBridge::WorldPolicy g_bridgeWorld;
+    OllamaBridgeObserver g_bridgeObserver = nullptr;
     std::atomic<uint64_t> g_bridgeGeneration{0};
     std::atomic<uint32_t> g_bridgeInFlight{0};
 
@@ -104,8 +109,50 @@ namespace
 
     // --- worker -----------------------------------------------------------
 
-    void RunChatTask(const Task& task)
+    OllamaBridge::WorldOutcome BridgeOutcome(OllamaApiResult const& api)
     {
+        using OllamaBridge::WorldOutcome;
+        if (api.ok)
+            return api.text.empty() ? WorldOutcome::Empty : WorldOutcome::Success;
+        if (api.error == "bridge_expired_or_invalid_request")
+            return WorldOutcome::Cancelled;
+        if (api.error == "bridge_circuit_open_or_inactive")
+            return WorldOutcome::CircuitOpen;
+        if (api.error == "bridge_invalid_response")
+            return WorldOutcome::Malformed;
+        return WorldOutcome::Unavailable;
+    }
+
+    void RunBridgeTask(Task& task)
+    {
+        Completion completion;
+        completion.bridgeSlot = std::move(task.bridgeSlot);
+        completion.request = std::move(task.request);
+        task.request = {};  // No retained payload can outlive publication under the transferred slot.
+        completion.deliverAt = Clock::now();
+        try
+        {
+            auto api = QueryOllamaBridge(completion.request.bridgeSettings, completion.request.bridgeTicket.request);
+            completion.bridgeOutcome = BridgeOutcome(api);
+            completion.text = std::move(api.text);
+        }
+        catch (...)
+        {
+            completion.bridgeOutcome = OllamaBridge::WorldOutcome::Unavailable;
+        }
+        // No cleanup, expression, filter, typing or reloadable config reads on this worker path.
+        std::lock_guard<std::mutex> lock(g_doneMutex);
+        if (completion.request.bridgeGeneration == g_bridgeGeneration.load())
+            g_done.push_back(std::move(completion));
+    }
+
+    void RunChatTask(Task& task)
+    {
+        if (task.request.bridgeGeneration)
+        {
+            RunBridgeTask(task);
+            return;
+        }
         OllamaApiResult api = QueryOllama(task.request.prompt, task.request.kind);
 
         if (!api.ok)
@@ -177,63 +224,118 @@ namespace
     {
         for (;;)
         {
-            Task task;
-
+            bool bridge = false;
             {
-                std::unique_lock<std::mutex> lock(g_queueMutex);
-                g_queueCv.wait(lock, [] { return !g_running || !g_queue.empty(); });
+                Task task;
 
-                if (!g_running && g_queue.empty())
-                    return;
-
-                task = std::move(g_queue.front());
-                g_queue.pop_front();
-                // Count before unlocking: retirement must not observe a false drain.
-                if (task.request.bridgeGeneration)
-                    ++g_bridgeInFlight;
-            }
-
-            ++g_inFlight;
-
-            try
-            {
-                switch (task.type)
                 {
-                    case TaskType::Sentiment:
-                        RunSentimentTask(task);
-                        break;
-                    case TaskType::Condense:
-                        Memory_RunCondensation(task.memoryBotGuid, task.memoryPrompt);
-                        break;
-                    case TaskType::Relationship:
-                        Memory_RunRelationshipUpdate(task.memoryBotGuid, task.memoryOtherGuid,
-                                                     task.memoryOtherName, task.memoryPrompt);
-                        break;
-                    default:
-                        RunChatTask(task);
-                        break;
-                }
-            }
-            catch (const std::exception& e)
-            {
-                RecordError(e.what());
-                LOG_ERROR("module.ollamachat", "[Ollama Chat] Worker exception: {}", e.what());
-            }
-            catch (...)
-            {
-                RecordError("unknown exception");
-                LOG_ERROR("module.ollamachat", "[Ollama Chat] Unknown worker exception.");
-            }
+                    std::unique_lock<std::mutex> lock(g_queueMutex);
+                    g_queueCv.wait(lock, [] { return !g_running || !g_queue.empty(); });
 
+                    if (!g_running && g_queue.empty())
+                        return;
+
+                    task = std::move(g_queue.front());
+                    g_queue.pop_front();
+                    // Count before unlocking: retirement must not observe a false drain.
+                    if (task.request.bridgeGeneration)
+                        ++g_bridgeInFlight;
+                }
+
+                bridge = task.request.bridgeGeneration != 0;
+                ++g_inFlight;
+
+                try
+                {
+                    switch (task.type)
+                    {
+                        case TaskType::Sentiment:
+                            RunSentimentTask(task);
+                            break;
+                        case TaskType::Condense:
+                            Memory_RunCondensation(task.memoryBotGuid, task.memoryPrompt);
+                            break;
+                        case TaskType::Relationship:
+                            Memory_RunRelationshipUpdate(task.memoryBotGuid, task.memoryOtherGuid, task.memoryOtherName,
+                                                         task.memoryPrompt);
+                            break;
+                        default:
+                            RunChatTask(task);
+                            break;
+                    }
+                }
+                catch (std::exception const& e)
+                {
+                    RecordError(e.what());
+                    LOG_ERROR("module.ollamachat", "[Ollama Chat] Worker exception: {}", e.what());
+                }
+                catch (...)
+                {
+                    RecordError("unknown exception");
+                    LOG_ERROR("module.ollamachat", "[Ollama Chat] Unknown worker exception.");
+                }
+            }  // Destroy task payload before releasing its slot or reporting actual worker drain.
             --g_inFlight;
-            if (task.request.bridgeGeneration)
+            if (bridge)
                 --g_bridgeInFlight;  // Real worker cleanup, independent of policy cancellation.
         }
     }
 
     // --- delivery (world thread only) -------------------------------------
 
-    Channel* ResolveChannel(Player* bot, const std::string& channelName)
+    bool BridgeCurrent(Completion const& c)
+    {
+        OllamaBridge::DispatchGuard current;
+        if (!g_bridgeObserver || c.request.bridgeGeneration != g_bridgeGeneration.load() ||
+            !g_bridgeObserver(c.request.bridgeTicket, current))
+            return false;
+        auto const now = OllamaBridge::Now();
+        return c.request.bridgeGeneration == g_bridgeGeneration.load() &&
+               g_bridgeWorld.Current(c.request.bridgeTicket, now) &&
+               OllamaBridge::DispatchGuardCurrent(c.request.bridgeTicket, c.request.bridgeGuard, current, now);
+    }
+
+    bool PrepareBridge(Completion& c)
+    {
+        using namespace OllamaBridge;
+        if (!BridgeCurrent(c))
+            return false;
+        if (c.bridgeOutcome == WorldOutcome::Success)
+        {
+            // Config-dependent cleanup stays on the world thread, after fresh authority/perception checks.
+            c.text = ProcessLlmResponse(c.text, c.request.botName, nullptr);
+            if (c.text.empty())
+                c.bridgeOutcome = WorldOutcome::Empty;
+            else
+            {
+                if (!BridgeCurrent(c))
+                    return false;
+                c.text = Roleplay_FilterMetaTerms(c.text);
+                if (c.text.empty())
+                    c.bridgeOutcome = WorldOutcome::Filtered;
+            }
+        }
+        auto const action = DispatchTerminal(c.bridgeOutcome, c.request.directAddress);
+        if (action == TerminalAction::Silence || !BridgeCurrent(c) ||
+            !g_bridgeWorld.Complete(c.request.bridgeTicket, c.bridgeOutcome, Now()))
+            return false;
+        if (action == TerminalAction::Outage)
+            c.text = DispatchOutageText();
+        uint64_t delayMs = 0;
+        if (g_EnableTypingSimulation)
+        {
+            delayMs =
+                g_TypingSimulationBaseDelay + static_cast<uint64_t>(c.text.size()) * g_TypingSimulationDelayPerChar;
+            if (g_TypingSimulationMaxDelay)
+                delayMs = std::min(delayMs, static_cast<uint64_t>(g_TypingSimulationMaxDelay));
+        }
+        delayMs = std::min(delayMs, static_cast<uint64_t>(MaxLifetimeMs));
+        c.deliverAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(delayMs);
+        c.bridgePrepared = true;
+        return true;
+    }
+
+    Channel* ResolveChannel(Player* bot, std::string const& channelName)
     {
         if (!bot || channelName.empty())
             return nullptr;
@@ -338,8 +440,46 @@ namespace
         }
     }
 
-    void Deliver(const Completion& c, const OllamaWorldSnapshot& world)
+    void DeliverBridge(Completion const& c, OllamaWorldSnapshot const& world)
     {
+        if (!BridgeCurrent(c) || !g_bridgeWorld.Consume(c.request.bridgeTicket, OllamaBridge::Now()))
+            return;
+        // Keep policy authorization live through every effect, then dispose the one-shot claim on every exit.
+        struct TerminalRelease
+        {
+            OllamaBridge::WorldTicket const& ticket;
+            ~TerminalRelease() { g_bridgeWorld.Cancel(ticket); }
+        } release{c.request.bridgeTicket};
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(c.request.botGuid));
+        if (!bot || !bot->IsInWorld())
+            return;
+        PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
+        if (!botAI || !BridgeCurrent(c))
+            return;
+        auto const botGuid = bot->GetGUID();
+        if ((!c.request.directAddress && Governor_IsRepetitive(botGuid, c.request.scopeKey, c.text)) ||
+            !Governor_TryConsumeSend(botGuid, c.request.scopeKey, c.request.directAddress))
+        {
+            ++g_droppedGovernor;
+            return;
+        }
+        Channel* channel = nullptr;
+        if (!BridgeCurrent(c) || !RouteMessage(bot, botAI, c, world, channel))
+            return;
+        if (!BridgeCurrent(c))
+            return;
+        Governor_RecordUtterance(botGuid, c.request.scopeKey, c.text);
+        ++g_totalDelivered;
+        // Neither outage nor success enters legacy memory, history, expression, sentiment or bot-chain paths.
+    }
+
+    void Deliver(Completion const& c, OllamaWorldSnapshot const& world)
+    {
+        if (c.request.bridgeGeneration)
+        {
+            DeliverBridge(c, world);
+            return;
+        }
         Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(c.request.botGuid));
         if (!bot || !bot->IsInWorld())
             return;
@@ -452,6 +592,13 @@ namespace
 
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
 
+void OllamaDispatch_SetBridgeObserver(OllamaBridgeObserver observer)
+{
+    // Rebinding cannot make work captured by a previous adapter eligible.
+    OllamaDispatch_BridgeConfigured();
+    g_bridgeObserver = observer;
+}
+
 void OllamaDispatch_BridgeConfigured()
 {
     // Existing startup/reload callers run on the world thread. This is no native activation receipt.
@@ -536,6 +683,8 @@ void OllamaDispatch_Stop()
 
 bool OllamaDispatch_Submit(OllamaChatRequest request)
 {
+    if (request.bridgeGeneration || OllamaConfig_Snapshot().provider == OllamaProvider::Bridge)
+        return false;
     if (request.prompt.empty() || request.botGuid == 0)
         return false;
 
@@ -565,6 +714,96 @@ bool OllamaDispatch_Submit(OllamaChatRequest request)
         g_queue.push_back(std::move(task));
     }
 
+    ++g_totalSubmitted;
+    g_queueCv.notify_one();
+    return true;
+}
+
+bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldScope const& scope,
+                                 OllamaBridge::Context input, OllamaBridge::DispatchGuard guard, int64_t lifetimeMs)
+{
+    using namespace OllamaBridge;
+    if (!g_bridgeObserver || request.chainDepth || request.kind != OllamaRequestKind::ChatReply ||
+        request.botGuid != scope.botGuid || request.targetGuid != input.speakerGuid || request.botName.size() > 128 ||
+        request.scopeKey.size() > 256 || request.directAddress != input.directAddress)
+        return false;
+    DispatchSource source = DispatchSource::Unsupported;
+    switch (request.source)
+    {
+        case SRC_WHISPER_LOCAL:
+            source = DispatchSource::Whisper;
+            break;
+        case SRC_SAY_LOCAL:
+            source = DispatchSource::Say;
+            break;
+        case SRC_YELL_LOCAL:
+            source = DispatchSource::Yell;
+            break;
+        case SRC_PARTY_LOCAL:
+            source = DispatchSource::Party;
+            break;
+        default:
+            return false;
+    }
+    if (guard.source != source ||
+        ((source == DispatchSource::Say || source == DispatchSource::Yell) && !input.directAddress))
+        return false;
+    auto settings = OllamaConfig_Snapshot();
+    Identity const identity{settings.bridge.instance, settings.bridge.provider, settings.bridge.endpoint, scope.epoch};
+    if (settings.provider != OllamaProvider::Bridge || settings.bridge.token != g_bridgeWorld.Snapshot().token ||
+        !(identity == g_bridgeWorld.Selected()))
+        return false;
+    auto slot = DispatchSlot::Acquire();
+    if (!slot)
+        return false;  // No capacity to stage even a queue-full fallback.
+    auto ticket = g_bridgeWorld.Reserve(scope, std::move(input), Now(), lifetimeMs);
+    if (!ticket.generation)
+        return false;
+    request.bridgeGeneration = ticket.generation;
+    request.bridgeSettings = std::move(settings);
+    request.bridgeTicket = ticket;
+    request.bridgeGuard = std::move(guard);
+    request.prompt.clear();
+    request.originMessage.clear();
+    request.channelName.clear();
+    request.channelId = 0;
+    request.recordHistory = false;
+    request.updateSentiment = false;
+    request.triggerBotReplies = false;
+    Completion pending;
+    pending.request = std::move(request);
+    pending.bridgeSlot = std::move(slot);
+    if (!BridgeCurrent(pending))
+    {
+        g_bridgeWorld.Cancel(ticket);
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        if (!g_running)
+        {
+            g_bridgeWorld.Cancel(ticket);
+            return false;
+        }
+        if (g_MaxQueueDepth > 0 && g_queue.size() >= g_MaxQueueDepth)
+        {
+            ++g_droppedQueueFull;
+            pending.bridgeOutcome = WorldOutcome::QueueFull;
+            pending.deliverAt = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> doneLock(g_doneMutex);
+            g_done.push_back(std::move(pending));
+            return true;  // Accepted one terminal outage, not another provider attempt.
+        }
+        if (!g_bridgeWorld.MarkQueued(ticket, Now()))
+        {
+            g_bridgeWorld.Cancel(ticket);
+            return false;
+        }
+        Task task;
+        task.request = std::move(pending.request);
+        task.bridgeSlot = std::move(pending.bridgeSlot);
+        g_queue.push_back(std::move(task));
+    }
     ++g_totalSubmitted;
     g_queueCv.notify_one();
     return true;
@@ -646,12 +885,31 @@ void OllamaDispatch_Update(uint32_t /*diff*/)
     OllamaWorldSnapshot world;
     world.Build();
 
-    for (const Completion& c : due)
+    for (Completion& c : due)
     {
         if (c.request.bridgeGeneration && c.request.bridgeGeneration != g_bridgeGeneration.load())
             continue;
         try
         {
+            if (c.request.bridgeGeneration)
+            {
+                if (!c.bridgePrepared && !PrepareBridge(c))
+                {
+                    g_bridgeWorld.Cancel(c.request.bridgeTicket);
+                    continue;
+                }
+                if (!BridgeCurrent(c))
+                {
+                    g_bridgeWorld.Cancel(c.request.bridgeTicket);
+                    continue;
+                }
+                if (c.deliverAt > Clock::now())
+                {
+                    std::lock_guard<std::mutex> lock(g_doneMutex);
+                    g_done.push_back(std::move(c));
+                    continue;
+                }
+            }
             Deliver(c, world);
         }
         catch (const std::exception& e)

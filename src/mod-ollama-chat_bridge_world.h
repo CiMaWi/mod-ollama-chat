@@ -1,6 +1,7 @@
 #ifndef MOD_OLLAMA_CHAT_BRIDGE_WORLD_H
 #define MOD_OLLAMA_CHAT_BRIDGE_WORLD_H
 
+#include <atomic>
 #include <unordered_map>
 
 #include "mod-ollama-chat_bridge.h"
@@ -58,6 +59,68 @@ enum class RetirementProof : uint8_t
     GenerationOnlyNoCaptures
 };
 
+enum class DispatchSource : uint8_t
+{
+    Unsupported,
+    Whisper,
+    Say,
+    Yell,
+    Party
+};
+
+// Trusted world adapter output, never decoded from model/native input. Audience is sorted and unique.
+// The adapter must resolve current humans, authority, exact group, map/phase and visibility/hearing afresh.
+struct DispatchGuard
+{
+    WorldScope scope;
+    DispatchSource source = DispatchSource::Unsupported;
+    uint64_t speakerGuid = 0;
+    uint64_t groupGuid = 0;
+    uint32_t mapId = 0;
+    uint32_t instanceId = 0;
+    uint32_t phaseMask = 0;
+    std::vector<uint64_t> audience;
+    bool humanSpeaker = false;
+    bool authority = false;
+    bool perceptible = false;
+    bool audienceOnline = false;
+    bool nonRaid = false;
+};
+
+bool DispatchGuardCurrent(WorldTicket const& ticket, DispatchGuard const& captured, DispatchGuard const& current,
+                          Clock now);
+
+enum class TerminalAction : uint8_t
+{
+    Silence,
+    Reply,
+    Outage
+};
+
+TerminalAction DispatchTerminal(WorldOutcome outcome, bool addressedHuman);
+char const* DispatchOutageText();
+
+// One physical slot for the entire owned task/completion lifetime, independent of logical reservations.
+// Move-only value: no game pointer, reference, callback or allocator crosses the worker boundary.
+class DispatchSlot
+{
+public:
+    DispatchSlot() = default;
+    ~DispatchSlot();
+    DispatchSlot(DispatchSlot const&) = delete;
+    DispatchSlot& operator=(DispatchSlot const&) = delete;
+    DispatchSlot(DispatchSlot&& other) noexcept;
+    DispatchSlot& operator=(DispatchSlot&& other) noexcept;
+    static DispatchSlot Acquire();
+    static std::size_t Used();
+    explicit operator bool() const { return _held; }
+
+private:
+    void Release();
+    bool _held = false;
+    static std::atomic<std::size_t> _used;
+};
+
 // Single world-thread owner. No pointers, game references, callbacks, native acknowledgements or tools.
 // Configured is an explicit notification even when only the bearer changes; no per-tick config polling.
 // Selected means module circuit selection only. J4b-X must emit authenticated fresh state to native code.
@@ -75,6 +138,7 @@ public:
     bool MarkQueued(WorldTicket const& ticket, Clock now);
     bool Complete(WorldTicket const& ticket, WorldOutcome outcome, Clock now);
     bool Current(WorldTicket const& ticket, Clock now) const;
+    // Claims once; retains current scope/deadline validation until the world caller calls Cancel on every exit.
     bool Consume(WorldTicket const& ticket, Clock now);
     void Cancel(WorldTicket const& ticket);
 
@@ -89,7 +153,8 @@ private:
     {
         Reserved,
         Queued,
-        Completed
+        Completed,
+        Consumed
     };
 
     struct ScopeEntry

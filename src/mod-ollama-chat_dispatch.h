@@ -4,6 +4,7 @@
 #include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_handler.h"
 #include "mod-ollama-chat_bridge_world.h"
+#include "mod-ollama-chat_api.h"
 
 #include "ObjectGuid.h"
 #include <string>
@@ -52,8 +53,11 @@ bool OllamaIsOnChannel(Channel const* channel, ObjectGuid guid);
 
 struct OllamaChatRequest
 {
-    // World-owned lifecycle tag. Zero keeps the existing provider path; J4b-2 binds the full ticket.
+    // Set only by SubmitBridge. Ordinary Submit rejects Bridge tags and unbound Bridge providers.
     uint64_t bridgeGeneration = 0;
+    OllamaEndpointSettings bridgeSettings;
+    OllamaBridge::WorldTicket bridgeTicket;
+    OllamaBridge::DispatchGuard bridgeGuard;
     // Who speaks, and to whom.
     uint64_t botGuid    = 0;
     uint64_t targetGuid = 0;      // 0 when there is no specific addressee
@@ -93,6 +97,13 @@ struct OllamaChatRequest
 // Submit a request. Returns false when the queue is at MaxQueueDepth, in which
 // case the caller should simply skip this bot rather than pile up backlog.
 bool OllamaDispatch_Submit(OllamaChatRequest request);
+
+// World-only adapter. Null by default: b2a cannot produce effects until b2b supplies real game validation.
+// Called afresh before cleanup and each effect; must not cache game pointers or accept wire-authored authority.
+using OllamaBridgeObserver = bool (*)(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&);
+void OllamaDispatch_SetBridgeObserver(OllamaBridgeObserver observer);
+bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldScope const& scope,
+                                 OllamaBridge::Context input, OllamaBridge::DispatchGuard guard, int64_t lifetimeMs);
 
 // Drain finished generations and deliver them. World thread only.
 void OllamaDispatch_Update(uint32_t diff);
