@@ -67,7 +67,8 @@ struct Fixture
     ChannelError Receive(Json const& json, Clock clock = now)
     {
         ChannelMessage result;
-        return policy.Receive(bearer, json.dump(), scope, clock, result);
+        std::string const route = json.at("requestId").is_string() ? json.at("requestId").get<std::string>() : "work";
+        return policy.Receive(bearer, json.dump(), scope, clock, result, route);
     }
 };
 
@@ -76,8 +77,9 @@ void IdentityAndTerminal()
     Fixture f;
     f.Open();
     ChannelMessage result;
-    Check(f.policy.Receive("wrong", "{", f.scope, now, result) == ChannelError::Unauthorized, "auth precedes parse");
-    Check(f.policy.Receive("wrong", std::string(MaxRequestBytes + 1, 'x'), f.scope, now, result) ==
+    Check(f.policy.Receive("wrong", "{", f.scope, now, result, "work") == ChannelError::Unauthorized,
+          "auth precedes parse");
+    Check(f.policy.Receive("wrong", std::string(MaxRequestBytes + 1, 'x'), f.scope, now, result, "work") ==
               ChannelError::Unauthorized,
           "auth precedes body size error");
     Check(f.Receive(f.Wire("hello")) == ChannelError::Invalid, "hello cannot register work");
@@ -124,10 +126,12 @@ void IdentityAndTerminal()
     Check(failed.Receive(failure) == ChannelError::Unauthorized, "old bearer retired");
     failed.scope.epoch = "epoch-2";
     Check(failed.policy.ObserveScope(failed.scope, now), "fresh epoch scope");
-    Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result) == ChannelError::Stale,
+    Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result, "work") ==
+              ChannelError::Stale,
           "old terminal cannot cross reconnect");
     failure["epoch"] = "epoch-2";
-    Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result) == ChannelError::Unknown,
+    Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result, "work") ==
+              ChannelError::Unknown,
           "reconnect cannot reopen old work");
     Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-1"}, bearer), "retired epoch reuse fails closed");
     Check(!failed.policy.ObserveScope(failed.scope, now), "bad activation leaves inactive");
@@ -193,21 +197,23 @@ void Schemas()
     Fixture f;
     f.Open();
     ChannelMessage result;
-    Check(f.policy.Receive(bearer, "{", f.scope, now, result) == ChannelError::Invalid, "malformed JSON");
-    Check(
-        f.policy.Receive(bearer, std::string(MaxRequestBytes + 1, ' '), f.scope, now, result) == ChannelError::TooLarge,
-        "bounded body before parse");
-    Check(f.policy.Receive(bearer, std::string(MaxRequestBytes, ' '), f.scope, now, result) == ChannelError::Invalid,
+    Check(f.policy.Receive(bearer, "{", f.scope, now, result, "work") == ChannelError::Invalid, "malformed JSON");
+    Check(f.policy.Receive(bearer, std::string(MaxRequestBytes + 1, ' '), f.scope, now, result, "work") ==
+              ChannelError::TooLarge,
+          "bounded body before parse");
+    Check(f.policy.Receive(bearer, std::string(MaxRequestBytes, ' '), f.scope, now, result, "work") ==
+              ChannelError::Invalid,
           "exact body maximum reaches parser");
     auto duplicate = f.Command().dump();
     duplicate.insert(1, "\"version\":1,");
-    Check(f.policy.Receive(bearer, duplicate, f.scope, now, result) == ChannelError::Invalid,
+    Check(f.policy.Receive(bearer, duplicate, f.scope, now, result, "work") == ChannelError::Invalid,
           "duplicate key before DOM overwrite");
     duplicate = f.Command().dump();
     auto const position = duplicate.find("\"params\":{}");
     duplicate.replace(position, 11, "\"params\":{\"x\":1,\"x\":2}");
-    Check(f.policy.Receive(bearer, duplicate, f.scope, now, result) == ChannelError::Invalid, "nested duplicate key");
-    Check(f.policy.Receive(bearer, std::string(20, '[') + "0" + std::string(20, ']'), f.scope, now, result) ==
+    Check(f.policy.Receive(bearer, duplicate, f.scope, now, result, "work") == ChannelError::Invalid,
+          "nested duplicate key");
+    Check(f.policy.Receive(bearer, std::string(20, '[') + "0" + std::string(20, ']'), f.scope, now, result, "work") ==
               ChannelError::Invalid,
           "parser nesting bound");
     for (auto const& pair : std::vector<std::pair<std::string, Json>>{{"version", 1.0},
@@ -265,7 +271,7 @@ void Schemas()
         auto good = f.Command("effect-" + std::to_string(++sequence));
         good["intent"] = pair.first;
         good["params"] = pair.second;
-        Check(f.policy.Receive(bearer, good.dump(), f.scope, now, result) == ChannelError::None,
+        Check(f.policy.Receive(bearer, good.dump(), f.scope, now, result, "work") == ChannelError::None,
               "whitelist decodes into typed values");
         Check(static_cast<unsigned>(std::get<ChannelCommand>(result.payload).intent) == sequence - 1,
               "typed intent preserved");
@@ -284,7 +290,7 @@ void QueriesEventsAndCapacity()
 {
     Fixture f;
     ChannelMessage query;
-    Check(f.policy.Receive(bearer, f.Query().dump(), f.scope, now, query) == ChannelError::None,
+    Check(f.policy.Receive(bearer, f.Query().dump(), f.scope, now, query, "work") == ChannelError::None,
           "authenticated reverse query");
     Check(f.Receive(f.Query()) == ChannelError::Duplicate, "query id replay reserved separately from effects");
     Check(f.Receive(f.Command("effect", "query")) == ChannelError::Invalid, "query ids never authorize commands");
@@ -298,7 +304,8 @@ void QueriesEventsAndCapacity()
     Check(f.policy.FinishQuery(query.envelope, f.scope, units, now, body) == ChannelError::Stale,
           "query terminal once");
     Check(body.empty(), "no stale query output after refusal");
-    Check(f.policy.Receive(bearer, f.Query("q2").dump(), f.scope, now, query) == ChannelError::None, "second query");
+    Check(f.policy.Receive(bearer, f.Query("q2").dump(), f.scope, now, query, "work") == ChannelError::None,
+          "second query");
     units.front().healthPercent = 101;
     Check(f.policy.FinishQuery(query.envelope, f.scope, units, now, body) == ChannelError::Invalid, "invalid UI field");
     units.front().healthPercent = 80;
@@ -308,7 +315,7 @@ void QueriesEventsAndCapacity()
           "observed optional fields retained");
     parsed = Json::parse(body);
     Check(parsed.at("units").at(0).size() == 5, "exact declared unit fields");
-    Check(f.policy.Receive(bearer, f.Query("q3").dump(), f.scope, now, query) == ChannelError::None,
+    Check(f.policy.Receive(bearer, f.Query("q3").dump(), f.scope, now, query, "work") == ChannelError::None,
           "query for local failure");
     Check(f.policy.FinishQuery(query.envelope, f.scope, std::vector<Participant>(41, units.front()), now, body) ==
               ChannelError::TooLarge,
@@ -401,7 +408,7 @@ void QueriesEventsAndCapacity()
               "bounded fresh epoch history");
     Check(!epochs.Bind({"fixture", "codex", "", "epoch-overflow"}, bearer), "epoch history capacity fails closed");
     ChannelMessage output;
-    Check(epochs.Receive(bearer, f.Query().dump(), f.scope, now, output) == ChannelError::Unauthorized,
+    Check(epochs.Receive(bearer, f.Query().dump(), f.scope, now, output, "work") == ChannelError::Unauthorized,
           "epoch exhaustion leaves inactive");
 }
 }  // namespace

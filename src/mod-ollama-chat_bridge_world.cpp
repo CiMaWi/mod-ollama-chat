@@ -6,6 +6,250 @@
 
 namespace OllamaBridge
 {
+WorldChannel::WorldChannel(WorldPolicy& world, Observer observer, ReadClock clock)
+    : _world(world), _observer(std::move(observer)), _clock(std::move(clock))
+{
+}
+
+void WorldChannel::Retire()
+{
+    _policy.Retire();
+    _selected = {};
+    _bindings.clear();
+    std::lock_guard<std::mutex> lock(_mutex);
+    _bearer.clear();
+    _receive.clear();
+    _done.clear();
+    if (_serial != std::numeric_limits<uint64_t>::max())
+        ++_serial;
+}
+
+void WorldChannel::Configure(bool enabled)
+{
+    Retire();
+    _enabled = enabled;
+}
+
+bool WorldChannel::Activate()
+{
+    auto const selected = _world.Selected();
+    if (!_enabled || _world.Retiring() || selected.epoch.empty())
+        return false;
+    if (_selected == selected)
+        return true;
+    if (!Drained() || _serial == std::numeric_limits<uint64_t>::max())
+        return false;
+    auto const settings = _world.Snapshot();
+    if (!_policy.Bind(selected, settings.token))
+        return false;
+    _selected = selected;
+    std::lock_guard<std::mutex> lock(_mutex);
+    _bearer = settings.token;
+    return true;
+}
+
+bool WorldChannel::Fresh(Binding const& binding, Clock now) const
+{
+    DispatchGuard current;
+    return _enabled && _selected == _world.Selected() && _world.Current(binding.ticket, now) && _observer &&
+           _observer(binding.ticket, current) && _world.Current(binding.ticket, _clock()) &&
+           DispatchGuardCurrent(binding.ticket, binding.guard, current, _clock());
+}
+
+bool WorldChannel::Register(WorldTicket const& ticket, DispatchGuard const& guard)
+{
+    auto const now = _clock();
+    Binding binding{ticket, guard};
+    if (!Fresh(binding, now))
+        return false;
+    // Explicit admission work only; no all-request sweep is installed on the world tick.
+    std::erase_if(_bindings, [&](auto const& pair) { return !_world.Current(pair.second.ticket, now); });
+    if (_bindings.size() >= MaxWorldPending || !_policy.ObserveScope(ticket.scope, now) ||
+        _policy.OpenGeneration(ticket.scope, ticket.request.requestId, ticket.request.deadline, now) !=
+            ChannelError::None)
+        return false;
+    return _bindings.emplace(ticket.request.requestId, std::move(binding)).second;
+}
+
+bool WorldChannel::RegisterEvents(WorldTicket const& ticket, DispatchGuard const& guard,
+                                  std::vector<ChannelObservedMark> const& events, uint64_t& receipt)
+{
+    receipt = 0;
+    auto const now = _clock();
+    Binding binding{ticket, guard, true};
+    if (!Fresh(binding, now) || events.empty() || events.size() > ChannelMaxEvents)
+        return false;
+    std::erase_if(_bindings, [&](auto const& pair) { return !_world.Current(pair.second.ticket, now); });
+    if (_bindings.size() >= MaxWorldPending || _bindings.contains(ticket.request.requestId) ||
+        !_policy.ObserveScope(ticket.scope, now))
+        return false;
+    // Capacity lasts through serialization/publication; no untracked outbound body survives this call.
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (Used() >= MaxPackets || _sequence == std::numeric_limits<uint64_t>::max())
+        return false;
+    auto packet = std::make_unique<ChannelPacket>();
+    packet->_lease = std::make_unique<ChannelPacket::Lease>(_used);
+    packet->_serial = _serial;
+    packet->_route = ticket.request.requestId;
+    packet->_until = CaptureDeadline(now, WorldLivenessMs);
+    packet->_until.unixMs = std::min(packet->_until.unixMs, ticket.request.deadline.unixMs);
+    packet->_until.steadyMs = std::min(packet->_until.steadyMs, ticket.request.deadline.steadyMs);
+    if (_policy.OpenEvents(ticket.scope, ticket.request.requestId, ticket.request.deadline, events, now,
+                           packet->body) != ChannelError::None)
+        return false;
+    if (!Fresh(binding, _clock()))
+    {
+        std::string ignored;
+        _policy.FinishFailure({ticket.scope.instance, ticket.scope.provider, ticket.scope.epoch,
+                               ticket.request.requestId, ticket.request.deadline.unixMs},
+                              ChannelFailure::Cancelled, ticket.scope, _clock(), ignored);
+        return false;
+    }
+    _bindings.emplace(ticket.request.requestId, std::move(binding));
+    packet->receipt = ++_sequence;
+    receipt = packet->receipt;
+    _done.emplace(receipt, std::move(packet));
+    return true;
+}
+
+void WorldChannel::Close(WorldTicket const& ticket)
+{
+    auto it = _bindings.find(ticket.request.requestId);
+    if (it == _bindings.end())
+        return;
+    std::string body;
+    ChannelEnvelope const envelope{ticket.scope.instance, ticket.scope.provider, ticket.scope.epoch,
+                                   ticket.request.requestId, ticket.request.deadline.unixMs};
+    _policy.FinishFailure(envelope, ChannelFailure::Cancelled, ticket.scope, _clock(), body);
+    _bindings.erase(it);
+    std::lock_guard<std::mutex> lock(_mutex);
+    std::erase_if(_receive, [&](auto const& packet) { return packet->_route == ticket.request.requestId; });
+    std::erase_if(_done, [&](auto const& pair) { return pair.second->_route == ticket.request.requestId; });
+}
+
+bool WorldChannel::Authenticated(std::string_view bearer) const
+{
+    if (_bearer.empty() || bearer.size() > 256)
+        return false;
+    std::size_t difference = _bearer.size() ^ bearer.size();
+    for (std::size_t i = 0; i < 256; ++i)
+        difference |= (i < _bearer.size() ? static_cast<unsigned char>(_bearer[i]) : 0) ^
+                      (i < bearer.size() ? static_cast<unsigned char>(bearer[i]) : 0);
+    return difference == 0;
+}
+
+ChannelError WorldChannel::Receive(std::string_view bearer, std::string_view route, std::string_view body,
+                                   uint64_t& receipt)
+{
+    receipt = 0;
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (!Authenticated(bearer))
+        return ChannelError::Unauthorized;
+    if (body.size() > MaxRequestBytes || route.size() > 128)
+        return ChannelError::TooLarge;
+    if (route.empty())
+        return ChannelError::Invalid;
+    if (Used() >= MaxPackets || _sequence == std::numeric_limits<uint64_t>::max())
+        return ChannelError::Capacity;
+    auto packet = std::make_unique<ChannelPacket>();
+    packet->_lease = std::make_unique<ChannelPacket::Lease>(_used);
+    packet->_serial = _serial;
+    packet->_until = CaptureDeadline(_clock(), WorldLivenessMs);
+    packet->_route.assign(route);
+    packet->body.assign(body);
+    packet->receipt = ++_sequence;
+    receipt = packet->receipt;
+    _receive.push_back(std::move(packet));
+    return ChannelError::None;
+}
+
+ChannelError WorldChannel::Take(std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
+{
+    packet.reset();
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (!Authenticated(bearer))
+        return ChannelError::Unauthorized;
+    auto it = _done.find(receipt);
+    if (it == _done.end())
+        return ChannelError::Unknown;
+    if (it->second->_serial != _serial || Expired(it->second->_until, _clock()))
+    {
+        _done.erase(it);
+        return ChannelError::Stale;
+    }
+    packet = std::move(it->second);
+    _done.erase(it);
+    return ChannelError::None;
+}
+
+std::size_t WorldChannel::Update()
+{
+    if (!_enabled || !Activate())
+        return 0;
+    // Scope count is bounded at 64; ObserveScope does not scan the replay ledger on healthy heartbeats.
+    for (auto const& scope : _world.Scopes(_clock()))
+        _policy.ObserveScope(scope, _clock());
+    std::size_t processed = 0;
+    while (processed < TickBudget)
+    {
+        std::unique_ptr<ChannelPacket> packet;
+        {
+            std::lock_guard<std::mutex> lock(_mutex);
+            if (_receive.empty())
+                break;
+            packet = std::move(_receive.front());
+            _receive.pop_front();
+        }
+        ++processed;
+        auto const it = _bindings.find(packet->_route);
+        if (it == _bindings.end() || Expired(packet->_until, _clock()) || !Fresh(it->second, _clock()))
+            continue;  // Actual payload disposal, not merely a logical cancellation.
+        auto const& binding = it->second;
+        bool eventTerminal = false;
+        {
+            ChannelMessage message;
+            auto const settings = _world.Snapshot();
+            packet->error =
+                _policy.Receive(settings.token, packet->body, binding.ticket.scope, _clock(), message, packet->_route);
+            packet->body.clear();
+            if (packet->error == ChannelError::None && Fresh(binding, _clock()))
+            {
+                if (std::holds_alternative<ChannelQuery>(message.payload))
+                    packet->error = _policy.FinishFailure(message.envelope, ChannelFailure::Unavailable,
+                                                          binding.ticket.scope, _clock(), packet->body);
+                else if (auto const* command = std::get_if<ChannelCommand>(&message.payload))
+                    packet->error =
+                        _policy.FinishCommand(message.envelope, command->commandId, ChannelOutcome::Rejected,
+                                              binding.ticket.scope, _clock(), packet->body);
+                else
+                {
+                    eventTerminal = binding.events;
+                    packet->error = ChannelError::Unknown;  // No reverse text/effect adapter; never fabricate delivery.
+                }
+                auto const until = CaptureDeadline(_clock(), message.envelope.deadlineUnixMs - _clock().unixMs);
+                packet->_until.unixMs = std::min(packet->_until.unixMs, until.unixMs);
+                packet->_until.steadyMs = std::min(packet->_until.steadyMs, until.steadyMs);
+            }
+        }  // Dispose parsed payload/settings BEFORE publishing the physical slot to another thread.
+        // J5c adds filtered data and J6 execution here. Until then all queries fail and commands are rejected.
+        if (!Fresh(binding, _clock()))
+            continue;
+        if (eventTerminal)
+        {
+            auto const ticket = binding.ticket;
+            Close(ticket);
+            _world.Cancel(ticket);
+            continue;
+        }
+        packet->_until.unixMs = std::min(packet->_until.unixMs, binding.ticket.request.deadline.unixMs);
+        packet->_until.steadyMs = std::min(packet->_until.steadyMs, binding.ticket.request.deadline.steadyMs);
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (packet->_serial == _serial && !Expired(packet->_until, _clock()))
+            _done.emplace(packet->receipt, std::move(packet));
+    }
+    return processed;
+}
+
 std::atomic<std::size_t> DispatchSlot::_used{0};
 
 DispatchSlot::~DispatchSlot() { Release(); }

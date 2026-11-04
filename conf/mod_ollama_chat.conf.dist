@@ -129,6 +129,18 @@ OllamaChat.Bridge.Provider =
 OllamaChat.Bridge.Endpoint =
 OllamaChat.Bridge.Token =
 
+# OllamaChat.Bridge.ChannelEnabled
+#     Description: Opt in to the provider-neutral reverse mailbox for a selected game bridge epoch.
+#                  I/O adapters authenticate every receive/result operation with Bridge.Token; they
+#                  must bound loopback sockets/bytes and retain returned packets through actual writes.
+#                  Up to 64 physical packets and 8 world-thread dequeues per tick. Reload revokes old
+#                  work immediately; a replacement epoch waits for actual payload disposal and drain.
+#                  No native socket/tool adapter is installed here. Queries fail unavailable and typed
+#                  commands are rejected until their separately reviewed world adapters are installed.
+#                  No raw commands, inference fallback, or model text execution is permitted.
+#     Default:     0 (existing generation behavior; reverse mailbox unavailable)
+OllamaChat.Bridge.ChannelEnabled = 0
+
 # OllamaChat.Bridge.ObserverEnabled / ObserverTokenRef
 #     Description: Default-off Codex world-observer transport (Windows only, like the native service).
 #                  TokenRef is the absolute fixed-local-drive path to the service's protected observer.json,

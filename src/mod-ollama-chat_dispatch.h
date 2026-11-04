@@ -119,8 +119,18 @@ void OllamaDispatch_Stop();
 
 // Explicit world-thread lifecycle notifications. Never called by native/CLI selection or queued callbacks.
 // Every publication retires old Bridge work, including bearer-only reloads. Legacy queues are untouched.
-void OllamaDispatch_BridgeConfigured();
+void OllamaDispatch_BridgeConfigured(bool channelEnabled = false);
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld();
+
+// Shared native-adapter boundary; every I/O operation authenticates the local game-link bearer.
+// route is an existing game-issued generation/event request id, never a wire-authored world scope.
+// World-only event publication; J5c owns observed mark provenance and fresh capture.
+bool OllamaDispatch_ChannelEvents(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard const& guard,
+                                  std::vector<OllamaBridge::ChannelObservedMark> const& events, uint64_t& receipt);
+OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer, std::string_view route,
+                                                         std::string_view body, uint64_t& receipt);
+OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, uint64_t receipt,
+                                                      std::unique_ptr<OllamaBridge::ChannelPacket>& packet);
 
 // Fire-and-forget sentiment analysis. Runs entirely on a worker: the sentiment
 // store is mutex-guarded in-memory state plus async DB writes, so it never

@@ -171,9 +171,10 @@ public:
                             std::vector<ChannelObservedMark> const& events, Clock now, std::string& body);
 
     // Authentication is checked before size/JSON parsing and before any replay/state mutation.
-    // current is a trusted fresh game capture, NEVER a scope deserialized from this body.
+    // current and expectedRequestId come from the trusted game route, NEVER from this body.
+    // Non-query ids must match that route before state changes; queries carry independent ids.
     ChannelError Receive(std::string const& localBearer, std::string const& body, WorldScope const& current, Clock now,
-                         ChannelMessage& message);
+                         ChannelMessage& message, std::string const& expectedRequestId);
     bool Current(ChannelEnvelope const& envelope, WorldScope const& current, Clock now, bool requireOpen = true) const;
     ChannelError FinishQuery(ChannelEnvelope const& envelope, WorldScope const& current,
                              std::vector<Participant> const& observedUnits, Clock now, std::string& body);
@@ -212,6 +213,7 @@ private:
     std::size_t const _maxIds;
     std::size_t const _maxPending;
     Identity _identity;
+    Clock _observed;  // Trusted clock high-water marks: heartbeat expiry cannot be undone by clock rollback.
     std::string _bearer;
     // Bounded lifetime epoch history also prevents accidental reconnect with a retired identity.
     std::unordered_set<std::string> _epochs;

@@ -940,7 +940,7 @@ void LoadOllamaChatConfig()
     OllamaConfig_Publish();
     // Explicit world-thread load/reload notification also retires work when the module is disabled.
     // The random-chatter update hook may return before dispatcher Update in that state.
-    OllamaDispatch_BridgeConfigured();
+    OllamaDispatch_BridgeConfigured(sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ChannelEnabled", false));
 
     LoadPersonalityTemplatesFromDB();
 

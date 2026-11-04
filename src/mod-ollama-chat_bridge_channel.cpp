@@ -240,6 +240,7 @@ ChannelPolicy::ChannelPolicy(std::size_t maxIds, std::size_t maxPending)
 void ChannelPolicy::Retire()
 {
     _identity = {};
+    _observed = {};
     _bearer.clear();
     _scopes.clear();
     _requests.clear();
@@ -280,15 +281,26 @@ void ChannelPolicy::RemoveScope(uint64_t botGuid, std::string const& contextId)
 
 void ChannelPolicy::Expire(Clock now)
 {
+    _observed = {std::max(_observed.unixMs, now.unixMs), std::max(_observed.steadyMs, now.steadyMs)};
     for (auto& [id, entry] : _requests)
-        if (!Alive(entry.until, now) || !ScopeCurrent(entry.scope, now))
+        if (!Alive(entry.until, now) || !Alive(entry.until, _observed) || !ScopeCurrent(entry.scope, now))
             entry.invalid = true;
     std::erase_if(_scopes, [&](ScopeEntry const& entry) { return !Alive(entry.until, now); });
 }
 
 bool ChannelPolicy::ObserveScope(WorldScope scope, Clock now)
 {
-    Expire(now);
+    _observed = {std::max(_observed.unixMs, now.unixMs), std::max(_observed.steadyMs, now.steadyMs)};
+    // Heartbeats run on the world tick. Scan only the bounded scopes, not every retained replay reservation.
+    // A genuine observation gap still permanently invalidates work before a matching scope can be refreshed.
+    for (std::size_t i = 0; i < _scopes.size();)
+        if (!Alive(_scopes[i].until, now) || !Alive(_scopes[i].until, _observed))
+        {
+            auto const expired = _scopes[i].scope;
+            RemoveScope(expired.botGuid, expired.contextId);
+        }
+        else
+            ++i;
     if (_bearer.empty() || scope.version != 1 || scope.instance != _identity.instance ||
         scope.provider != _identity.provider || scope.epoch != _identity.epoch || !scope.botGuid ||
         !scope.controllerGuid || !Identifier(scope.contextId) || !Identifier(scope.perceptionScope) ||
@@ -316,14 +328,17 @@ bool ChannelPolicy::ObserveScope(WorldScope scope, Clock now)
 
 bool ChannelPolicy::ScopeCurrent(WorldScope const& scope, Clock now) const
 {
-    return !_bearer.empty() && std::any_of(_scopes.begin(), _scopes.end(), [&](ScopeEntry const& entry)
-                                           { return SameScope(entry.scope, scope) && Alive(entry.until, now); });
+    return !_bearer.empty() &&
+           std::any_of(
+               _scopes.begin(), _scopes.end(), [&](ScopeEntry const& entry)
+               { return SameScope(entry.scope, scope) && Alive(entry.until, now) && Alive(entry.until, _observed); });
 }
 
 std::size_t ChannelPolicy::Pending() const
 {
-    return std::count_if(_requests.begin(), _requests.end(),
-                         [](auto const& pair) { return !pair.second.terminal && !pair.second.invalid; });
+    return std::count_if(
+        _requests.begin(), _requests.end(), [&](auto const& pair)
+        { return !pair.second.terminal && !pair.second.invalid && Alive(pair.second.until, _observed); });
 }
 
 ChannelError ChannelPolicy::Open(WorldScope const& scope, std::string requestId, Deadline deadline, ChannelWork work,
@@ -336,6 +351,8 @@ ChannelError ChannelPolicy::Open(WorldScope const& scope, std::string requestId,
         return ChannelError::Invalid;
     if (_requests.contains(requestId))
         return ChannelError::Duplicate;
+    if (!Alive(deadline, _observed))
+        return ChannelError::Stale;
     if (_requests.size() >= _maxIds || Pending() >= _maxPending)
         return ChannelError::Capacity;
     ChannelEnvelope envelope{_identity.instance, _identity.provider, _identity.epoch, requestId, deadline.unixMs};
@@ -387,11 +404,11 @@ bool ChannelPolicy::Current(ChannelEnvelope const& envelope, WorldScope const& c
     return !entry.invalid && (!requireOpen || !entry.terminal) && envelope.instance == _identity.instance &&
            envelope.provider == _identity.provider && envelope.epoch == _identity.epoch &&
            envelope.deadlineUnixMs == entry.envelope.deadlineUnixMs && SameScope(entry.scope, current) &&
-           ScopeCurrent(current, now) && Alive(entry.until, now);
+           ScopeCurrent(current, now) && Alive(entry.until, now) && Alive(entry.until, _observed);
 }
 
 ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string const& body, WorldScope const& current,
-                                    Clock now, ChannelMessage& message)
+                                    Clock now, ChannelMessage& message, std::string const& expectedRequestId)
 {
     message = {};
     if (!Authenticated(localBearer))
@@ -444,6 +461,8 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
             message = {std::move(envelope), query};
             return ChannelError::None;
         }
+        if (envelope.requestId != expectedRequestId)
+            return ChannelError::Invalid;
         // Fully validate syntax before reserving any replay id or closing a request.
         if (type == "command")
             payload = Command(json);

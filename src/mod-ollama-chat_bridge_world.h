@@ -3,11 +3,15 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
+#include <memory>
 #include <optional>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 
 #include "mod-ollama-chat_bridge.h"
+#include "mod-ollama-chat_bridge_channel.h"
 
 namespace OllamaBridge
 {
@@ -243,6 +247,77 @@ private:
     Identity _selected;
     std::vector<ScopeEntry> _scopes;
     std::unordered_map<std::string, PendingEntry> _pending;
+};
+// An owned response keeps its physical slot until its body has actually been destroyed.
+// Native adapters may hold this value during asynchronous writes, but must not copy its body into untracked work.
+class ChannelPacket
+{
+    friend class WorldChannel;
+    struct Lease
+    {
+        explicit Lease(std::shared_ptr<std::atomic<std::size_t>> count) : used(std::move(count)) { ++*used; }
+        ~Lease() { --*used; }
+        std::shared_ptr<std::atomic<std::size_t>> used;
+    };
+    std::unique_ptr<Lease> _lease;  // Declared first: destroyed AFTER every owned payload below.
+    std::string _route;
+    uint64_t _serial = 0;
+    Deadline _until;
+
+public:
+    uint64_t receipt = 0;
+    ChannelError error = ChannelError::None;
+    std::string body;
+};
+
+// Provider-neutral reverse channel. Receive/Take are I/O-thread safe; all other methods are world-only.
+// There is no HTTP, waiting, worker callback or game pointer in these mailboxes. Native adapters bound sockets
+// and bytes before Receive; their async write owns the returned packet until disposal, including cancellation.
+class WorldChannel
+{
+public:
+    using Observer = std::function<bool(WorldTicket const&, DispatchGuard&)>;
+    static constexpr std::size_t MaxPackets = 64;
+    static constexpr std::size_t TickBudget = 8;
+    explicit WorldChannel(WorldPolicy& world, Observer observer, ReadClock clock = Now);
+    void Configure(bool enabled);
+    void Retire();
+    bool Activate();
+    bool Register(WorldTicket const& ticket, DispatchGuard const& guard);
+    // World-only: a separate game reservation, never an already registered generation route.
+    // J5c supplies freshly filtered marks; native adapters discover the receipt out of band.
+    bool RegisterEvents(WorldTicket const& ticket, DispatchGuard const& guard,
+                        std::vector<ChannelObservedMark> const& events, uint64_t& receipt);
+    void Close(WorldTicket const& ticket);
+    std::size_t Update();
+    bool Drained() const { return _used->load() == 0; }
+    std::size_t Used() const { return _used->load(); }
+    ChannelError Receive(std::string_view bearer, std::string_view route, std::string_view body, uint64_t& receipt);
+    ChannelError Take(std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet);
+
+private:
+    struct Binding
+    {
+        WorldTicket ticket;
+        DispatchGuard guard;
+        bool events = false;
+    };
+    bool Authenticated(std::string_view bearer) const;  // Caller holds _mutex.
+    bool Fresh(Binding const& binding, Clock now) const;
+    WorldPolicy& _world;
+    Observer const _observer;  // Invoked only synchronously by the world owner, never by Receive/Take.
+    ReadClock const _clock;
+    ChannelPolicy _policy;
+    bool _enabled = false;
+    Identity _selected;
+    std::unordered_map<std::string, Binding> _bindings;
+    std::shared_ptr<std::atomic<std::size_t>> _used = std::make_shared<std::atomic<std::size_t>>(0);
+    mutable std::mutex _mutex;
+    std::string _bearer;
+    uint64_t _serial = 0;
+    uint64_t _sequence = 0;
+    std::deque<std::unique_ptr<ChannelPacket>> _receive;
+    std::unordered_map<uint64_t, std::unique_ptr<ChannelPacket>> _done;
 };
 }  // namespace OllamaBridge
 

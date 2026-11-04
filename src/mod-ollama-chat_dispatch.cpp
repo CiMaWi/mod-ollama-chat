@@ -89,6 +89,15 @@ OllamaBridge::WorldPolicy g_bridgeWorld(&g_nativeObserver);
 bool g_nativeSelected = false;  // World-thread cached selection, including fail-closed invalid settings.
 OllamaBridge::Settings g_nativeSettings;
 OllamaBridgeObserver g_bridgeObserver = nullptr;
+bool g_channelEnabled = false;
+OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
+                                           [](OllamaBridge::WorldTicket const& ticket,
+                                              OllamaBridge::DispatchGuard& guard)
+                                           {
+                                               return g_bridgeObserver && g_bridgeObserver(ticket, guard) &&
+                                                      (!g_nativeSelected ||
+                                                       g_nativeObserver.Current(ticket.scope, OllamaBridge::Now()));
+                                           });
 std::atomic<uint64_t> g_bridgeGeneration{0};
 std::atomic<uint32_t> g_bridgeInFlight{0};
 
@@ -305,45 +314,45 @@ bool BridgeCurrent(Completion const& c)
            OllamaBridge::DispatchGuardCurrent(c.request.bridgeTicket, c.request.bridgeGuard, current, now);
 }
 
-    bool PrepareBridge(Completion& c)
+bool PrepareBridge(Completion& c)
+{
+    using namespace OllamaBridge;
+    g_bridgeChannel.Close(c.request.bridgeTicket);
+    if (!BridgeCurrent(c))
+        return false;
+    if (c.bridgeOutcome == WorldOutcome::Success)
     {
-        using namespace OllamaBridge;
-        if (!BridgeCurrent(c))
-            return false;
-        if (c.bridgeOutcome == WorldOutcome::Success)
+        // Config-dependent cleanup stays on the world thread, after fresh authority/perception checks.
+        c.text = ProcessLlmResponse(c.text, c.request.botName, nullptr);
+        if (c.text.empty())
+            c.bridgeOutcome = WorldOutcome::Empty;
+        else
         {
-            // Config-dependent cleanup stays on the world thread, after fresh authority/perception checks.
-            c.text = ProcessLlmResponse(c.text, c.request.botName, nullptr);
+            if (!BridgeCurrent(c))
+                return false;
+            c.text = Roleplay_FilterMetaTerms(c.text);
             if (c.text.empty())
-                c.bridgeOutcome = WorldOutcome::Empty;
-            else
-            {
-                if (!BridgeCurrent(c))
-                    return false;
-                c.text = Roleplay_FilterMetaTerms(c.text);
-                if (c.text.empty())
-                    c.bridgeOutcome = WorldOutcome::Filtered;
-            }
+                c.bridgeOutcome = WorldOutcome::Filtered;
         }
-        auto const action = DispatchTerminal(c.bridgeOutcome, c.request.directAddress);
-        if (action == TerminalAction::Silence || !BridgeCurrent(c) ||
-            !g_bridgeWorld.Complete(c.request.bridgeTicket, c.bridgeOutcome, Now()))
-            return false;
-        if (action == TerminalAction::Outage)
-            c.text = DispatchOutageText();
-        uint64_t delayMs = 0;
-        if (g_EnableTypingSimulation)
-        {
-            delayMs =
-                g_TypingSimulationBaseDelay + static_cast<uint64_t>(c.text.size()) * g_TypingSimulationDelayPerChar;
-            if (g_TypingSimulationMaxDelay)
-                delayMs = std::min(delayMs, static_cast<uint64_t>(g_TypingSimulationMaxDelay));
-        }
-        delayMs = std::min(delayMs, static_cast<uint64_t>(MaxLifetimeMs));
-        c.deliverAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(delayMs);
-        c.bridgePrepared = true;
-        return true;
     }
+    auto const action = DispatchTerminal(c.bridgeOutcome, c.request.directAddress);
+    if (action == TerminalAction::Silence || !BridgeCurrent(c) ||
+        !g_bridgeWorld.Complete(c.request.bridgeTicket, c.bridgeOutcome, Now()))
+        return false;
+    if (action == TerminalAction::Outage)
+        c.text = DispatchOutageText();
+    uint64_t delayMs = 0;
+    if (g_EnableTypingSimulation)
+    {
+        delayMs = g_TypingSimulationBaseDelay + static_cast<uint64_t>(c.text.size()) * g_TypingSimulationDelayPerChar;
+        if (g_TypingSimulationMaxDelay)
+            delayMs = std::min(delayMs, static_cast<uint64_t>(g_TypingSimulationMaxDelay));
+    }
+    delayMs = std::min(delayMs, static_cast<uint64_t>(MaxLifetimeMs));
+    c.deliverAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(delayMs);
+    c.bridgePrepared = true;
+    return true;
+}
 
     Channel* ResolveChannel(Player* bot, std::string const& channelName)
     {
@@ -604,16 +613,39 @@ bool BridgeCurrent(Completion const& c)
 
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
 
+bool OllamaDispatch_ChannelEvents(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard const& guard,
+                                  std::vector<OllamaBridge::ChannelObservedMark> const& events, uint64_t& receipt)
+{
+    if (g_bridgeChannel.RegisterEvents(ticket, guard, events, receipt))
+        return true;
+    g_bridgeChannel.Close(ticket);
+    g_bridgeWorld.Cancel(ticket);
+    return false;
+}
+
+OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer, std::string_view route,
+                                                         std::string_view body, uint64_t& receipt)
+{
+    return g_bridgeChannel.Receive(bearer, route, body, receipt);
+}
+
+OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, uint64_t receipt,
+                                                      std::unique_ptr<OllamaBridge::ChannelPacket>& packet)
+{
+    return g_bridgeChannel.Take(bearer, receipt, packet);
+}
+
 void OllamaDispatch_SetBridgeObserver(OllamaBridgeObserver observer)
 {
     // Rebinding cannot make work captured by a previous adapter eligible.
-    OllamaDispatch_BridgeConfigured();
+    OllamaDispatch_BridgeConfigured(g_channelEnabled);
     g_bridgeObserver = observer;
 }
 
 static void RetireBridgeWork()
 {
     g_bridgeGeneration = 0;
+    g_bridgeChannel.Retire();
     OllamaChat_BridgeReset();
     OllamaBridge_SetActivation({});
     {
@@ -627,9 +659,11 @@ static void RetireBridgeWork()
     g_bridgeWorld.Shutdown();
 }
 
-void OllamaDispatch_BridgeConfigured()
+void OllamaDispatch_BridgeConfigured(bool channelEnabled)
 {
     RetireBridgeWork();
+    g_channelEnabled = channelEnabled;
+    g_bridgeChannel.Configure(channelEnabled);
     OllamaEndpointSettings const settings = OllamaConfig_Snapshot();
     g_nativeSelected = g_Enable && settings.provider == OllamaProvider::Bridge && settings.bridge.provider == "codex" &&
                        settings.bridge.observerEnabled;
@@ -685,6 +719,7 @@ void OllamaDispatch_Stop()
 {
     // Revoke before the existing terminal legacy-pool join. Reload/tick never joins workers.
     g_bridgeGeneration = 0;
+    g_bridgeChannel.Configure(false);
     OllamaChat_BridgeReset();
     OllamaBridge_SetActivation({});
     g_bridgeWorld.Shutdown();
@@ -812,10 +847,16 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
         g_bridgeWorld.Cancel(ticket);
         return false;
     }
+    if (g_channelEnabled && !g_bridgeChannel.Register(ticket, pending.request.bridgeGuard))
+    {
+        g_bridgeWorld.Cancel(ticket);
+        return false;
+    }
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
         if (!g_running)
         {
+            g_bridgeChannel.Close(ticket);
             g_bridgeWorld.Cancel(ticket);
             return false;
         }
@@ -830,6 +871,7 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
         }
         if (!g_bridgeWorld.MarkQueued(ticket, Now()))
         {
+            g_bridgeChannel.Close(ticket);
             g_bridgeWorld.Cancel(ticket);
             return false;
         }
@@ -888,7 +930,7 @@ static void UpdateNativeObserver()
     if (state.epoch.empty() && !g_bridgeWorld.Selected().epoch.empty())
         RetireBridgeWork();
     // Count physical queued/completed slots as well as workers, never cancelled reservations.
-    bool const drained = g_bridgeInFlight.load() == 0 && DispatchSlot::Used() == 0;
+    bool const drained = g_bridgeInFlight.load() == 0 && DispatchSlot::Used() == 0 && g_bridgeChannel.Drained();
     if (state.enabled && state.epoch.empty())
     {
         if (state.incarnation.empty())
@@ -923,17 +965,21 @@ void OllamaDispatch_Update(uint32_t /*diff*/)
     g_bridgeWorld.Expire(OllamaBridge::Now());
     OllamaChat_BridgeRefresh();
     if (g_nativeSelected)
-        g_nativeObserver.Publish(g_bridgeWorld.Scopes(OllamaBridge::Now()),
-                                 g_bridgeInFlight.load() == 0 && OllamaBridge::DispatchSlot::Used() == 0,
-                                 OllamaBridge::Now());
+        g_nativeObserver.Publish(
+            g_bridgeWorld.Scopes(OllamaBridge::Now()),
+            g_bridgeInFlight.load() == 0 && OllamaBridge::DispatchSlot::Used() == 0 && g_bridgeChannel.Drained(),
+            OllamaBridge::Now());
     // J4 generation intents have no strategy captures or typed execution.
     // Future strategy owners must replace this proof; unknown obligations fail closed.
-    if (!g_nativeSelected && g_bridgeWorld.ObserveDrain(g_bridgeInFlight.load() == 0,
-                                                        OllamaBridge::RetirementProof::GenerationOnlyNoCaptures))
+    if (!g_nativeSelected &&
+        g_bridgeWorld.ObserveDrain(
+            g_bridgeInFlight.load() == 0 && OllamaBridge::DispatchSlot::Used() == 0 && g_bridgeChannel.Drained(),
+            OllamaBridge::RetirementProof::GenerationOnlyNoCaptures))
     {
         OllamaBridge_SetActivation(g_bridgeWorld.Selected());
         g_bridgeGeneration = g_bridgeWorld.Generation();
     }
+    g_bridgeChannel.Update();  // Bounded independent reverse lane; no HTTP, waits or generation-worker dependency.
     const auto now = Clock::now();
 
     // Move due completions out under the lock, then deliver without it: the
