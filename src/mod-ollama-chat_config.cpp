@@ -933,6 +933,9 @@ void LoadOllamaChatConfig()
     // the g_Ollama* globals directly -- reassigning those here would free the
     // buffers under a worker mid-request.
     OllamaConfig_Publish();
+    // Explicit world-thread load/reload notification also retires work when the module is disabled.
+    // The random-chatter update hook may return before dispatcher Update in that state.
+    OllamaDispatch_BridgeConfigured();
 
     LoadPersonalityTemplatesFromDB();
 

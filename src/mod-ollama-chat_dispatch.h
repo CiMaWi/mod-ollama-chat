@@ -3,6 +3,7 @@
 
 #include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_handler.h"
+#include "mod-ollama-chat_bridge_world.h"
 
 #include "ObjectGuid.h"
 #include <string>
@@ -51,6 +52,8 @@ bool OllamaIsOnChannel(Channel const* channel, ObjectGuid guid);
 
 struct OllamaChatRequest
 {
+    // World-owned lifecycle tag. Zero keeps the existing provider path; J4b-2 binds the full ticket.
+    uint64_t bridgeGeneration = 0;
     // Who speaks, and to whom.
     uint64_t botGuid    = 0;
     uint64_t targetGuid = 0;      // 0 when there is no specific addressee
@@ -96,6 +99,11 @@ void OllamaDispatch_Update(uint32_t diff);
 
 void OllamaDispatch_Start();
 void OllamaDispatch_Stop();
+
+// Explicit world-thread lifecycle notifications. Never called by native/CLI selection or queued callbacks.
+// Every publication retires old Bridge work, including bearer-only reloads. Legacy queues are untouched.
+void OllamaDispatch_BridgeConfigured();
+OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld();
 
 // Fire-and-forget sentiment analysis. Runs entirely on a worker: the sentiment
 // store is mutex-guarded in-memory state plus async DB writes, so it never

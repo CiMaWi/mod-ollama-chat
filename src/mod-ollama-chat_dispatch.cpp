@@ -11,6 +11,7 @@
 #include "mod-ollama-chat_world.h"
 
 #include "CellImpl.h"
+#include "CryptoRandom.h"
 #include "Channel.h"
 #include "ChannelMgr.h"
 #include "GridNotifiers.h"
@@ -24,6 +25,7 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -76,6 +78,11 @@ namespace
     std::deque<Completion> g_done;
 
     std::vector<std::thread> g_workers;
+
+    // Policy and selection are world-thread only; worker counters/tags carry no game references.
+    OllamaBridge::WorldPolicy g_bridgeWorld;
+    std::atomic<uint64_t> g_bridgeGeneration{0};
+    std::atomic<uint32_t> g_bridgeInFlight{0};
 
     std::atomic<uint32_t> g_inFlight{ 0 };
     std::atomic<uint64_t> g_totalSubmitted{ 0 };
@@ -152,6 +159,8 @@ namespace
         completion.deliverAt = Clock::now() + std::chrono::milliseconds(delayMs);
 
         std::lock_guard<std::mutex> lock(g_doneMutex);
+        if (completion.request.bridgeGeneration && completion.request.bridgeGeneration != g_bridgeGeneration.load())
+            return;
         g_done.push_back(std::move(completion));
     }
 
@@ -179,6 +188,9 @@ namespace
 
                 task = std::move(g_queue.front());
                 g_queue.pop_front();
+                // Count before unlocking: retirement must not observe a false drain.
+                if (task.request.bridgeGeneration)
+                    ++g_bridgeInFlight;
             }
 
             ++g_inFlight;
@@ -214,6 +226,8 @@ namespace
             }
 
             --g_inFlight;
+            if (task.request.bridgeGeneration)
+                --g_bridgeInFlight;  // Real worker cleanup, independent of policy cancellation.
         }
     }
 
@@ -436,6 +450,39 @@ namespace
 
 // --------------------------------------------------------------------------
 
+OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
+
+void OllamaDispatch_BridgeConfigured()
+{
+    // Existing startup/reload callers run on the world thread. This is no native activation receipt.
+    g_bridgeGeneration = 0;
+    OllamaBridge_SetActivation({});
+    {
+        std::lock_guard<std::mutex> lock(g_queueMutex);
+        std::erase_if(g_queue, [](Task const& task) { return task.request.bridgeGeneration != 0; });
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_doneMutex);
+        std::erase_if(g_done, [](Completion const& item) { return item.request.bridgeGeneration != 0; });
+    }
+    OllamaEndpointSettings const settings = OllamaConfig_Snapshot();
+    std::string epoch;
+    if (g_Enable && settings.provider == OllamaProvider::Bridge && OllamaBridge::ValidSettings(settings.bridge))
+    {
+        // Core cryptographic entropy; never process id/time/CLI/model-provided authority.
+        auto const bytes = Acore::Crypto::GetRandomBytes<32>();
+        char const hex[] = "0123456789abcdef";
+        epoch.reserve(bytes.size() * 2);
+        for (auto byte : bytes)
+        {
+            epoch.push_back(hex[byte >> 4]);
+            epoch.push_back(hex[byte & 15]);
+        }
+    }
+    g_bridgeWorld.Configured(g_Enable && settings.provider == OllamaProvider::Bridge, settings.bridge,
+                             std::move(epoch));
+}
+
 void OllamaDispatch_Start()
 {
     std::lock_guard<std::mutex> lock(g_queueMutex);
@@ -459,6 +506,10 @@ void OllamaDispatch_Start()
 
 void OllamaDispatch_Stop()
 {
+    // Revoke before the existing terminal legacy-pool join. Reload/tick never joins workers.
+    g_bridgeGeneration = 0;
+    OllamaBridge_SetActivation({});
+    g_bridgeWorld.Shutdown();
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
         if (!g_running)
@@ -496,6 +547,9 @@ bool OllamaDispatch_Submit(OllamaChatRequest request)
         std::lock_guard<std::mutex> lock(g_queueMutex);
 
         if (!g_running)
+            return false;
+
+        if (task.request.bridgeGeneration && task.request.bridgeGeneration != g_bridgeGeneration.load())
             return false;
 
         if (g_MaxQueueDepth > 0 && g_queue.size() >= g_MaxQueueDepth)
@@ -552,6 +606,15 @@ void OllamaDispatch_SubmitSentiment(uint64_t botGuid, uint64_t playerGuid,
 
 void OllamaDispatch_Update(uint32_t /*diff*/)
 {
+    g_bridgeWorld.Expire(OllamaBridge::Now());
+    // J4 generation intents have no strategy captures or typed execution.
+    // Future strategy owners must replace this proof; unknown obligations fail closed.
+    if (g_bridgeWorld.ObserveDrain(g_bridgeInFlight.load() == 0,
+                                   OllamaBridge::RetirementProof::GenerationOnlyNoCaptures))
+    {
+        OllamaBridge_SetActivation(g_bridgeWorld.Selected());
+        g_bridgeGeneration = g_bridgeWorld.Generation();
+    }
     const auto now = Clock::now();
 
     // Move due completions out under the lock, then deliver without it: the
@@ -585,6 +648,8 @@ void OllamaDispatch_Update(uint32_t /*diff*/)
 
     for (const Completion& c : due)
     {
+        if (c.request.bridgeGeneration && c.request.bridgeGeneration != g_bridgeGeneration.load())
+            continue;
         try
         {
             Deliver(c, world);
