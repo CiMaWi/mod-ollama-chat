@@ -105,6 +105,12 @@ void OllamaDispatch_SetBridgeObserver(OllamaBridgeObserver observer);
 bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldScope const& scope,
                                  OllamaBridge::Context input, OllamaBridge::DispatchGuard guard, int64_t lifetimeMs);
 
+// World-thread game adapter and bounded, audience-scoped conversation memory. No legacy memory is imported.
+bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard);
+void OllamaChat_BridgeRefresh();
+void OllamaChat_BridgeReset();
+void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply);
+
 // Drain finished generations and deliver them. World thread only.
 void OllamaDispatch_Update(uint32_t diff);
 

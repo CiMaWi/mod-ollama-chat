@@ -1,11 +1,13 @@
 // Actual bridge/world translation units plus exact extracted dispatch helpers (see hub J4b-2a-check runner).
-// Game adapter, route, governor, cleanup, config and API are stubs. No full dispatch TU or live-game proof.
+// Handler adapter is extracted verbatim too; game objects/route/governor/cleanup/API are controlled stand-ins.
+// No full handler/dispatch TU or live-game proof.
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <iostream>
+#include <list>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -36,6 +38,14 @@ using OllamaBridgeObserver = bool (*)(OllamaBridge::WorldTicket const&, OllamaBr
 #define LOG_ERROR(...) ((void)0)
 
 #include "dispatch-types.inc"
+
+OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
+bool OllamaDispatch_SubmitBridge(OllamaChatRequest, OllamaBridge::WorldScope const&, OllamaBridge::Context,
+                                 OllamaBridge::DispatchGuard, int64_t);
+bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&);
+void OllamaChat_BridgeRefresh();
+void OllamaChat_BridgeReset();
+void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const&, std::string const&);
 
 namespace
 {
@@ -69,6 +79,14 @@ bool apiBlocked = false;
 bool apiEntered = false;
 bool throwApi = false;
 std::string routedText;
+bool adapterMode = false;
+bool g_Enable = true;
+bool g_EnableWhisperReplies = true;
+bool g_DisableForSayYell = false;
+bool g_DisableForParty = false;
+float g_SayDistance = 25.0f;
+float g_YellDistance = 100.0f;
+std::string voice = "A quiet traveler.";
 
 void Check(bool condition, char const* message)
 {
@@ -108,15 +126,68 @@ struct ObjectGuid
 {
     uint64_t value;
     explicit ObjectGuid(uint64_t guid) : value(guid) {}
+    uint64_t GetRawValue() const { return value; }
+    bool operator==(ObjectGuid const&) const = default;
 };
+struct Group;
 struct Player
 {
-    bool IsInWorld() const { return true; }
-    ObjectGuid GetGUID() const { return ObjectGuid(11); }
+    uint64_t guid = 11;
+    bool online = true;
+    bool inWorld = true;
+    bool human = false;
+    bool visible = true;
+    uint32_t map = 1;
+    uint32_t instance = 1;
+    uint32_t phase = 1;
+    uint32_t team = 0;
+    float distance = 0;
+    std::string name = "Bot";
+    Group* group = nullptr;
+    bool IsInWorld() const { return inWorld; }
+    ObjectGuid GetGUID() const { return ObjectGuid(guid); }
+    Group* GetGroup() const { return group; }
+    uint32_t GetTeamId() const { return team; }
+    uint32_t GetMapId() const { return map; }
+    uint32_t GetInstanceId() const { return instance; }
+    uint32_t GetPhaseMask() const { return phase; }
+    std::string GetName() const { return name; }
+    bool IsInMap(Player* p) const { return inWorld && p->inWorld && map == p->map && instance == p->instance; }
+    bool InSamePhase(Player* p) const { return (phase & p->phase) != 0; }
+    bool IsWithinDistInMap(Player* p, float d) const { return IsInMap(p) && InSamePhase(p) && p->distance <= d; }
+    bool CanSeeOrDetect(Player* p, bool ignoreStealth, bool) const { return ignoreStealth || (visible && p->visible); }
+};
+struct Group
+{
+    struct Slot
+    {
+        ObjectGuid guid;
+    };
+    std::list<Slot> members{{ObjectGuid(11)}, {ObjectGuid(22)}, {ObjectGuid(33)}};
+    uint64_t guid = 99;
+    uint64_t leader = 22;
+    bool raid = false;
+    bool isRaidGroup() const { return raid; }
+    auto const& GetMemberSlots() const { return members; }
+    ObjectGuid GetGUID() const { return ObjectGuid(guid); }
+    ObjectGuid GetLeaderGUID() const { return ObjectGuid(leader); }
+    bool IsMember(ObjectGuid id) const
+    {
+        return std::any_of(members.begin(), members.end(), [&](Slot const& slot) { return slot.guid == id; });
+    }
 };
 struct PlayerbotAI
 {
+    Player* master = nullptr;
+    bool isBot = true;
+    Player* GetMaster() { return master; }
+    bool IsBotAI() const { return isBot; }
 };
+Player players[70];
+Group party;
+PlayerbotAI gameAI;
+bool OllamaIsRealPlayer(Player* player) { return player && player->human; }
+std::string Roleplay_BuildVoicePrompt(Player*) { return voice; }
 struct Channel
 {
 };
@@ -125,8 +196,15 @@ struct OllamaWorldSnapshot
 };
 struct ObjectAccessor
 {
-    static Player* FindConnectedPlayer(ObjectGuid)
+    static Player* FindConnectedPlayer(ObjectGuid guid)
     {
+        if (adapterMode)
+        {
+            for (auto& player : players)
+                if (player.guid == guid.value && player.online)
+                    return &player;
+            return nullptr;
+        }
         static Player player;
         return &player;
     }
@@ -138,8 +216,10 @@ struct PlayerbotsMgr
         static PlayerbotsMgr manager;
         return manager;
     }
-    PlayerbotAI* GetPlayerbotAI(Player*)
+    PlayerbotAI* GetPlayerbotAI(Player* player)
     {
+        if (adapterMode)
+            return player == &players[0] ? &gameAI : nullptr;
         static PlayerbotAI ai;
         return &ai;
     }
@@ -170,6 +250,7 @@ bool Observe(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard& guar
 }  // namespace
 
 #include "dispatch-helpers.inc"
+#include "handler-bridge.inc"
 
 namespace
 {
@@ -199,6 +280,8 @@ void ChangeScope()
 
 void Reset()
 {
+    adapterMode = false;
+    OllamaChat_BridgeReset();
     g_queue.clear();
     g_done.clear();
     Check(OllamaBridge::DispatchSlot::Used() == 0, "all physical slots disposed");
@@ -564,6 +647,226 @@ void DrainTest()
     Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::GenerationOnlyNoCaptures),
           "actual drain permits selection");
 }
+
+void AdapterFixture()
+{
+    Reset();
+    g_bridgeWorld.InvalidateScope(gameGuard.scope.botGuid, gameGuard.scope.contextId);
+    adapterMode = true;
+    party = {};
+    for (unsigned i = 0; i < std::size(players); ++i)
+    {
+        players[i] = {};
+        players[i].guid = (i + 1) * 11;
+        players[i].human = i != 0;
+        players[i].name = "Person" + std::to_string(i);
+        players[i].group = &party;
+    }
+    gameAI = {};
+    gameAI.master = &players[1];
+    g_Enable = g_EnableWhisperReplies = true;
+    g_DisableForParty = g_DisableForSayYell = false;
+    g_SayDistance = 25.0f;
+    g_YellDistance = 100.0f;
+    voice = "A quiet traveler.";
+    g_bridgeObserver = OllamaChat_BridgeObserve;
+}
+
+bool AdapterSubmit(ChatChannelSourceLocal source = SRC_PARTY_LOCAL, std::string text = "A public question.")
+{
+    return BridgeSubmit(&players[0], &players[2], source, text, true, "party-99", 0);
+}
+
+void AdapterTests()
+{
+    using namespace OllamaBridge;
+    AdapterFixture();
+    Check(AdapterSubmit(), "real adapter admits human master with separate conversational speaker");
+    auto const& input = g_queue.front().request.bridgeTicket.request.input;
+    Check(g_queue.front().request.bridgeTicket.scope.controllerGuid == 22 && input.speakerGuid == 33 &&
+              !input.speakerControlsBot && input.persona == voice && input.memory.empty(),
+          "controller and speaker remain distinct, audited persona only");
+    Check(input.systemPrompt != config.systemPrompt && input.party.size() == 3 && input.observations.size() == 2 &&
+              input.party[0].role.empty() && input.party[0].healthPercent == -1 && !input.party[0].visibleTargetGuid,
+          "restricted explicit context excludes legacy prompt, role, victim and private history");
+    auto done = Finish();
+    Check(PrepareBridge(done), "adapter completion prepared");
+    DeliverBridge(done, {});
+    Check(g_bridgeBindings[0].memory.find("A public question.") != std::string::npos, "successful exchange remembered");
+    done = {};
+    Check(AdapterSubmit(), "next same-audience request admitted");
+    Check(!g_queue.front().request.bridgeTicket.request.input.memory.empty(), "same-scope memory carried");
+
+    // Each mutation exercises the real adapter through preparation and delivery after a typing delay.
+    std::vector<std::function<void()>> losses = {[] { gameAI.master = &players[3]; },
+                                                 []
+                                                 {
+                                                     gameAI.master = nullptr;
+                                                     party.leader = 33;
+                                                 },
+                                                 [] { players[1].human = false; },
+                                                 [] { players[2].human = false; },
+                                                 [] { players[2].online = false; },
+                                                 [] { players[0].inWorld = false; },
+                                                 [] { gameAI.isBot = false; },
+                                                 [] { party.guid = 100; },
+                                                 [] { party.raid = true; },
+                                                 [] { party.members.push_back({ObjectGuid(44)}); },
+                                                 [] { players[2].group = nullptr; },
+                                                 [] { players[1].group = nullptr; },
+                                                 [] { players[2].map = 2; },
+                                                 [] { players[2].instance = 2; },
+                                                 [] { players[2].phase = 2; },
+                                                 [] { players[2].phase = 3; },
+                                                 [] { players[1].visible = false; },
+                                                 [] { players[2].visible = false; },
+                                                 [] { players[2].distance = 26; },
+                                                 []
+                                                 {
+                                                     players[3].online = false;
+                                                     party.members.push_back({ObjectGuid(44)});
+                                                 },
+                                                 [] { voice += " Revised."; },
+                                                 [] { players[2].name = "Renamed"; },
+                                                 [] { g_DisableForParty = true; },
+                                                 [] { g_Enable = false; },
+                                                 [] { g_bridgeBindings[0].heartbeat.unixMs = 1; },
+                                                 [] { g_bridgeBindings[0].heartbeat.steadyMs = 1; },
+                                                 [] { g_bridgeBindings[0].idleUntil.steadyMs = 1; }};
+    for (auto const& lose : losses)
+    {
+        AdapterFixture();
+        Check(AdapterSubmit(), "loss fixture admitted");
+        done = Finish();
+        g_EnableTypingSimulation = true;
+        Check(PrepareBridge(done) && done.deliverAt > std::chrono::steady_clock::now(), "loss fixture typing delay");
+        lose();
+        DeliverBridge(done, {});
+        Check(!routeCalls && !governorCalls && !recordCalls && g_bridgeBindings.empty(),
+              "world loss invalidates before delivery, including scoped memory");
+        done = {};
+    }
+    AdapterFixture();
+    gameAI.master = nullptr;
+    Check(AdapterSubmit(), "no master permits actual human group leader fallback");
+    Check(g_queue.front().request.bridgeTicket.scope.controllerGuid == 22, "fallback leader captured");
+    AdapterFixture();
+    gameAI.master = &players[3];
+    players[3].human = false;
+    Check(!AdapterSubmit(), "ineligible existing master cannot fall back to eligible leader");
+    AdapterFixture();
+    gameAI.master = nullptr;
+    players[0].group = nullptr;
+    Check(!AdapterSubmit(SRC_WHISPER_LOCAL), "speaker alone cannot grant control");
+    AdapterFixture();
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Private whisper."), "direct admitted");
+    done = Finish();
+    Check(PrepareBridge(done), "private prepared");
+    DeliverBridge(done, {});
+    done = {};
+    Check(AdapterSubmit(), "party after whisper admitted");
+    Check(g_queue.back().request.bridgeTicket.request.input.memory.empty(), "private memory never crosses to party");
+    g_queue.clear();
+    Check(BridgeSubmit(&players[0], &players[1], SRC_WHISPER_LOCAL, "Other speaker", true, "scope", 0),
+          "another direct speaker admitted");
+    Check(g_queue.front().request.bridgeTicket.request.input.memory.empty(), "memory separated by speaker");
+    AdapterFixture();
+    Check(!AdapterSubmit(SRC_RAID_LOCAL), "unsupported raid rejected");
+    Check(!BridgeSubmit(&players[0], &players[2], SRC_SAY_LOCAL, "ambient", false, "scope", 0),
+          "unaddressed ambient skipped");
+    Check(!BridgeSubmit(&players[0], &players[2], SRC_WHISPER_LOCAL, "bot chain", true, "scope", 1),
+          "bot-origin chain rejected");
+    Check(!AdapterSubmit(SRC_PARTY_LOCAL, std::string(4097, 'x')), "text bound fails closed");
+    voice.assign(8193, 'x');
+    Check(!AdapterSubmit(), "persona bound fails closed");
+    voice = "voice";
+    players[2].name.assign(129, 'x');
+    Check(!AdapterSubmit(), "name bound fails closed");
+    AdapterFixture();
+    players[2].distance = 26;
+    Check(!AdapterSubmit(SRC_SAY_LOCAL), "say hearing bound");
+    Check(AdapterSubmit(SRC_YELL_LOCAL), "yell uses its own hearing radius");
+    done = Finish();
+    Check(PrepareBridge(done), "yell prepared");
+    g_YellDistance = 20;
+    DeliverBridge(done, {});
+    Check(!routeCalls, "changed hearing invalidates delayed yell");
+    done = {};
+    AdapterFixture();
+    Check(AdapterSubmit(), "scope renewal fixture");
+    done = Finish();
+    auto const old = done.request.bridgeTicket;
+    players[2].visible = false;
+    OllamaChat_BridgeRefresh();
+    players[2].visible = true;
+    Check(AdapterSubmit(), "fresh eligibility permits new request");
+    Check(!(g_queue.front().request.bridgeTicket.scope == old.scope) && !g_bridgeWorld.Current(old, Now()),
+          "same values after loss cannot revive old tickets");
+    done = {};
+    AdapterFixture();
+    Check(AdapterSubmit(), "outage memory fixture");
+    done = Finish();
+    done.bridgeOutcome = WorldOutcome::Unavailable;
+    Check(PrepareBridge(done), "outage prepared");
+    DeliverBridge(done, {});
+    Check(g_bridgeBindings[0].memory.empty(), "outage is not an exchange memory");
+    done = {};
+    for (unsigned loss = 0; loss < 5; ++loss)
+    {
+        AdapterFixture();
+        Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Private memory marker"), "memory invalidation fixture");
+        done = Finish();
+        Check(PrepareBridge(done), "memory invalidation prepared");
+        DeliverBridge(done, {});
+        done = {};
+        Check(!g_bridgeBindings[0].memory.empty(), "memory exists before invalidation");
+        if (loss == 0)
+            players[2].visible = false;
+        else if (loss == 1)
+            g_bridgeBindings[0].heartbeat.unixMs = 1;
+        else if (loss == 2)
+            g_bridgeBindings[0].heartbeat.steadyMs = 1;
+        else if (loss == 3)
+            party.members.push_back({ObjectGuid(44)});
+        else
+        {
+            g_bridgeWorld.Configured(true, config.bridge, "new-epoch");
+            Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures), "reload selected");
+            g_bridgeGeneration = g_bridgeWorld.Generation();
+        }
+        OllamaChat_BridgeRefresh();
+        Check(g_bridgeBindings.empty(), "loss or reload erases actual stored memory");
+        players[2].visible = true;
+        Check(AdapterSubmit(SRC_WHISPER_LOCAL), "fresh scope after memory invalidation");
+        Check(g_queue.front().request.bridgeTicket.request.input.memory.empty(),
+              "fresh scope cannot recover old memory");
+    }
+    AdapterFixture();
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, std::string(4096, 'x')), "maximum human statement admitted");
+    apiResult.text.assign(4096, 'y');
+    done = Finish();
+    Check(PrepareBridge(done), "maximum exchange prepared");
+    DeliverBridge(done, {});
+    Check(g_bridgeBindings[0].memory.size() <= 8192 && g_bridgeBindings[0].memory.find('y') == std::string::npos,
+          "oversized combined exchange retains bounded human statement only");
+    done = {};
+    AdapterFixture();
+    for (unsigned i = 1; i <= MaxWorldScopes; ++i)
+        Check(BridgeSubmit(&players[0], &players[i], SRC_WHISPER_LOCAL, "Question", true, "scope", 0),
+              "bounded distinct conversation admitted");
+    g_queue.clear();
+    Check(!DispatchSlot::Used() && g_bridgeBindings.size() == MaxWorldScopes,
+          "bindings bounded independently of slots");
+    Check(!BridgeSubmit(&players[0], &players[65], SRC_WHISPER_LOCAL, "Question", true, "scope", 0),
+          "sixty-fifth binding refused even with free worker capacity");
+    for (auto& binding : g_bridgeBindings)
+        binding.idleUntil.steadyMs = 1;
+    OllamaChat_BridgeRefresh();
+    Check(g_bridgeBindings.empty(), "idle bindings and memory retire within bounded lifetime");
+    Check(BridgeSubmit(&players[0], &players[65], SRC_WHISPER_LOCAL, "Question", true, "scope", 0),
+          "expired binding capacity reusable");
+    Reset();
+}
 }  // namespace
 
 int main()
@@ -577,6 +880,7 @@ int main()
         ClaimedScopeTests();
         TerminalTests();
         DrainTest();
+        AdapterTests();
         g_queue.clear();
         g_done.clear();
         Check(!OllamaBridge::DispatchSlot::Used(), "final no leaked slots");

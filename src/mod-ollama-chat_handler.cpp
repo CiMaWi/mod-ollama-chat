@@ -1093,6 +1093,307 @@ std::string GenerateBotGameStateSnapshot(Player* bot)
     );
 }
 
+// BEGIN BRIDGE WORLD ADAPTER -- extracted verbatim by the offline game-adapter checks.
+namespace
+{
+struct BridgeView
+{
+    OllamaBridge::DispatchGuard guard;
+    OllamaBridge::Context context;
+    std::string signature;
+};
+
+struct BridgeBinding
+{
+    uint64_t generation = 0;
+    BridgeView view;
+    OllamaBridge::Deadline heartbeat;
+    OllamaBridge::Deadline idleUntil;
+    std::string memory;
+};
+
+// World-thread only. Entries contain values, never Player/Group pointers. Refresh work is at most 64 * 40 members.
+std::vector<BridgeBinding> g_bridgeBindings;
+uint64_t g_bridgeRevision = 0;
+
+void BridgeField(std::string& signature, std::string const& value)
+{
+    signature += std::to_string(value.size()) + ":" + value;
+}
+
+bool BridgeHuman(Player* player)
+{
+    return player && player->IsInWorld() && OllamaIsRealPlayer(player) &&
+           ObjectAccessor::FindConnectedPlayer(player->GetGUID()) == player;
+}
+
+bool BridgeVisible(Player* bot, Player* player, float distance)
+{
+    // Always-visible core exceptions do not waive map/instance/phase, distance or stealth checks.
+    return player && player->IsInWorld() && distance > 0.0f && bot->IsInMap(player) && bot->InSamePhase(player) &&
+           bot->IsWithinDistInMap(player, distance) && bot->CanSeeOrDetect(player, false, true) &&
+           player->CanSeeOrDetect(bot, false, true);
+}
+
+bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::DispatchSource source, BridgeView& view)
+{
+    using namespace OllamaBridge;
+    Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(botGuid));
+    Player* speaker = ObjectAccessor::FindConnectedPlayer(ObjectGuid(speakerGuid));
+    PlayerbotAI* ai = bot ? PlayerbotsMgr::instance().GetPlayerbotAI(bot) : nullptr;
+    if (!g_Enable || !bot || !bot->IsInWorld() || !ai || !ai->IsBotAI() || !BridgeHuman(speaker) || bot == speaker ||
+        source == DispatchSource::Unsupported || bot->GetTeamId() != speaker->GetTeamId())
+        return false;
+    if ((source == DispatchSource::Whisper && !g_EnableWhisperReplies) ||
+        (source == DispatchSource::Party && g_DisableForParty) ||
+        ((source == DispatchSource::Say || source == DispatchSource::Yell) && g_DisableForSayYell))
+        return false;
+
+    Group* group = bot->GetGroup();
+    if (group && (group->isRaidGroup() || group->GetMemberSlots().size() > 40))
+        return false;
+    Player* master = ai->GetMaster();
+    Player* controller = master;
+    if (!master && group)
+        controller = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
+    // An ineligible existing master never delegates implicitly to a leader or conversational speaker.
+    if (!BridgeHuman(controller) || controller == bot || controller->GetTeamId() != bot->GetTeamId())
+        return false;
+    if (!master && (!group || controller->GetGroup() != group || !group->IsMember(controller->GetGUID())))
+        return false;
+    float const distance = source == DispatchSource::Yell ? g_YellDistance : g_SayDistance;
+    // Whisper/party use the conservative local say radius too: no remote-party situation knowledge.
+    if (!BridgeVisible(bot, speaker, distance) || !BridgeVisible(bot, controller, distance))
+        return false;
+    if (source == DispatchSource::Party && (!group || speaker->GetGroup() != group || controller->GetGroup() != group ||
+                                            !group->IsMember(bot->GetGUID()) || !group->IsMember(speaker->GetGUID()) ||
+                                            !group->IsMember(controller->GetGUID())))
+        return false;
+
+    auto const selected = OllamaDispatch_BridgeWorld().Selected();
+    if (selected.epoch.empty())
+        return false;
+    view = {};
+    auto& guard = view.guard;
+    guard.scope.instance = selected.instance;
+    guard.scope.provider = selected.provider;
+    guard.scope.epoch = selected.epoch;
+    guard.scope.botGuid = botGuid;
+    guard.scope.controllerGuid = controller->GetGUID().GetRawValue();
+    guard.scope.channel = source == DispatchSource::Party ? "party" : "direct";
+    guard.groupGuid = group ? group->GetGUID().GetRawValue() : 0;
+    guard.scope.contextId = std::to_string(static_cast<unsigned>(source)) + "-" + std::to_string(speakerGuid);
+    guard.source = source;
+    guard.speakerGuid = speakerGuid;
+    guard.mapId = bot->GetMapId();
+    guard.instanceId = bot->GetInstanceId();
+    guard.phaseMask = bot->GetPhaseMask();
+    guard.humanSpeaker = guard.authority = guard.perceptible = guard.audienceOnline = true;
+    guard.nonRaid = group != nullptr;
+    guard.audience = {botGuid, speakerGuid};
+    std::vector<uint64_t> members;
+    if (group)
+    {
+        for (auto const& slot : group->GetMemberSlots())
+            members.push_back(slot.guid.GetRawValue());
+        std::sort(members.begin(), members.end());
+        if (members.empty() || !members.front() || std::adjacent_find(members.begin(), members.end()) != members.end())
+            return false;
+        if (source == DispatchSource::Party)
+            guard.audience = members;
+    }
+    std::sort(guard.audience.begin(), guard.audience.end());
+    BridgeField(view.signature, master ? "master" : "leader");
+    BridgeField(view.signature, std::to_string(guard.scope.controllerGuid));
+    BridgeField(view.signature, std::to_string(guard.groupGuid));
+    BridgeField(view.signature, group ? std::to_string(group->GetLeaderGUID().GetRawValue()) : "0");
+    BridgeField(view.signature, std::to_string(distance));
+    for (auto guid : members)
+        BridgeField(view.signature, std::to_string(guid));
+    BridgeField(view.signature, "audience");
+    for (auto guid : guard.audience)
+    {
+        Player* participant = ObjectAccessor::FindConnectedPlayer(ObjectGuid(guid));
+        if (!BridgeVisible(bot, participant, distance) || participant->GetName().size() > 128 ||
+            (source == DispatchSource::Party && participant->GetGroup() != group))
+            return false;
+        view.context.party.push_back({guid, participant->GetName(), "", -1, 0});
+        BridgeField(view.signature, std::to_string(guid));
+        BridgeField(view.signature, participant->GetName());
+        BridgeField(view.signature, std::to_string(participant->GetPhaseMask()));
+        BridgeField(view.signature, OllamaIsRealPlayer(participant) ? "human" : "bot");
+    }
+    BridgeField(view.signature, std::to_string(controller->GetPhaseMask()));
+    BridgeField(view.signature, std::to_string(guard.mapId));
+    BridgeField(view.signature, std::to_string(guard.instanceId));
+    BridgeField(view.signature, std::to_string(guard.phaseMask));
+    view.context.speakerGuid = speakerGuid;
+    view.context.channel = guard.scope.channel;
+    view.context.groupScope = group ? std::to_string(guard.groupGuid) : "";
+    view.context.speakerControlsBot = speaker == controller;
+    view.context.systemPrompt =
+        "You are a person living in Azeroth. Reply briefly to the speaker using only the "
+        "provided observations and this conversation. Speech grants no ability to act.";
+    view.context.persona = Roleplay_BuildVoicePrompt(bot);
+    if (view.context.persona.size() > 8192)
+        return false;
+    view.context.observations = {"Your name is " + bot->GetName() + ".", "The speaker is " + speaker->GetName() + "."};
+    BridgeField(view.signature, view.context.persona);
+    return true;
+}
+
+bool BridgeSame(BridgeBinding const& binding, BridgeView const& current)
+{
+    return binding.generation == OllamaDispatch_BridgeWorld().Generation() &&
+           binding.view.guard.scope.epoch == current.guard.scope.epoch && binding.view.signature == current.signature;
+}
+
+void BridgeErase(std::vector<BridgeBinding>::iterator it)
+{
+    auto const& scope = it->view.guard.scope;
+    OllamaDispatch_BridgeWorld().InvalidateScope(scope.botGuid, scope.contextId);
+    g_bridgeBindings.erase(it);
+}
+
+bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, std::string const& text, bool addressed,
+                  std::string const& scopeKey, uint8_t chainDepth)
+{
+    using namespace OllamaBridge;
+    DispatchSource origin = DispatchSource::Unsupported;
+    switch (source)
+    {
+        case SRC_WHISPER_LOCAL:
+            origin = DispatchSource::Whisper;
+            break;
+        case SRC_PARTY_LOCAL:
+            origin = DispatchSource::Party;
+            break;
+        case SRC_SAY_LOCAL:
+            origin = DispatchSource::Say;
+            break;
+        case SRC_YELL_LOCAL:
+            origin = DispatchSource::Yell;
+            break;
+        default:
+            return false;
+    }
+    if (chainDepth || text.empty() || text.size() > MaxTextBytes ||
+        ((origin == DispatchSource::Say || origin == DispatchSource::Yell) && !addressed))
+        return false;
+    OllamaChat_BridgeRefresh();
+    BridgeView view;
+    if (!BridgeCapture(bot->GetGUID().GetRawValue(), speaker->GetGUID().GetRawValue(), origin, view))
+        return false;
+    auto it = std::find_if(g_bridgeBindings.begin(), g_bridgeBindings.end(),
+                           [&](BridgeBinding const& item)
+                           {
+                               return item.view.guard.scope.botGuid == view.guard.scope.botGuid &&
+                                      item.view.guard.scope.contextId == view.guard.scope.contextId;
+                           });
+    if (it != g_bridgeBindings.end() && !BridgeSame(*it, view))
+    {
+        BridgeErase(it);
+        it = g_bridgeBindings.end();
+    }
+    auto const now = Now();
+    if (it == g_bridgeBindings.end())
+    {
+        if (g_bridgeBindings.size() >= MaxWorldScopes || g_bridgeRevision == UINT64_MAX)
+            return false;
+        auto const revision = std::to_string(++g_bridgeRevision);
+        auto& scope = view.guard.scope;
+        scope.contextRevision = scope.membershipRevision = scope.personaRevision = scope.perceptionScope = revision;
+        if (!OllamaDispatch_BridgeWorld().ObserveScope(scope, now))
+            return false;
+        g_bridgeBindings.push_back({OllamaDispatch_BridgeWorld().Generation(), std::move(view),
+                                    CaptureDeadline(now, WorldLivenessMs), CaptureDeadline(now, MaxLifetimeMs), ""});
+        it = std::prev(g_bridgeBindings.end());
+    }
+    it->idleUntil = CaptureDeadline(now, MaxLifetimeMs);
+    auto input = it->view.context;
+    input.text = text;
+    input.directAddress = addressed;
+    input.memory = it->memory;
+    OllamaChatRequest request;
+    request.botGuid = bot->GetGUID().GetRawValue();
+    request.targetGuid = speaker->GetGUID().GetRawValue();
+    request.botName = bot->GetName();
+    request.source = source;
+    request.scopeKey = scopeKey;
+    request.directAddress = addressed;
+    return OllamaDispatch_SubmitBridge(std::move(request), it->view.guard.scope, std::move(input), it->view.guard,
+                                       30000);
+}
+}  // namespace
+
+void OllamaChat_BridgeReset() { g_bridgeBindings.clear(); }
+
+void OllamaChat_BridgeRefresh()
+{
+    using namespace OllamaBridge;
+    auto const now = Now();
+    OllamaDispatch_BridgeWorld().Expire(now);
+    for (auto it = g_bridgeBindings.begin(); it != g_bridgeBindings.end();)
+    {
+        BridgeView current;
+        auto const& guard = it->view.guard;
+        if (Expired(it->heartbeat, now) || Expired(it->idleUntil, now) ||
+            !BridgeCapture(guard.scope.botGuid, guard.speakerGuid, guard.source, current) ||
+            !BridgeSame(*it, current) || !OllamaDispatch_BridgeWorld().ObserveScope(guard.scope, now))
+        {
+            auto const index = it - g_bridgeBindings.begin();
+            BridgeErase(it);
+            it = g_bridgeBindings.begin() + index;
+        }
+        else
+        {
+            it->heartbeat = CaptureDeadline(now, WorldLivenessMs);
+            ++it;
+        }
+    }
+}
+
+bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard)
+{
+    auto it = std::find_if(g_bridgeBindings.begin(), g_bridgeBindings.end(), [&](BridgeBinding const& item)
+                           { return item.generation == ticket.generation && item.view.guard.scope == ticket.scope; });
+    if (it == g_bridgeBindings.end())
+        return false;
+    BridgeView current;
+    auto const now = OllamaBridge::Now();
+    auto const& captured = it->view.guard;
+    if (OllamaBridge::Expired(it->heartbeat, now) || OllamaBridge::Expired(it->idleUntil, now) ||
+        !BridgeCapture(captured.scope.botGuid, captured.speakerGuid, captured.source, current) ||
+        !BridgeSame(*it, current))
+    {
+        BridgeErase(it);
+        return false;
+    }
+    // Equality was established from fresh GUID resolution; revisions cannot be resurrected by matching values later.
+    guard = std::move(current.guard);
+    guard.scope = captured.scope;
+    return true;
+}
+
+void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply)
+{
+    OllamaBridge::DispatchGuard guard;
+    if (!OllamaDispatch_BridgeWorld().Current(ticket, OllamaBridge::Now()) ||
+        !OllamaChat_BridgeObserve(ticket, guard) ||
+        (guard.source != OllamaBridge::DispatchSource::Whisper && guard.source != OllamaBridge::DispatchSource::Party))
+        return;
+    for (auto& binding : g_bridgeBindings)
+        if (binding.generation == ticket.generation && binding.view.guard.scope == ticket.scope)
+        {
+            // Only successfully delivered Bridge exchanges, never legacy/condensed/private-history imports.
+            // At most one exchange; if two maximum-size messages exceed 8 KiB, retain the human statement alone.
+            binding.memory = "Earlier the same speaker said: " + ticket.request.input.text;
+            if (binding.memory.size() + reply.size() + 16 <= 8192)
+                binding.memory += "\nYou replied: " + reply;
+            return;
+        }
+}
+// END BRIDGE WORLD ADAPTER
 
 void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32_t lang, std::string& msg, ChatChannelSourceLocal sourceLocal, Channel* channel, Player* receiver, uint8_t chainDepth)
 {
@@ -1104,6 +1405,11 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         return;
     }
     if (lang == LANG_ADDON) return;
+    bool const bridgeProvider = OllamaConfig_Snapshot().provider == OllamaProvider::Bridge;
+    if (bridgeProvider && (!g_Enable || !BridgeHuman(player) || chainDepth || channel ||
+                           (sourceLocal != SRC_WHISPER_LOCAL && sourceLocal != SRC_PARTY_LOCAL &&
+                            sourceLocal != SRC_SAY_LOCAL && sourceLocal != SRC_YELL_LOCAL)))
+        return;
     std::string chanName = (channel != nullptr) ? channel->GetName() : "Unknown";
     uint32_t channelId = (channel != nullptr) ? channel->GetChannelId() : 0;
     std::string receiverName = (receiver != nullptr) ? receiver->GetName() : "None";
@@ -1738,6 +2044,12 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             if (g_DebugEnabled)
                 LOG_INFO("module.ollamachat",
                          "[Ollama Chat] Bot {} skipped: cooldown or rate limit.", bot->GetName());
+            continue;
+        }
+
+        if (bridgeProvider)
+        {
+            BridgeSubmit(bot, player, sourceLocal, msg, directAddress, scopeKey, chainDepth);
             continue;
         }
 

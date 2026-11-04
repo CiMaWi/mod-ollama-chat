@@ -470,6 +470,8 @@ namespace
             return;
         Governor_RecordUtterance(botGuid, c.request.scopeKey, c.text);
         ++g_totalDelivered;
+        if (c.bridgeOutcome == OllamaBridge::WorldOutcome::Success && BridgeCurrent(c))
+            OllamaChat_BridgeRemember(c.request.bridgeTicket, c.text);
         // Neither outage nor success enters legacy memory, history, expression, sentiment or bot-chain paths.
     }
 
@@ -603,6 +605,7 @@ void OllamaDispatch_BridgeConfigured()
 {
     // Existing startup/reload callers run on the world thread. This is no native activation receipt.
     g_bridgeGeneration = 0;
+    OllamaChat_BridgeReset();
     OllamaBridge_SetActivation({});
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
@@ -637,6 +640,7 @@ void OllamaDispatch_Start()
         return;
 
     g_running = true;
+    g_bridgeObserver = OllamaChat_BridgeObserve;
 
     uint32_t count = g_DispatchWorkerThreads;
     if (count == 0)
@@ -655,6 +659,7 @@ void OllamaDispatch_Stop()
 {
     // Revoke before the existing terminal legacy-pool join. Reload/tick never joins workers.
     g_bridgeGeneration = 0;
+    OllamaChat_BridgeReset();
     OllamaBridge_SetActivation({});
     g_bridgeWorld.Shutdown();
     {
@@ -846,6 +851,7 @@ void OllamaDispatch_SubmitSentiment(uint64_t botGuid, uint64_t playerGuid,
 void OllamaDispatch_Update(uint32_t /*diff*/)
 {
     g_bridgeWorld.Expire(OllamaBridge::Now());
+    OllamaChat_BridgeRefresh();
     // J4 generation intents have no strategy captures or typed execution.
     // Future strategy owners must replace this proof; unknown obligations fail closed.
     if (g_bridgeWorld.ObserveDrain(g_bridgeInFlight.load() == 0,
