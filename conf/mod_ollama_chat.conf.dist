@@ -52,6 +52,10 @@ OllamaChat.DebugShowFullPrompt = 0
 #                             directly. (Claude is also reachable through
 #                             OpenRouter using the openai format.)
 #
+#                  bridge     Local native subscription bridge. Requires a game-bound
+#                             request and explicit local-link settings below. The
+#                             module never reads native credentials or selects models.
+#
 #                  Example settings for each:
 #
 #                    OpenAI
@@ -95,6 +99,35 @@ OllamaChat.DebugShowFullPrompt = 0
 #
 #     Default:     ollama
 OllamaChat.Provider = ollama
+
+# OllamaChat.Bridge.Instance / Provider / Endpoint / Token
+#     Description: Used only with Provider = bridge; empty defaults fail closed.
+#                  Instance identifies this game instance; Provider identifies the selected
+#                  native bridge (for example codex or claude), not a model or API format.
+#                  Instance and Provider start with an ASCII letter or digit and use
+#                  1-128 ASCII letters, digits, dot, colon, underscore or hyphen. Endpoint
+#                  must be http://127.0.0.1 with an optional port in 1-65535, and no path,
+#                  query, credentials or trailing slash.
+#                  The module posts to /v1/generate. Url, Model, ApiKey, ApiKeyHeader and
+#                  reasoning/sampling settings are not sent to the bridge.
+#
+#                  Provision the same independent local bearer at both ends explicitly,
+#                  with at least 128 random bits encoded as base64url or hex (22-512
+#                  characters). TokenRef in selection JSON is only a reference: never
+#                  put the bearer there or reuse native subscription/API credentials.
+#                  Restrict local config file access as for the database password.
+#                  No token, request body or remote error body is logged by this path.
+#
+#                  Reload publishes settings; it does not activate a bridge or acknowledge
+#                  CLI selection. The trusted game owner must retire old work and provide
+#                  a fresh epoch before generation can run. Queued requests keep their
+#                  captured settings/identity/deadline. World delivery rechecks authority.
+#                  This path has no automatic provider switch, retry or LLM fallback.
+#     Default:     all empty (bridge generation disabled)
+OllamaChat.Bridge.Instance =
+OllamaChat.Bridge.Provider =
+OllamaChat.Bridge.Endpoint =
+OllamaChat.Bridge.Token =
 
 # OllamaChat.Url
 #     Description: The full URL of the generation endpoint for the configured

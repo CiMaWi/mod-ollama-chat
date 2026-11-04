@@ -23,6 +23,7 @@ namespace
 
     std::mutex             g_settingsMutex;
     OllamaEndpointSettings g_settings;
+    OllamaBridge::Circuit g_bridgeCircuit;
 
     // Per-session self-heals for OpenAI-format endpoints, learned from one
     // HTTP 400 each and remembered so the next request does not repeat it:
@@ -545,6 +546,7 @@ namespace
 void OllamaConfig_Publish()
 {
     OllamaEndpointSettings next;
+    next.bridge = g_OllamaBridgeSettings;
     next.url              = g_OllamaUrl;
     next.model            = g_OllamaModel;
     next.systemPrompt     = g_OllamaSystemPrompt;
@@ -587,6 +589,9 @@ OllamaEndpointSettings OllamaConfig_Snapshot()
 
 OllamaHttpHeaders OllamaBuildRequestHeaders(const OllamaEndpointSettings& cfg)
 {
+    if (cfg.provider == OllamaProvider::Bridge)
+        return OllamaBridge::Headers(cfg.bridge);
+
     OllamaHttpHeaders headers;
 
     if (cfg.provider == OllamaProvider::Anthropic)
@@ -626,15 +631,25 @@ OllamaHttpHeaders OllamaBuildRequestHeaders(const OllamaEndpointSettings& cfg)
 
 OllamaApiResult QueryOllama(const std::string& prompt, OllamaRequestKind kind)
 {
+    return QueryOllama(prompt, kind, OllamaConfig_Snapshot());
+}
+
+OllamaApiResult QueryOllama(std::string const& prompt, OllamaRequestKind kind, OllamaEndpointSettings const& cfg)
+{
     OllamaApiResult result;
+    // Never reinterpret background/legacy prompts as an authorized bridge request.
+    // This gate precedes capability policy, provider builders, retries and all HTTP.
+    if (cfg.provider == OllamaProvider::Bridge)
+    {
+        result.error = "bridge_requires_bound_request";
+        return result;
+    }
 
     if (prompt.empty())
     {
         result.error = "empty prompt";
         return result;
     }
-
-    const OllamaEndpointSettings cfg = OllamaConfig_Snapshot();
 
     // One place decides what the "think" field should be: policy for this
     // request kind, plus everything learned about this model so far.
@@ -812,6 +827,35 @@ OllamaApiResult QueryOllama(const std::string& prompt, OllamaRequestKind kind)
             LOG_INFO("module.ollamachat", "[Ollama Chat] Model reasoning: {}", result.thinking);
     }
 
+    return result;
+}
+
+void OllamaBridge_SetActivation(OllamaBridge::Identity identity)
+{
+    // Trusted game owner only, after retirement/drain/restoration. Publishing config
+    // deliberately does not call this, grant authority or acknowledge selection intent.
+    g_bridgeCircuit.Reset(std::move(identity));
+}
+
+OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, OllamaBridge::Request const& request)
+{
+    OllamaApiResult result;
+    if (settings.provider != OllamaProvider::Bridge || !OllamaBridge::ValidSettings(settings.bridge))
+    {
+        result.error = "bridge_invalid_configuration";
+        return result;
+    }
+    auto const started = std::chrono::steady_clock::now();
+    auto bridge = OllamaBridge::Generate(
+        settings.bridge, request, g_bridgeCircuit, OllamaBridge::Now,
+        [](OllamaBridge::Settings const& link, std::string const& body, int64_t remainingMs)
+        { return OllamaHttp_PostBridge(link.endpoint, body, OllamaBridge::Headers(link), remainingMs); });
+    result.latencyMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
+    result.ok = bridge.ok;
+    result.text = std::move(bridge.text);
+    result.error = std::move(bridge.error);
+    result.status = bridge.status;
     return result;
 }
 

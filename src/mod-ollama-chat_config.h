@@ -10,6 +10,7 @@
 #include <utility>
 #include <mutex>
 #include <ctime>
+#include "mod-ollama-chat_bridge.h"
 #include "ScriptMgr.h"  // Ensure WorldScript is defined
 
 // --------------------------------------------
@@ -54,6 +55,7 @@ enum class OllamaProvider : uint8_t
                     // Mistral, DeepSeek, xAI, Gemini (compat endpoint), LM Studio,
                     // vLLM, llama.cpp server, and Ollama's own /v1/chat/completions
     Anthropic,      // Anthropic Messages API (Claude)
+    Bridge,      // Local subscription bridge; requires a game-bound request.
 };
 
 OllamaProvider OllamaProvider_Parse(const std::string& text);
@@ -62,6 +64,7 @@ const char*    OllamaProvider_Name(OllamaProvider provider);
 extern std::string g_OllamaUrl;
 extern std::string g_OllamaModel;
 extern OllamaProvider g_OllamaProvider;
+extern OllamaBridge::Settings g_OllamaBridgeSettings;  // World-thread load/publish only.
 extern std::string g_OllamaApiKey;            // never log this
 extern std::string g_OllamaApiKeyHeader;      // empty = provider default header
 extern int32_t     g_OllamaVerifyCertificates; // -1 auto (on when ApiKey set), 0 off, 1 on

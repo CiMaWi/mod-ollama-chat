@@ -95,8 +95,10 @@ OllamaHttpHeaders OllamaBuildRequestHeaders(const OllamaEndpointSettings& cfg);
 // Blocking. Call from a worker thread, never from the world thread.
 OllamaApiResult QueryOllama(const std::string& prompt, OllamaRequestKind kind);
 
-// Integration seam for submission-time snapshots. Implemented by the J4a config/API
-// integration; no existing caller uses these declarations until that integration lands.
+// Capture settings on world submission and carry that owned value with queued work.
+// Prompt-only calls reject Bridge: it requires the explicit game-bound request below.
+// The returned text is a validated generation intent, never an execution acknowledgement.
+// Delivery must still revalidate activation, audience, authority and expiry on the world thread.
 OllamaApiResult QueryOllama(std::string const& prompt, OllamaRequestKind kind, OllamaEndpointSettings const& settings);
 OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, OllamaBridge::Request const& request);
 

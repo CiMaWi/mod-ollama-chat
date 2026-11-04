@@ -51,6 +51,7 @@ uint32_t   g_EventChatterMaxBotsPerPlayer    = 2;
 std::string g_OllamaUrl        = "http://localhost:11434/api/generate";
 std::string g_OllamaModel      = "llama3.2:1b";
 OllamaProvider g_OllamaProvider = OllamaProvider::Ollama;
+OllamaBridge::Settings g_OllamaBridgeSettings;
 std::string g_OllamaApiKey;
 std::string g_OllamaApiKeyHeader;
 int32_t     g_OllamaVerifyCertificates = -1;
@@ -83,8 +84,11 @@ OllamaProvider OllamaProvider_Parse(const std::string& text)
     if (lower == "anthropic" || lower == "claude")
         return OllamaProvider::Anthropic;
 
+    if (lower == "bridge")
+        return OllamaProvider::Bridge;
+
     LOG_WARN("module.ollamachat",
-             "[Ollama Chat] Unknown OllamaChat.Provider '{}'; expected ollama, openai or anthropic. "
+             "[Ollama Chat] Unknown OllamaChat.Provider '{}'; expected ollama, openai, anthropic or bridge. "
              "Falling back to ollama.", text);
     return OllamaProvider::Ollama;
 }
@@ -93,6 +97,8 @@ const char* OllamaProvider_Name(OllamaProvider provider)
 {
     switch (provider)
     {
+        case OllamaProvider::Bridge:
+            return "bridge";
         case OllamaProvider::OpenAI:    return "openai";
         case OllamaProvider::Anthropic: return "anthropic";
         default:                        return "ollama";
@@ -571,9 +577,17 @@ void LoadOllamaChatConfig()
     g_OllamaApiKeyHeader              = sConfigMgr->GetOption<std::string>("OllamaChat.ApiKeyHeader", "");
     g_OllamaVerifyCertificates        = sConfigMgr->GetOption<int32_t>("OllamaChat.VerifyCertificates", -1);
 
+    g_OllamaBridgeSettings.instance = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Instance", "");
+    g_OllamaBridgeSettings.provider = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Provider", "");
+    g_OllamaBridgeSettings.endpoint = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Endpoint", "");
+    g_OllamaBridgeSettings.token = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Token", "");
+    if (g_OllamaProvider == OllamaProvider::Bridge && !OllamaBridge::ValidSettings(g_OllamaBridgeSettings))
+        LOG_ERROR("module.ollamachat", "[Ollama Chat] Invalid bridge configuration; generation is disabled.");
+
     // The endpoint path is provider-specific and the most common mistake is
     // switching Provider while leaving Url on Ollama's /api/generate. Warn,
     // do not override: proxies and self-hosted gateways use arbitrary paths.
+    if (g_OllamaProvider != OllamaProvider::Bridge)
     {
         const char* expected = nullptr;
         switch (g_OllamaProvider)
