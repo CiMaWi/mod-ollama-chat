@@ -1,6 +1,7 @@
 #ifndef MOD_OLLAMA_CHAT_HTTPCLIENT_H
 #define MOD_OLLAMA_CHAT_HTTPCLIENT_H
 
+#include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
@@ -25,6 +26,12 @@ struct OllamaHttpResult
 
 // True when the module was compiled with OpenSSL, i.e. https:// URLs work.
 bool OllamaHttp_TlsAvailable();
+
+// Dedicated silent local-link operation. A fresh nonredirecting socket, a 250 ms
+// connection cap, a total monotonic deadline, and a streaming response byte cap.
+// Does not consult config globals, use hosted keys, retry, or log a remote body.
+OllamaHttpResult OllamaHttp_PostBridge(std::string const& baseUrl, std::string const& jsonData,
+                                       OllamaHttpHeaders const& headers, int64_t remainingMs);
 
 class OllamaHttpClient
 {

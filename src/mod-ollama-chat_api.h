@@ -1,11 +1,13 @@
 #ifndef MOD_OLLAMA_CHAT_API_H
 #define MOD_OLLAMA_CHAT_API_H
 
+#include <cstdint>
+#include <string>
+
+#include "mod-ollama-chat_bridge.h"
 #include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_config.h"
 #include "mod-ollama-chat_httpclient.h"
-#include <string>
-#include <cstdint>
 
 // Result of one generation call. The old API returned a bare string, so
 // "server unreachable", "model refused to think" and "model said nothing"
@@ -38,6 +40,9 @@ struct OllamaApiResult
 // --------------------------------------------------------------------------
 struct OllamaEndpointSettings
 {
+    // Owned local-link configuration. No native credential is read by this module.
+    OllamaBridge::Settings bridge;
+
     std::string url;
     std::string model;
     std::string systemPrompt;
@@ -89,6 +94,15 @@ OllamaHttpHeaders OllamaBuildRequestHeaders(const OllamaEndpointSettings& cfg);
 //
 // Blocking. Call from a worker thread, never from the world thread.
 OllamaApiResult QueryOllama(const std::string& prompt, OllamaRequestKind kind);
+
+// Integration seam for submission-time snapshots. Implemented by the J4a config/API
+// integration; no existing caller uses these declarations until that integration lands.
+OllamaApiResult QueryOllama(std::string const& prompt, OllamaRequestKind kind, OllamaEndpointSettings const& settings);
+OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, OllamaBridge::Request const& request);
+
+// Trusted world-owner lifecycle seam, never called by selection files or bridge input.
+// Retirement/drain/restoration checks belong to that owner before activating an identity.
+void OllamaBridge_SetActivation(OllamaBridge::Identity identity);
 
 // Legacy shim: returns the text, or empty on any failure.
 std::string QueryOllamaAPI(const std::string& prompt);

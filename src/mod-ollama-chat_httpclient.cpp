@@ -1,4 +1,6 @@
 #include "mod-ollama-chat_httpclient.h"
+
+#include "mod-ollama-chat_bridge.h"
 #include "mod-ollama-chat_config.h"
 
 // Rename the httplib namespace to avoid ODR/ABI collisions with other modules
@@ -7,14 +9,285 @@
 #define httplib ollamachat_httplib
 #include <httplib.h>
 
-#include "Log.h"
+#include <algorithm>
+#include <array>
+#include <chrono>
 #include <memory>
 #include <regex>
 #include <sstream>
 #include <unordered_map>
 
+#include "Log.h"
+
 namespace
 {
+// Keep SIGPIPE protection local to this transport, independent of process signal handlers.
+#if defined(MSG_NOSIGNAL)
+constexpr int BridgeSendFlags = CPPHTTPLIB_SEND_FLAGS | MSG_NOSIGNAL;
+#else
+constexpr int BridgeSendFlags = CPPHTTPLIB_SEND_FLAGS;
+#endif
+
+// The injected option setter lets Windows tests exercise checked POSIX setup failure.
+template <typename SetOption>
+bool ConfigureBridgeSignalSafety(socket_t socket, bool sendIsSafe, int socketOption, SetOption setOption)
+{
+    if (sendIsSafe)
+        return true;
+    return socketOption != 0 && setOption(socket, SOL_SOCKET, socketOption, 1);
+}
+
+bool ConfigureBridgeSignalSafety(socket_t socket)
+{
+#if defined(_WIN64) || (defined(MSG_NOSIGNAL) && !defined(SO_NOSIGPIPE))
+    constexpr bool sendIsSafe = true;
+#else
+    constexpr bool sendIsSafe = false;
+#endif
+#ifdef SO_NOSIGPIPE
+    constexpr int socketOption = SO_NOSIGPIPE;
+#else
+    constexpr int socketOption = 0;
+#endif
+    return ConfigureBridgeSignalSafety(socket, sendIsSafe, socketOption,
+                                       [](socket_t target, int level, int option, int value)
+                                       { return httplib::detail::set_socket_opt(target, level, option, value); });
+}
+
+// Check the absolute deadline even for buffered input. Socket I/O is nonblocking:
+// readiness is not a guarantee that a subsequent send can finish without waiting.
+class BridgeDeadlineStream final : public httplib::Stream
+{
+public:
+    BridgeDeadlineStream(socket_t socket, std::chrono::steady_clock::time_point started,
+                         std::chrono::steady_clock::time_point expires)
+        : _socket(socket), _started(started), _expires(expires)
+    {
+    }
+
+    bool is_readable() const override { return Alive() && _offset < _size; }
+    bool wait_readable() const override { return is_readable() || Wait(false); }
+    bool wait_writable() const override { return Wait(true); }
+
+    ssize_t read(char* data, std::size_t size) override
+    {
+        if (!Alive())
+            return -1;
+        if (_offset == _size)
+        {
+            ssize_t received;
+            do
+            {
+                if (!Wait(false))
+                    return -1;
+                received = ::recv(_socket, _buffer.data(), static_cast<int>(_buffer.size()), CPPHTTPLIB_RECV_FLAGS);
+            } while (received < 0 && Retry());
+            if (received <= 0 || !Alive())
+                return received <= 0 ? received : -1;
+            _offset = 0;
+            _size = static_cast<std::size_t>(received);
+        }
+        auto const count = std::min(size, _size - _offset);
+        std::copy_n(_buffer.data() + _offset, count, data);
+        _offset += count;
+        return static_cast<ssize_t>(count);
+    }
+
+    ssize_t write(char const* data, std::size_t size) override
+    {
+        ssize_t sent;
+        do
+        {
+            if (!Wait(true))
+                return -1;
+            auto const count = static_cast<int>(std::min<std::size_t>(size, 65536));
+            sent = ::send(_socket, data, count, BridgeSendFlags);
+        } while (sent < 0 && Retry());
+        return Alive() ? sent : -1;
+    }
+
+    void get_remote_ip_and_port(std::string& ip, int& port) const override
+    {
+        httplib::detail::get_remote_ip_and_port(_socket, ip, port);
+    }
+    void get_local_ip_and_port(std::string& ip, int& port) const override
+    {
+        httplib::detail::get_local_ip_and_port(_socket, ip, port);
+    }
+    socket_t socket() const override { return _socket; }
+    time_t duration() const override
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - _started)
+            .count();
+    }
+
+private:
+    bool Alive() const { return std::chrono::steady_clock::now() < _expires; }
+
+    bool Wait(bool write) const
+    {
+        auto const remaining = _expires - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero())
+            return false;
+        auto timeout = std::chrono::ceil<std::chrono::milliseconds>(remaining).count();
+        if (write)
+            timeout = std::min<int64_t>(timeout, 1000);
+        pollfd descriptor{};
+        descriptor.fd = _socket;
+        descriptor.events = write ? POLLOUT : POLLIN;
+        // Fail closed on an interrupted poll; never restart a stale wait budget.
+        return httplib::detail::poll_wrapper(&descriptor, 1, static_cast<int>(timeout)) > 0 && Alive();
+    }
+
+    static bool Retry()
+    {
+#ifdef _WIN64
+        int const error = WSAGetLastError();
+        return error == WSAEWOULDBLOCK || error == WSAEINTR;
+#else
+        return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR;
+#endif
+    }
+
+    socket_t const _socket;
+    std::chrono::steady_clock::time_point const _started;
+    std::chrono::steady_clock::time_point const _expires;
+    std::array<char, 4096> _buffer{};
+    std::size_t _offset = 0;
+    std::size_t _size = 0;
+};
+
+// One wait only: EINTR fails closed instead of renewing a relative timeout.
+// Injected wait/clock arguments let the standalone harness prove this path.
+template <typename Poll, typename Clock>
+httplib::Error WaitForBridgeConnect(socket_t socket, std::chrono::steady_clock::time_point expires, Poll poll,
+                                    Clock now)
+{
+    auto const remaining = expires - now();
+    if (remaining <= std::chrono::steady_clock::duration::zero())
+        return httplib::Error::ConnectionTimeout;
+    pollfd descriptor{};
+    descriptor.fd = socket;
+    descriptor.events = POLLIN | POLLOUT;
+    auto const timeout = std::chrono::ceil<std::chrono::milliseconds>(remaining).count();
+    int const result = poll(&descriptor, 1, static_cast<int>(timeout));
+    if (now() >= expires || result == 0)
+        return httplib::Error::ConnectionTimeout;
+    if (result < 0 || !(descriptor.revents & (POLLIN | POLLOUT)))
+        return httplib::Error::Connection;
+    int error = 0;
+    socklen_t length = sizeof(error);
+    if (::getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&error), &length) != 0 || error != 0)
+        return httplib::Error::Connection;
+    return now() < expires ? httplib::Error::Success : httplib::Error::ConnectionTimeout;
+}
+
+// The supported stream hook keeps connected socket ownership/cleanup in httplib and all
+// deadline enforcement on this worker. No cancellation thread survives Post.
+class BridgeDeadlineClient final : public httplib::ClientImpl
+{
+public:
+    BridgeDeadlineClient(std::string const& host, int port, std::chrono::steady_clock::time_point expires)
+        : httplib::ClientImpl(host, port), _expires(expires)
+    {
+    }
+
+protected:
+    bool create_and_connect_socket(Socket& socket, httplib::Error& error) override
+    {
+        auto const started = std::chrono::steady_clock::now();
+        auto const expires = std::min(_expires, started + std::chrono::milliseconds(250));
+        error = httplib::Error::ConnectionTimeout;
+        if (started >= expires)
+            return false;
+        error = httplib::Error::Connection;
+        if (host_ != "127.0.0.1" || port_ <= 0 || port_ > 65535)
+            return false;
+
+        // No resolver or alternate address attempts: this transport is literal IPv4 loopback only.
+#ifdef _WIN64
+        socket_t owned =
+            WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_NO_HANDLE_INHERIT | WSA_FLAG_OVERLAPPED);
+#elif defined(SOCK_CLOEXEC)
+        socket_t owned = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
+#else
+        socket_t owned = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+#endif
+        if (owned == INVALID_SOCKET)
+            return false;
+        auto cleanup = httplib::detail::scope_exit(
+            [&]
+            {
+                if (owned != INVALID_SOCKET)
+                    httplib::detail::close_socket(owned);
+            });
+#ifdef _WIN64
+        u_long nonblocking = 1;
+        if (ioctlsocket(owned, FIONBIO, &nonblocking) != 0)
+            return false;
+#else
+#ifndef SOCK_CLOEXEC
+        if (fcntl(owned, F_SETFD, FD_CLOEXEC) == -1)
+            return false;
+#endif
+        int const flags = fcntl(owned, F_GETFL, 0);
+        if (flags == -1 || fcntl(owned, F_SETFL, flags | O_NONBLOCK) == -1)
+            return false;
+#endif
+        if (tcp_nodelay_)
+            httplib::detail::set_socket_opt(owned, IPPROTO_TCP, TCP_NODELAY, 1);
+        if (socket_options_)
+            socket_options_(owned);
+        // Check after optional customization, before connect or any send. Failure
+        // leaves the socket with the local guard; unsupported POSIX targets fail closed.
+        if (!ConfigureBridgeSignalSafety(owned))
+            return false;
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = htons(static_cast<uint16_t>(port_));
+        error = httplib::Error::ConnectionTimeout;
+        if (std::chrono::steady_clock::now() >= expires)
+            return false;
+        if (::connect(owned, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0)
+        {
+            error = httplib::Error::Connection;
+            if (httplib::detail::is_connection_error())
+                return false;
+            error = WaitForBridgeConnect(owned, expires, httplib::detail::poll_wrapper, std::chrono::steady_clock::now);
+            if (error != httplib::Error::Success)
+                return false;
+        }
+        error = httplib::Error::ConnectionTimeout;
+        if (std::chrono::steady_clock::now() >= expires)
+            return false;
+        socket.sock = owned;
+        owned = INVALID_SOCKET;
+        error = httplib::Error::Success;
+        return true;
+    }
+
+    bool process_socket(Socket const& socket, std::chrono::steady_clock::time_point started,
+                        std::function<bool(httplib::Stream&)> callback) override
+    {
+#ifdef _WIN64
+        u_long nonblocking = 1;
+        if (ioctlsocket(socket.sock, FIONBIO, &nonblocking) != 0)
+            return false;
+#else
+        int const flags = fcntl(socket.sock, F_GETFL, 0);
+        if (flags == -1 || fcntl(socket.sock, F_SETFL, flags | O_NONBLOCK) == -1)
+            return false;
+#endif
+        BridgeDeadlineStream stream(socket.sock, started, _expires);
+        return callback(stream);
+    }
+
+private:
+    std::chrono::steady_clock::time_point const _expires;
+};
+
     struct ParsedUrl
     {
         bool        valid = false;
@@ -201,6 +474,66 @@ namespace
 
         return result;
     }
+}
+
+OllamaHttpResult OllamaHttp_PostBridge(std::string const& baseUrl, std::string const& jsonData,
+                                       OllamaHttpHeaders const& headers, int64_t remainingMs)
+{
+    OllamaHttpResult result;
+    result.error = "bridge_invalid_transport_input";
+    if (!OllamaBridge::ValidEndpoint(baseUrl) || jsonData.empty() || jsonData.size() > OllamaBridge::MaxRequestBytes ||
+        remainingMs <= 0 || remainingMs > OllamaBridge::MaxLifetimeMs || headers.size() != 1 ||
+        headers.front().first != "Authorization" || headers.front().second.compare(0, 7, "Bearer ") != 0)
+        return result;
+
+    OllamaBridge::Settings const link = {"link", "link", baseUrl, headers.front().second.substr(7)};
+    if (!OllamaBridge::ValidSettings(link))
+        return result;
+
+    try
+    {
+        auto const started = std::chrono::steady_clock::now();
+        auto const expires = started + std::chrono::milliseconds(remainingMs);
+        ParsedUrl const parsed = ParseUrl(baseUrl + "/v1/generate");
+        if (!parsed.valid || parsed.https || parsed.host != "127.0.0.1")
+            return result;
+
+        BridgeDeadlineClient client(parsed.host, parsed.port, expires);
+        client.set_follow_location(false);
+        client.set_keep_alive(false);
+        client.set_decompress(false);
+
+        bool oversized = false;
+        bool expired = false;
+        auto receiver = [&](char const* data, std::size_t length)
+        {
+            expired = std::chrono::steady_clock::now() >= expires;
+            oversized = length > OllamaBridge::MaxResponseBytes - result.body.size();
+            if (expired || oversized)
+                return false;
+            result.body.append(data, length);
+            return true;
+        };
+        auto const response =
+            client.Post(parsed.path, BuildHeaders(parsed.host, headers), jsonData, "application/json", receiver);
+        expired = expired || std::chrono::steady_clock::now() >= expires;
+        if (!response || expired || oversized)
+        {
+            result.body.clear();
+            result.error = oversized ? "bridge_response_too_large"
+                           : expired ? "bridge_transport_timeout"
+                                     : "bridge_transport_unavailable";
+            return result;
+        }
+        result.status = response->status;
+        result.error.clear();
+    }
+    catch (std::exception const&)
+    {
+        result.body.clear();
+        result.error = "bridge_transport_unavailable";
+    }
+    return result;
 }
 
 bool OllamaHttp_TlsAvailable()
