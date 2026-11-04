@@ -97,9 +97,11 @@ OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
                                                return g_bridgeObserver && g_bridgeObserver(ticket, guard) &&
                                                       (!g_nativeSelected ||
                                                        g_nativeObserver.Current(ticket.scope, OllamaBridge::Now()));
-                                           });
-std::atomic<uint64_t> g_bridgeGeneration{0};
-std::atomic<uint32_t> g_bridgeInFlight{0};
+        },
+        OllamaBridge::Now, &OllamaChat_BridgeQuerySource());
+    std::deque<OllamaBridge::EventPublication> g_eventPublications;  // WORLD ONLY, bounded by MaxPackets.
+    std::atomic<uint64_t> g_bridgeGeneration{0};
+    std::atomic<uint32_t> g_bridgeInFlight{0};
 
     std::atomic<uint32_t> g_inFlight{ 0 };
     std::atomic<uint64_t> g_totalSubmitted{ 0 };
@@ -613,14 +615,25 @@ bool PrepareBridge(Completion& c)
 
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
 
-bool OllamaDispatch_ChannelEvents(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard const& guard,
-                                  std::vector<OllamaBridge::ChannelObservedMark> const& events, uint64_t& receipt)
+bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const& guard, std::vector<uint8_t> const& icons)
 {
-    if (g_bridgeChannel.RegisterEvents(ticket, guard, events, receipt))
-        return true;
-    g_bridgeChannel.Close(ticket);
-    g_bridgeWorld.Cancel(ticket);
-    return false;
+    if (g_eventPublications.size() >= OllamaBridge::WorldChannel::MaxPackets)
+        return false;
+    OllamaBridge::EventPublication publication;
+    if (!g_bridgeChannel.ObserveEvents(guard, icons, publication))
+        return false;
+    g_eventPublications.push_back(std::move(publication));
+    return true;
+}
+
+bool OllamaDispatch_ChannelNextEvent(OllamaBridge::EventPublication& publication)
+{
+    publication = {};
+    if (g_eventPublications.empty())
+        return false;
+    publication = std::move(g_eventPublications.front());
+    g_eventPublications.pop_front();
+    return true;
 }
 
 OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer, std::string_view route,
@@ -646,6 +659,7 @@ static void RetireBridgeWork()
 {
     g_bridgeGeneration = 0;
     g_bridgeChannel.Retire();
+    g_eventPublications.clear();
     OllamaChat_BridgeReset();
     OllamaBridge_SetActivation({});
     {

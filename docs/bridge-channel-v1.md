@@ -1,9 +1,9 @@
-# Shared game channel policy (J5a)
+# Shared game channel policy and runtime integration (J5)
 
 `src/mod-ollama-chat_bridge_channel.{h,cpp}` is a production plain-value/state helper. It does not create a
 listener, acknowledge game activation, read game objects, queue work, execute commands or integrate native tools.
-No current runtime caller changes. J5b owns transport/physical queues; J5c owns actual filtered observations;
-J6 owns execution; J9C/X owns live proof. Native C and X transports remain their respective owners' work.
+The shared runtime installs bounded physical mailboxes, filtered query assembly and current-mark event production.
+J6 owns execution; J9C/X owns live proof. Native socket/tool adapters remain J11C/X work.
 
 The semantic source is HUB `bridge/game/README.md`, `boundary.js` and `examples.json` (frozen J2 v1).
 `Receive` authenticates the local game-link bearer before checking body size or parsing JSON. Subscription
@@ -79,7 +79,7 @@ strict decode, epoch retirement/reconnect, exact expiry/rollback, removed/revise
 typed command staging, bounded query/event shapes and capacity fail-closed. It is no full module/world/native proof.
 
 
-## J5c1 filtered observation helper; J5c2 integration remains open
+## J5c filtered observations and runtime integration
 
 `mod-ollama-chat_bridge_query.{h,cpp}` supplies production capture/revalidation logic against a synchronous,
 world-only `QueryWorldSource`. The source must re-resolve GUIDs and actual group, map, instance, phase,
@@ -99,12 +99,11 @@ trusted game hook. Unknown/removed/hidden marks and duplicate icon entries fail 
 accepted; eight distinct current icons is the actual schema's maximum. No historical mark stream, removal event,
 new event kind, synchronous network call or per-tick world/group scan is introduced.
 
-J5c2 must implement the source using real Player/Group reads and wire the query branch of `WorldChannel::Update`
-to these observations. It must revalidate provenance after serialization and immediately before inserting the
-packet into the completion map (inside the world publication boundary); the existing final guard alone does not
-check a marked target or a query unit. An optional final-validation hook on `RegisterEvents`, before `_done`
-publication, is required for the same reason. Do not publish then try to retract a receipt: an authenticated I/O
-consumer can already own a returned packet. Keep observer callbacks synchronous and bounded on the world thread.
+The runtime source uses real Player/Group reads and wires the query branch of `WorldChannel::Update` to these
+observations. It revalidates provenance after serialization and immediately before inserting the packet into the
+completion map. `ObserveEvents` supplies the final-validation callback to `RegisterEvents`, which checks the marks
+before `_done` publication and before exposing the receipt. Observer callbacks stay synchronous and bounded on
+the world thread; publication does not rely on later receipt retraction.
 
 An event producer must reserve a distinct game `WorldTicket` against an already observed current scope, with
 lifetime at most 5000 ms, capture marks, validate the source at the final channel publication seam, and cancel/close
@@ -119,4 +118,10 @@ The standalone `tests/bridge-query-selftest.cpp` links the actual helper, world 
 mailbox with controlled current world objects. It checks visibility/missing units, omitted provenance, real query
 encoding, currentness/expiry/reconnect, separate event reservation/receipt and returned packet lifetime. Its caller
 illustrates the handoff, but is not production dispatcher wiring, real game-object adapter, native socket/tool
-integration or live J9C/X acceptance. Those J5c2/full-J5 exits remain open.
+integration or live J9C/X acceptance.
+
+`tests/bridge-query-dispatch-selftest.cpp` additionally links the production bridge/query/world/channel code and
+extracts the actual handler adapter, refresh and dispatcher channel bodies verbatim against controlled game-object
+stand-ins. It covers the runtime query/event joins and final publication checks offline. It does not prove a full
+module build or live game delivery. The full J5 parent remains open pending independent review; native J11C/X
+adapters, J6 effects and live J9C/X delivery remain later work.

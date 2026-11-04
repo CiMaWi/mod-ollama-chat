@@ -273,13 +273,22 @@ public:
 // Provider-neutral reverse channel. Receive/Take are I/O-thread safe; all other methods are world-only.
 // There is no HTTP, waiting, worker callback or game pointer in these mailboxes. Native adapters bound sockets
 // and bytes before Receive; their async write owns the returned packet until disposal, including cancellation.
+class QueryWorldSource;
+
+struct EventPublication
+{
+    std::string route;
+    uint64_t receipt = 0;
+};
+
 class WorldChannel
 {
 public:
     using Observer = std::function<bool(WorldTicket const&, DispatchGuard&)>;
     static constexpr std::size_t MaxPackets = 64;
     static constexpr std::size_t TickBudget = 8;
-    explicit WorldChannel(WorldPolicy& world, Observer observer, ReadClock clock = Now);
+    explicit WorldChannel(WorldPolicy& world, Observer observer, ReadClock clock = Now,
+                          QueryWorldSource* source = nullptr);
     void Configure(bool enabled);
     void Retire();
     bool Activate();
@@ -287,7 +296,10 @@ public:
     // World-only: a separate game reservation, never an already registered generation route.
     // J5c supplies freshly filtered marks; native adapters discover the receipt out of band.
     bool RegisterEvents(WorldTicket const& ticket, DispatchGuard const& guard,
-                        std::vector<ChannelObservedMark> const& events, uint64_t& receipt);
+                        std::vector<ChannelObservedMark> const& events, uint64_t& receipt,
+                        std::function<bool()> const& current = {});
+    // Synchronous world capture; reserves a separate event route and never renews an observation.
+    bool ObserveEvents(DispatchGuard const& guard, std::vector<uint8_t> const& icons, EventPublication& publication);
     void Close(WorldTicket const& ticket);
     std::size_t Update();
     bool Drained() const { return _used->load() == 0; }
@@ -305,7 +317,8 @@ private:
     bool Authenticated(std::string_view bearer) const;  // Caller holds _mutex.
     bool Fresh(Binding const& binding, Clock now) const;
     WorldPolicy& _world;
-    Observer const _observer;  // Invoked only synchronously by the world owner, never by Receive/Take.
+    QueryWorldSource* const _source;  // WORLD ONLY; never copied into a packet or worker task.
+    Observer const _observer;         // Invoked only synchronously by the world owner, never by Receive/Take.
     ReadClock const _clock;
     ChannelPolicy _policy;
     bool _enabled = false;

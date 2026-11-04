@@ -4,10 +4,23 @@
 #include <limits>
 #include <utility>
 
+#include "mod-ollama-chat_bridge_query.h"
+
 namespace OllamaBridge
 {
-WorldChannel::WorldChannel(WorldPolicy& world, Observer observer, ReadClock clock)
-    : _world(world), _observer(std::move(observer)), _clock(std::move(clock))
+namespace
+{
+Deadline ChannelDeadline(Deadline captured, Clock now)
+{
+    // Separate clock reads may cross a millisecond boundary. Tighten the monotonic cap to the
+    // shorter captured remainder; never renew either clock or change the captured wire deadline.
+    captured.steadyMs = now.steadyMs + RemainingMs(captured, now);
+    return captured;
+}
+}  // namespace
+
+WorldChannel::WorldChannel(WorldPolicy& world, Observer observer, ReadClock clock, QueryWorldSource* source)
+    : _world(world), _source(source), _observer(std::move(observer)), _clock(std::move(clock))
 {
 }
 
@@ -65,19 +78,20 @@ bool WorldChannel::Register(WorldTicket const& ticket, DispatchGuard const& guar
     // Explicit admission work only; no all-request sweep is installed on the world tick.
     std::erase_if(_bindings, [&](auto const& pair) { return !_world.Current(pair.second.ticket, now); });
     if (_bindings.size() >= MaxWorldPending || !_policy.ObserveScope(ticket.scope, now) ||
-        _policy.OpenGeneration(ticket.scope, ticket.request.requestId, ticket.request.deadline, now) !=
-            ChannelError::None)
+        _policy.OpenGeneration(ticket.scope, ticket.request.requestId, ChannelDeadline(ticket.request.deadline, now),
+                               now) != ChannelError::None)
         return false;
     return _bindings.emplace(ticket.request.requestId, std::move(binding)).second;
 }
 
 bool WorldChannel::RegisterEvents(WorldTicket const& ticket, DispatchGuard const& guard,
-                                  std::vector<ChannelObservedMark> const& events, uint64_t& receipt)
+                                  std::vector<ChannelObservedMark> const& events, uint64_t& receipt,
+                                  std::function<bool()> const& current)
 {
     receipt = 0;
     auto const now = _clock();
     Binding binding{ticket, guard, true};
-    if (!Fresh(binding, now) || events.empty() || events.size() > ChannelMaxEvents)
+    if (!Fresh(binding, now) || events.empty() || events.size() > ChannelMaxEvents || (_source && !current))
         return false;
     std::erase_if(_bindings, [&](auto const& pair) { return !_world.Current(pair.second.ticket, now); });
     if (_bindings.size() >= MaxWorldPending || _bindings.contains(ticket.request.requestId) ||
@@ -94,10 +108,11 @@ bool WorldChannel::RegisterEvents(WorldTicket const& ticket, DispatchGuard const
     packet->_until = CaptureDeadline(now, WorldLivenessMs);
     packet->_until.unixMs = std::min(packet->_until.unixMs, ticket.request.deadline.unixMs);
     packet->_until.steadyMs = std::min(packet->_until.steadyMs, ticket.request.deadline.steadyMs);
-    if (_policy.OpenEvents(ticket.scope, ticket.request.requestId, ticket.request.deadline, events, now,
-                           packet->body) != ChannelError::None)
+    if (_policy.OpenEvents(ticket.scope, ticket.request.requestId, ChannelDeadline(ticket.request.deadline, now),
+                           events, now, packet->body) != ChannelError::None)
         return false;
-    if (!Fresh(binding, _clock()))
+    if (!Fresh(binding, _clock()) || (current && !current()) || !Fresh(binding, _clock()) ||
+        Expired(packet->_until, _clock()))
     {
         std::string ignored;
         _policy.FinishFailure({ticket.scope.instance, ticket.scope.provider, ticket.scope.epoch,
@@ -109,6 +124,34 @@ bool WorldChannel::RegisterEvents(WorldTicket const& ticket, DispatchGuard const
     packet->receipt = ++_sequence;
     receipt = packet->receipt;
     _done.emplace(receipt, std::move(packet));
+    return true;
+}
+
+bool WorldChannel::ObserveEvents(DispatchGuard const& guard, std::vector<uint8_t> const& icons,
+                                 EventPublication& publication)
+{
+    publication = {};
+    if (!_source || !Activate())
+        return false;
+    Context input;
+    input.channel = guard.scope.channel;
+    input.speakerGuid = guard.speakerGuid;
+    input.text = "Current observed marks.";
+    auto const ticket = _world.Reserve(guard.scope, std::move(input), _clock(), WorldLivenessMs);
+    if (!ticket.generation)
+        return false;
+    FilteredQueryAdapter adapter(_world, *_source, _clock);
+    MarkObservation observed;
+    uint64_t receipt = 0;
+    if (!adapter.CaptureMarks(ticket, guard, icons, observed) ||
+        !RegisterEvents(ticket, guard, observed.marks, receipt, [&] { return adapter.Current(observed); }))
+    {
+        Close(ticket);
+        _world.Cancel(ticket);
+        return false;
+    }
+    // No consumer can discover this route/receipt until the final validation and _done insertion succeeded.
+    publication = {ticket.request.requestId, receipt};
     return true;
 }
 
@@ -206,6 +249,7 @@ std::size_t WorldChannel::Update()
             continue;  // Actual payload disposal, not merely a logical cancellation.
         auto const& binding = it->second;
         bool eventTerminal = false;
+        std::optional<QueryObservation> observed;
         {
             ChannelMessage message;
             auto const settings = _world.Snapshot();
@@ -215,8 +259,19 @@ std::size_t WorldChannel::Update()
             if (packet->error == ChannelError::None && Fresh(binding, _clock()))
             {
                 if (std::holds_alternative<ChannelQuery>(message.payload))
-                    packet->error = _policy.FinishFailure(message.envelope, ChannelFailure::Unavailable,
-                                                          binding.ticket.scope, _clock(), packet->body);
+                {
+                    QueryObservation capture;
+                    if (_source && FilteredQueryAdapter(_world, *_source, _clock)
+                                       .CaptureQuery(binding.ticket, binding.guard, capture))
+                    {
+                        observed = std::move(capture);
+                        packet->error = _policy.FinishQuery(message.envelope, binding.ticket.scope, observed->units,
+                                                            _clock(), packet->body);
+                    }
+                    else
+                        packet->error = _policy.FinishFailure(message.envelope, ChannelFailure::Unavailable,
+                                                              binding.ticket.scope, _clock(), packet->body);
+                }
                 else if (auto const* command = std::get_if<ChannelCommand>(&message.payload))
                     packet->error =
                         _policy.FinishCommand(message.envelope, command->commandId, ChannelOutcome::Rejected,
@@ -231,7 +286,7 @@ std::size_t WorldChannel::Update()
                 packet->_until.steadyMs = std::min(packet->_until.steadyMs, until.steadyMs);
             }
         }  // Dispose parsed payload/settings BEFORE publishing the physical slot to another thread.
-        // J5c adds filtered data and J6 execution here. Until then all queries fail and commands are rejected.
+        // J6 execution remains closed. Query observations are checked again after serialization below.
         if (!Fresh(binding, _clock()))
             continue;
         if (eventTerminal)
@@ -244,7 +299,9 @@ std::size_t WorldChannel::Update()
         packet->_until.unixMs = std::min(packet->_until.unixMs, binding.ticket.request.deadline.unixMs);
         packet->_until.steadyMs = std::min(packet->_until.steadyMs, binding.ticket.request.deadline.steadyMs);
         std::lock_guard<std::mutex> lock(_mutex);
-        if (packet->_serial == _serial && !Expired(packet->_until, _clock()))
+        if (packet->_serial == _serial && !Expired(packet->_until, _clock()) && Fresh(binding, _clock()) &&
+            (!observed || FilteredQueryAdapter(_world, *_source, _clock).Current(*observed)) &&
+            !Expired(packet->_until, _clock()))
             _done.emplace(packet->receipt, std::move(packet));
     }
     return processed;

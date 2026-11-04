@@ -135,8 +135,9 @@ OllamaChat.Bridge.Token =
 #                  must bound loopback sockets/bytes and retain returned packets through actual writes.
 #                  Up to 64 physical packets and 8 world-thread dequeues per tick. Reload revokes old
 #                  work immediately; a replacement epoch waits for actual payload disposal and drain.
-#                  No native socket/tool adapter is installed here. Queries fail unavailable and typed
-#                  commands are rejected until their separately reviewed world adapters are installed.
+#                  The shared runtime installs filtered queries and current-mark event production.
+#                  Native socket/tool adapters remain J11C/X work; typed commands remain rejected (J6).
+#                  Live delivery awaits J9C/X proof.
 #                  No raw commands, inference fallback, or model text execution is permitted.
 #     Default:     0 (existing generation behavior; reverse mailbox unavailable)
 OllamaChat.Bridge.ChannelEnabled = 0

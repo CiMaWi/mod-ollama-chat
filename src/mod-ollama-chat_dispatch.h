@@ -4,6 +4,7 @@
 #include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_handler.h"
 #include "mod-ollama-chat_bridge_world.h"
+#include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_api.h"
 
 #include "ObjectGuid.h"
@@ -107,6 +108,7 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
 
 // World-thread game adapter and bounded, audience-scoped conversation memory. No legacy memory is imported.
 bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard);
+OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource();
 void OllamaChat_BridgeRefresh();
 void OllamaChat_BridgeReset();
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply);
@@ -125,8 +127,9 @@ OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld();
 // Shared native-adapter boundary; every I/O operation authenticates the local game-link bearer.
 // route is an existing game-issued generation/event request id, never a wire-authored world scope.
 // World-only event publication; J5c owns observed mark provenance and fresh capture.
-bool OllamaDispatch_ChannelEvents(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard const& guard,
-                                  std::vector<OllamaBridge::ChannelObservedMark> const& events, uint64_t& receipt);
+bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const& guard, std::vector<uint8_t> const& icons);
+// World-only route handoff for the later native adapter; contains no game pointer or authority grant.
+bool OllamaDispatch_ChannelNextEvent(OllamaBridge::EventPublication& publication);
 OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer, std::string_view route,
                                                          std::string_view body, uint64_t& receipt);
 OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, uint64_t receipt,

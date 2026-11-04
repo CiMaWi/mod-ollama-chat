@@ -1101,6 +1101,7 @@ struct BridgeView
     OllamaBridge::DispatchGuard guard;
     OllamaBridge::Context context;
     std::string signature;
+    std::vector<OllamaBridge::ChannelObservedMark> marks;
 };
 
 struct BridgeBinding
@@ -1110,6 +1111,7 @@ struct BridgeBinding
     OllamaBridge::Deadline heartbeat;
     OllamaBridge::Deadline idleUntil;
     std::string memory;
+    std::vector<OllamaBridge::ChannelObservedMark> marks;
 };
 
 // World-thread only. Entries contain values, never Player/Group pointers. Refresh work is at most 64 * 40 members.
@@ -1134,6 +1136,72 @@ bool BridgeVisible(Player* bot, Player* player, float distance)
            bot->IsWithinDistInMap(player, distance) && bot->CanSeeOrDetect(player, false, true) &&
            player->CanSeeOrDetect(bot, false, true);
 }
+
+// Shared conservative participant-observable Unit check. No AI role or selected-target reads.
+bool BridgeVisibleUnit(Player* bot, Unit* unit, float distance)
+{
+    return bot && bot->IsInWorld() && unit && unit->IsInWorld() && distance > 0.0f && bot->IsInMap(unit) &&
+           bot->InSamePhase(unit) && bot->IsWithinDistInMap(unit, distance) && bot->CanSeeOrDetect(unit, false, true);
+}
+
+class BridgeQuerySource final : public OllamaBridge::QueryWorldSource
+{
+public:
+    bool Observe(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard) override
+    {
+        return OllamaChat_BridgeObserve(ticket, guard);
+    }
+
+    bool GroupMembers(OllamaBridge::WorldTicket const& ticket, uint64_t groupGuid,
+                      std::vector<uint64_t>& members) override
+    {
+        members.clear();
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.botGuid));
+        Group* group = bot && bot->IsInWorld() ? bot->GetGroup() : nullptr;
+        if (!group || group->isRaidGroup() || group->GetGUID().GetRawValue() != groupGuid ||
+            group->GetMemberSlots().empty() || group->GetMemberSlots().size() > OllamaBridge::ChannelMaxUnits ||
+            !group->IsMember(bot->GetGUID()))
+            return false;
+        for (auto const& slot : group->GetMemberSlots())
+            members.push_back(slot.guid.GetRawValue());
+        return true;
+    }
+
+    bool ResolveVisible(OllamaBridge::WorldTicket const& ticket, uint64_t guid,
+                        OllamaBridge::VisibleUnit& result) override
+    {
+        result = {};
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.botGuid));
+        Unit* unit = bot && bot->IsInWorld() ? ObjectAccessor::GetUnit(*bot, ObjectGuid(guid)) : nullptr;
+        auto const it =
+            std::find_if(g_bridgeBindings.begin(), g_bridgeBindings.end(), [&](BridgeBinding const& item)
+                         { return item.generation == ticket.generation && item.view.guard.scope == ticket.scope; });
+        if (it == g_bridgeBindings.end())
+            return false;
+        float const distance =
+            it->view.guard.source == OllamaBridge::DispatchSource::Yell ? g_YellDistance : g_SayDistance;
+        if (!BridgeVisibleUnit(bot, unit, distance))
+            return false;
+        Player* player = unit->ToPlayer();
+        if (player && ObjectAccessor::FindConnectedPlayer(player->GetGUID()) != player)
+            return false;
+        Group* group = player ? player->GetGroup() : nullptr;
+        result = {guid, group ? group->GetGUID().GetRawValue() : 0, unit->GetName(),
+                  static_cast<int32_t>(unit->GetHealthPct())};
+        return true;
+    }
+
+    bool ReadMark(OllamaBridge::WorldTicket const& ticket, uint8_t icon, uint64_t& targetGuid) override
+    {
+        targetGuid = 0;
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.botGuid));
+        Group* group = bot && bot->IsInWorld() ? bot->GetGroup() : nullptr;
+        if (!group || group->isRaidGroup() || icon > 7 || !group->IsMember(bot->GetGUID()))
+            return false;
+        targetGuid = group->GetTargetIcon(icon).GetRawValue();
+        return targetGuid != 0;
+    }
+};
 
 bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::DispatchSource source, BridgeView& view)
 {
@@ -1238,6 +1306,15 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     if (view.context.persona.size() > 8192)
         return false;
     view.context.observations = {"Your name is " + bot->GetName() + ".", "The speaker is " + speaker->GetName() + "."};
+    // Piggyback on this existing bounded observation; never add a world/group scan or tick hook.
+    if (group)
+        for (uint8_t icon = 0; icon < 8; ++icon)
+        {
+            auto const guid = group->GetTargetIcon(icon);
+            Unit* unit = guid.GetRawValue() ? ObjectAccessor::GetUnit(*bot, guid) : nullptr;
+            if (BridgeVisibleUnit(bot, unit, distance))
+                view.marks.push_back({guid.GetRawValue(), icon});
+        }
     BridgeField(view.signature, view.context.persona);
     return true;
 }
@@ -1324,7 +1401,10 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
         if (!OllamaDispatch_BridgeWorld().ObserveScope(scope, now))
             return false;
         g_bridgeBindings.push_back({OllamaDispatch_BridgeWorld().Generation(), std::move(view),
-                                    CaptureDeadline(now, WorldLivenessMs), CaptureDeadline(now, MaxLifetimeMs), ""});
+                                    CaptureDeadline(now, WorldLivenessMs),
+                                    CaptureDeadline(now, MaxLifetimeMs),
+                                    "",
+                                    {}});
         it = std::prev(g_bridgeBindings.end());
     }
     it->idleUntil = CaptureDeadline(now, MaxLifetimeMs);
@@ -1343,6 +1423,12 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
                                        30000);
 }
 }  // namespace
+
+OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource()
+{
+    static BridgeQuerySource source;
+    return source;
+}
 
 void OllamaChat_BridgeReset() { g_bridgeBindings.clear(); }
 
@@ -1366,7 +1452,24 @@ void OllamaChat_BridgeRefresh()
         else
         {
             it->heartbeat = CaptureDeadline(now, WorldLivenessMs);
+            bool const changed = current.marks.size() != it->marks.size() ||
+                                 !std::equal(current.marks.begin(), current.marks.end(), it->marks.begin(),
+                                             [](ChannelObservedMark const& a, ChannelObservedMark const& b)
+                                             { return a.targetGuid == b.targetGuid && a.icon == b.icon; });
+            auto const observedGuard = guard;
+            std::vector<uint8_t> icons;
+            if (changed)
+                for (auto const& mark : current.marks)
+                    icons.push_back(mark.icon);
+            it->marks = std::move(current.marks);
             ++it;
+            // The synchronous observer may invalidate a binding. Do not retain its iterator across publication.
+            if (!icons.empty())
+            {
+                auto const index = it - g_bridgeBindings.begin();
+                OllamaDispatch_ChannelEvents(observedGuard, icons);
+                it = g_bridgeBindings.begin() + std::min<std::size_t>(index, g_bridgeBindings.size());
+            }
         }
     }
 }
