@@ -4,6 +4,8 @@
 #define httplib ollamachat_httplib
 #include <atomic>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <nlohmann/json.hpp>
@@ -74,6 +76,126 @@ nlohmann::json Reply(OllamaBridge::Settings const& settings, OllamaBridge::Reque
             {"deadlineUnixMs", request.deadline.unixMs},
             {"type", "generation.result"},
             {"text", "I shall wait here."}};
+}
+
+void ObserverSettingsChecks(std::string const& directory)
+{
+    using namespace OllamaBridge;
+    auto settings = Settings();
+    settings.provider = "codex";
+    settings.observerTokenRef = directory + "/valid/observer.json";
+    auto write = [&](std::string const& document)
+    {
+        std::ofstream file(settings.observerTokenRef, std::ios::binary | std::ios::trunc);
+        file << document;
+        Check(static_cast<bool>(file), "write disposable observer credential");
+    };
+    std::string const secret(64, 'a');
+    auto const document = nlohmann::json{{"version", 1}, {"token", secret}}.dump();
+    write(document);
+    Check(!LoadObserverToken(settings) && settings.observerToken.empty(), "observer defaults disabled");
+    settings.observerEnabled = true;
+    Check(LoadObserverToken(settings) && ValidObserverSettings(settings), "protected exact credential loaded");
+    auto const captured = settings;
+    write("{\"version\":1,\"version\":1,\"token\":\"" + secret + "\"}");
+    Check(!LoadObserverToken(settings), "duplicate otherwise-valid credential rejected");
+    write(nlohmann::json{{"version", true}, {"token", secret}}.dump());
+    Check(!LoadObserverToken(settings), "boolean credential version rejected");
+    write(document + std::string(65536 - document.size(), ' '));
+    Check(LoadObserverToken(settings), "credential file exact byte cap accepted");
+    write(document + std::string(1, static_cast<char>(0xff)));
+    Check(!LoadObserverToken(settings), "invalid credential UTF-8 rejected");
+    for (auto const& bad :
+         {"{}", "{\"version\":true,\"token\":\"x\"}", "{\"version\":1,\"version\":1,\"token\":\"x\"}"})
+    {
+        write(bad);
+        Check(!LoadObserverToken(settings) && settings.observerToken.empty(), "malformed credential clears cache");
+    }
+    for (auto const& bad :
+         {std::string(63, 'a'), std::string(65, 'a'), std::string(64, 'A'), std::string(63, 'a') + "\n"})
+    {
+        write(nlohmann::json{{"version", 1}, {"token", bad}}.dump());
+        Check(!LoadObserverToken(settings) && settings.observerToken.empty(), "exact lowercase token bound");
+    }
+    write(nlohmann::json{{"version", 1}, {"token", secret}, {"extra", true}}.dump());
+    Check(!LoadObserverToken(settings), "unknown credential field rejected");
+    write(std::string(65537, 'x'));
+    Check(!LoadObserverToken(settings), "credential file byte cap");
+    write(document);
+    settings.token = secret;
+    Check(!LoadObserverToken(settings) && settings.observerToken.empty(), "generation token cannot observe");
+    settings = captured;
+    settings.provider = "claude";
+    Check(!LoadObserverToken(settings), "observer limited to Codex");
+    for (auto const& reference :
+         std::vector<std::string>{"observer.json", "C:observer.json", "\\\\127.0.0.1\\refuse\\observer.json",
+                                  directory + "/valid/missing.json", directory + "/missing/observer.json",
+                                  directory + "/unsafe/observer.json", directory + "/unsafe-file/observer.json",
+                                  directory + "/alias/observer.json"})
+    {
+        settings = captured;
+        settings.observerTokenRef = reference;
+        Check(!LoadObserverToken(settings) && settings.observerToken.empty(), "unsafe credential reference refused");
+    }
+#ifdef _WIN32
+    std::string loaded;
+    std::vector<std::filesystem::path> attempted;
+    auto recordOpen = [&](std::filesystem::path const& path, bool isDirectory)
+    {
+        attempted.push_back(path);
+        return OpenObserverComponent(path, isDirectory);
+    };
+    auto const alias = std::filesystem::path(directory) / "alias";
+    Check(!ReadObserverToken(alias / "observer.json", loaded, recordOpen), "reparse ancestor refused by real resolver");
+    Check(!attempted.empty() && attempted.back() == alias,
+          "unsafe ancestor stops actual opens before any descendant lookup");
+    bool rootFirst = !attempted.empty() && attempted.front() == alias.root_path();
+    for (std::size_t index = 1; index < attempted.size(); ++index)
+        rootFirst = rootFirst && attempted[index].parent_path() == attempted[index - 1];
+    Check(rootFirst, "actual component opens are ordered from root toward leaf");
+    bool checkedPins = false;
+    auto checkPinnedOpen = [&](std::filesystem::path const& path, bool isDirectory)
+    {
+        auto const handle = OpenObserverComponent(path, isDirectory);
+        if (!isDirectory && handle != INVALID_HANDLE_VALUE)
+        {
+            checkedPins = true;
+            for (auto ancestor = path.parent_path(); ancestor.filename() == "valid" || ancestor.filename() == "fixture";
+                 ancestor = ancestor.parent_path())
+            {
+                auto renamed = ancestor;
+                renamed += ".pin-test";
+                bool const moved = MoveFileExW(ancestor.c_str(), renamed.c_str(), 0);
+                DWORD const moveError = GetLastError();
+                if (moved)
+                    Check(MoveFileExW(renamed.c_str(), ancestor.c_str(), 0), "restore unexpected fixture rename");
+                Check(!moved && moveError == ERROR_SHARING_VIOLATION, "all pinned ancestors deny rename at file open");
+                ObserverHandle writer{CreateFileW(ancestor.c_str(), GENERIC_WRITE,
+                                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                                                  OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr)};
+                Check(writer.value == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION,
+                      "all pinned ancestors deny reparse writer at file open");
+            }
+        }
+        return handle;
+    };
+    Check(ReadObserverToken(std::filesystem::path(captured.observerTokenRef), loaded, checkPinnedOpen) &&
+              loaded == document && checkedPins,
+          "validated ancestry stays pinned through same-handle file read");
+    settings = captured;
+    settings.observerTokenRef = directory + "/alias/../valid/observer.json";
+    Check(!LoadObserverToken(settings), "parent traversal cannot bypass unsafe ancestor");
+    settings.observerTokenRef = directory + "/valid/../valid/observer.json";
+    Check(!LoadObserverToken(settings), "parent traversal is refused without escaping pinned ancestry");
+#endif
+    auto const link = std::filesystem::path(directory) / "valid" / "linked.json";
+    std::filesystem::create_hard_link(captured.observerTokenRef, link);
+    settings = captured;
+    Check(!LoadObserverToken(settings), "multiply linked credential refused");
+    std::filesystem::remove(link);
+    settings = captured;
+    Check(LoadObserverToken(settings) && captured.observerToken == secret,
+          "owned captured credential survives mutable settings refusal");
 }
 
 void BoundaryChecks()
@@ -614,6 +736,33 @@ void HttpChecks()
     server.new_task_queue = [] { return new httplib::ThreadPool(2); };
     std::atomic<unsigned> received = 0;
     std::atomic<bool> sawHeader = false;
+    std::atomic<unsigned> observed = 0;
+    std::atomic<bool> sawObserverHeader = false;
+    auto observe = [&](httplib::Request const& request, httplib::Response& response)
+    {
+        ++observed;
+        sawObserverHeader = request.get_header_value_count("Authorization") == 1 &&
+                            request.get_header_value("Authorization") == "Bearer " + std::string(64, 'a') &&
+                            request.get_header_value("Content-Type") == "application/json";
+        if (request.body == "redirect")
+            response.set_redirect("http://127.0.0.1:1/forbidden");
+        else if (request.body == "failure")
+        {
+            response.status = 503;
+            response.set_content("synthetic-remote-error", "application/json");
+        }
+        else if (request.body == "oversize")
+            response.set_content(std::string(MaxResponseBytes + 1, 'x'), "application/json");
+        else if (request.body == "slow")
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            response.set_content("{}", "application/json");
+        }
+        else
+            response.set_content(request.body, "application/json");
+    };
+    server.Post("/v1/observer/open", observe);
+    server.Post("/v1/observer/snapshot", observe);
     server.Post("/v1/generate",
                 [&](httplib::Request const& request, httplib::Response& response)
                 {
@@ -671,6 +820,44 @@ void HttpChecks()
     Check(!OllamaHttp_PostBridge(settings.endpoint, std::string(MaxRequestBytes + 1, 'x'), headers, 1000).ok(),
           "request size rejected before HTTP");
     Check(!OllamaHttp_PostBridge(settings.endpoint, "echo", headers, 0).ok(), "expired transport no HTTP");
+    auto observer = settings;
+    observer.provider = "codex";
+    observer.observerEnabled = true;
+    observer.observerTokenRef = "synthetic-owned-snapshot/observer.json";
+    observer.observerToken = std::string(64, 'a');
+    std::string const open =
+        "{\"version\":1,\"type\":\"observer.open\",\"instance\":\"fixture-main\",\"provider\":\"codex\"}";
+    result = OllamaHttp_PostObserver(observer, OllamaObserverOperation::Open, open, 1000);
+    Check(result.ok() && result.body == open && sawObserverHeader, "fixed open path exact body observer bearer");
+    std::string const snapshot = std::string(MaxRequestBytes, 'x');
+    result = OllamaHttp_PostObserver(observer, OllamaObserverOperation::Snapshot, snapshot, 1000);
+    Check(result.error == "bridge_response_too_large" && result.body.empty() && observed == 2,
+          "snapshot request cap admitted with bounded echo response");
+    result = OllamaHttp_PostObserver(observer, OllamaObserverOperation::Snapshot, "snapshot", 1000);
+    Check(result.ok() && result.body == "snapshot" && observed == 3, "fixed snapshot path and exact bytes");
+    result = OllamaHttp_PostObserver(observer, OllamaObserverOperation::Open, "redirect", 1000);
+    Check(result.status == 302 && observed == 4, "observer redirect never followed");
+    result = OllamaHttp_PostObserver(observer, OllamaObserverOperation::Open, "failure", 1000);
+    Check(result.status == 503 && observed == 5, "observer errors never retried");
+    result = OllamaHttp_PostObserver(observer, OllamaObserverOperation::Open, "slow", 50);
+    Check(result.error == "bridge_transport_timeout" && result.body.empty(), "observer total deadline");
+    unsigned const beforeRefusals = observed;
+    for (int64_t const budget : {int64_t(0), int64_t(-1), int64_t(5001)})
+        Check(!OllamaHttp_PostObserver(observer, OllamaObserverOperation::Open, open, budget).ok(),
+              "observer freshness budget bounded");
+    Check(!OllamaHttp_PostObserver(observer, static_cast<OllamaObserverOperation>(99), open, 1000).ok(),
+          "unknown operation refused");
+    Check(!OllamaHttp_PostObserver(observer, OllamaObserverOperation::Open, snapshot + "x", 1000).ok(),
+          "observer oversized body refused before HTTP");
+    auto invalidObserver = observer;
+    invalidObserver.observerToken = observer.token;
+    Check(!OllamaHttp_PostObserver(invalidObserver, OllamaObserverOperation::Open, open, 1000).ok(),
+          "observer never falls back to link bearer");
+    invalidObserver = observer;
+    invalidObserver.observerEnabled = false;
+    Check(!OllamaHttp_PostObserver(invalidObserver, OllamaObserverOperation::Open, open, 1000).ok(),
+          "disabled observer sends no HTTP");
+    Check(observed == beforeRefusals && received == 4, "observer refusals and operations preserve generation route");
     server.stop();
     listener.join();
     auto const refusedAt = std::chrono::steady_clock::now();
@@ -680,11 +867,13 @@ void HttpChecks()
 }
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     try
     {
         BoundaryChecks();
+        if (argc == 2)
+            ObserverSettingsChecks(argv[1]);
         CircuitChecks();
         InterruptedConnectChecks();
         SignalSafetyChecks();

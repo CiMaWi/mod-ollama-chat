@@ -581,6 +581,11 @@ void LoadOllamaChatConfig()
     g_OllamaBridgeSettings.provider = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Provider", "");
     g_OllamaBridgeSettings.endpoint = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Endpoint", "");
     g_OllamaBridgeSettings.token = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Token", "");
+    g_OllamaBridgeSettings.observerEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ObserverEnabled", false);
+    g_OllamaBridgeSettings.observerTokenRef =
+        sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.ObserverTokenRef", "");
+    if (!OllamaBridge::LoadObserverToken(g_OllamaBridgeSettings) && g_OllamaBridgeSettings.observerEnabled)
+        LOG_ERROR("module.ollamachat", "[Ollama Chat] Invalid observer configuration; observation is disabled.");
     if (g_OllamaProvider == OllamaProvider::Bridge && !OllamaBridge::ValidSettings(g_OllamaBridgeSettings))
         LOG_ERROR("module.ollamachat", "[Ollama Chat] Invalid bridge configuration; generation is disabled.");
 

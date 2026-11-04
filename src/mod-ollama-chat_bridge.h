@@ -25,6 +25,9 @@ struct Settings
     std::string provider;
     std::string endpoint;
     std::string token;  // Local game-link bearer only; never native subscription credentials.
+    bool observerEnabled = false;
+    std::string observerTokenRef;  // Absolute protected observer.json path; resolved only on config load.
+    std::string observerToken;     // Owned local observer bearer, distinct from the game-link bearer.
 };
 
 struct Clock
@@ -95,6 +98,9 @@ struct Result
 bool ValidIdentifier(std::string const& value);
 bool ValidEndpoint(std::string const& value);
 bool ValidSettings(Settings const& settings);
+// Windows-only, matching the native service. Refusal always clears the cached secret.
+bool LoadObserverToken(Settings& settings);
+bool ValidObserverSettings(Settings const& settings);
 Clock Now();
 Deadline CaptureDeadline(Clock now, int64_t lifetimeMs);
 bool Expired(Deadline deadline, Clock now);

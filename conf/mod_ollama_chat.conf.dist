@@ -129,6 +129,27 @@ OllamaChat.Bridge.Provider =
 OllamaChat.Bridge.Endpoint =
 OllamaChat.Bridge.Token =
 
+# OllamaChat.Bridge.ObserverEnabled / ObserverTokenRef
+#     Description: Default-off Codex world-observer transport (Windows only, like the native service).
+#                  TokenRef is the absolute fixed-local-drive path to the service's protected observer.json,
+#                  never a bearer, subscription credential or a selection/activation grant. The
+#                  exact JSON is {"version":1,"token":"<64 lowercase hexadecimal characters>"}.
+#                  The token must differ from Bridge.Token. Both file and containing directory
+#                  must be owned by and accessible only to this Windows user, without reparse
+#                  paths or file hardlinks. The native service independently checks its copy.
+#                  Missing, malformed, unsafe or equal credentials disable observation. No file
+#                  is created, changed or provisioned. Other providers and generation stay unchanged.
+#                  Config load/reload resolves the bounded file into the existing owned settings
+#                  snapshot. Workers never read config or credentials from disk. Token rotation
+#                  requires owned stop/drain/restart of the native service and world owner; reload
+#                  alone grants no readiness or permission to reuse an epoch or queued observation.
+#                  Only /v1/observer/open and /v1/observer/snapshot are allowed, with a separate
+#                  observer bearer and at most 5000 ms total transport time, without retry/redirect.
+#                  This setting does not start a worker, emit snapshots or activate game authority.
+#     Default:     0 / empty (no observation)
+OllamaChat.Bridge.ObserverEnabled = 0
+OllamaChat.Bridge.ObserverTokenRef =
+
 # OllamaChat.Url
 #     Description: The full URL of the generation endpoint for the configured
 #                  Provider. See the examples under OllamaChat.Provider.
