@@ -2,6 +2,9 @@
 #define MOD_OLLAMA_CHAT_BRIDGE_WORLD_H
 
 #include <atomic>
+#include <condition_variable>
+#include <optional>
+#include <thread>
 #include <unordered_map>
 
 #include "mod-ollama-chat_bridge.h"
@@ -12,26 +15,6 @@ constexpr std::size_t MaxWorldPending = 64;
 constexpr std::size_t MaxWorldScopes = 64;
 constexpr uint64_t MaxEpochRequests = 4096;
 constexpr int64_t WorldLivenessMs = 5000;
-
-// Complete trusted-world observation. GUIDs and revisions become decimal/string wire values in J4b-X.
-// This is an emitter contract, not an implemented/authenticated native transport.
-struct WorldScope
-{
-    uint32_t version = 1;
-    std::string instance;
-    std::string provider;
-    std::string epoch;
-    uint64_t botGuid = 0;
-    uint64_t controllerGuid = 0;
-    std::string contextId;
-    std::string channel;  // direct or party
-    std::string perceptionScope;
-    std::string contextRevision;
-    std::string membershipRevision;
-    std::string personaRevision;
-
-    bool operator==(WorldScope const& other) const;
-};
 
 struct WorldTicket
 {
@@ -121,12 +104,89 @@ private:
     static std::atomic<std::size_t> _used;
 };
 
-// Single world-thread owner. No pointers, game references, callbacks, native acknowledgements or tools.
+// One independent owned HTTP lane. Only Poll/BindEpoch/Publish on the world thread can accept authority.
+// Each challenge consumes a new complete capture; no sender retry or cached heartbeat exists.
+class WorldObserver
+{
+public:
+    using Transport =
+        std::function<OllamaHttpResult(Settings const&, OllamaObserverOperation, std::string const&, int64_t)>;
+    struct View
+    {
+        bool enabled = false;
+        std::string incarnation;
+        std::string epoch;
+        bool pending = false;
+    };
+
+    explicit WorldObserver(Transport transport, ReadClock clock = Now);
+    ~WorldObserver();
+    void Start();
+    void Stop();  // Terminal shutdown only; never called on tick/reload.
+    void Configured(bool enabled, Settings settings, Clock now);
+    void Poll(Clock now);
+    View State() const;
+    void Open(bool worldDrained, Clock now);
+    bool BindEpoch(std::string epoch, bool worldDrained, Clock now);
+    void Publish(std::vector<WorldScope> scopes, bool worldDrained, Clock now);
+    bool Current(WorldScope const& scope, Clock now) const;
+    void Forget(WorldScope const& scope);
+    void ForgetAll();
+
+private:
+    struct Job
+    {
+        uint64_t serial = 0;
+        Settings settings;
+        OllamaObserverOperation operation = OllamaObserverOperation::Open;
+        std::string body;
+        Deadline deadline;
+        ObserverChallenge previous;
+        std::vector<WorldScope> scopes;
+    };
+    struct Reply
+    {
+        Job job;
+        bool valid = false;
+        ObserverChallenge challenge;
+        Deadline nextDeadline;
+    };
+    void Run();
+    void Reset(Clock now);
+    void RetirePacket(Clock now);
+
+    Transport const _transport;
+    ReadClock const _clock;
+    mutable std::mutex _mutex;
+    std::condition_variable _wake;
+    std::thread _worker;
+    bool _running = false;
+    bool _busy = false;
+    bool _enabled = false;
+    uint64_t _serial = 1;
+    Settings _settings;
+    ObserverChallenge _challenge;
+    std::string _epoch;
+    Deadline _challengeUntil;
+    Deadline _liveUntil;
+    int64_t _lastSteady = 0;
+    int64_t _retryAt = 0;
+    int64_t _refreshAt = 0;
+    std::vector<WorldScope> _accepted;
+    std::vector<WorldScope> _observed;
+    std::vector<WorldScope> _sent;
+    std::optional<Job> _job;
+    std::optional<Reply> _reply;
+};
+
+// Single world-thread owner. No game pointers, game references, native grants or tools.
 // Configured is an explicit notification even when only the bearer changes; no per-tick config polling.
 // Selected means module circuit selection only. J4b-X must emit authenticated fresh state to native code.
 class WorldPolicy
 {
 public:
+    explicit WorldPolicy(WorldObserver* observer = nullptr) : _observer(observer) {}
+    std::vector<WorldScope> Scopes(Clock now) const;
     void Configured(bool enabled, Settings settings, std::string epoch);
     void Shutdown();
     bool ObserveDrain(bool drained, RetirementProof proof);
@@ -172,6 +232,7 @@ private:
     bool ScopeCurrent(WorldScope const& scope, Clock now) const;
     void Retire();
 
+    WorldObserver* const _observer;  // Owned lane outlives policy; never carried to a generation task.
     uint64_t _generation = 0;
     uint64_t _sequence = 0;  // Never reset, including reload, rejection, cancellation and queue-full.
     uint64_t _issued = 0;

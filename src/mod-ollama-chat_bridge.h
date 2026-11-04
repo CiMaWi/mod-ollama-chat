@@ -67,6 +67,25 @@ struct Context
     std::vector<Participant> party;
 };
 
+// Exact captured game binding; owned values only, never a grant supplied by the model.
+struct WorldScope
+{
+    uint32_t version = 1;
+    std::string instance;
+    std::string provider;
+    std::string epoch;
+    uint64_t botGuid = 0;
+    uint64_t controllerGuid = 0;
+    std::string contextId;
+    std::string channel;  // direct or party
+    std::string perceptionScope;
+    std::string contextRevision;
+    std::string membershipRevision;
+    std::string personaRevision;
+
+    bool operator==(WorldScope const& other) const;
+};
+
 struct Request
 {
     std::string epoch;
@@ -75,6 +94,7 @@ struct Request
     uint64_t controllerGuid = 0;
     uint64_t botGuid = 0;
     Context input;
+    WorldScope scope;  // Required only by the opt-in Codex observer protocol.
 };
 
 struct Identity
@@ -109,6 +129,20 @@ Identity MakeIdentity(Settings const& settings, Request const& request);
 OllamaHttpHeaders Headers(Settings const& settings);
 bool Build(Settings const& settings, Request const& request, Clock now, std::string& body);
 Result Parse(Settings const& settings, Request const& request, std::string const& body, Clock now);
+
+struct ObserverChallenge
+{
+    std::string serviceId;
+    std::string incarnation;
+    std::string challenge;
+    uint32_t sequence = 0;
+};
+
+bool BuildObserverOpen(Settings const& settings, std::string& body);
+bool BuildObserverSnapshot(Settings const& settings, ObserverChallenge const& challenge, std::string const& epoch,
+                           bool active, bool worldDrained, std::vector<WorldScope> const& scopes, std::string& body);
+bool ParseObserverChallenge(Settings const& settings, std::string const& body, ObserverChallenge const* previous,
+                            ObserverChallenge& challenge);
 
 // Reset is called ONLY by the trusted world activation owner after its retirement
 // obligations are met. It does not acknowledge CLI intent, drain work or restore strategies.
