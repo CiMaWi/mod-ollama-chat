@@ -77,3 +77,46 @@ on every game tick. The helper has no autonomous timer or background thread.
 Offline proof compiles this exact production cpp with `tests/bridge-channel-selftest.cpp`. It covers authentication,
 strict decode, epoch retirement/reconnect, exact expiry/rollback, removed/revised/lapsed scope, terminal/replay state,
 typed command staging, bounded query/event shapes and capacity fail-closed. It is no full module/world/native proof.
+
+
+## J5c1 filtered observation helper; J5c2 integration remains open
+
+`mod-ollama-chat_bridge_query.{h,cpp}` supplies production capture/revalidation logic against a synchronous,
+world-only `QueryWorldSource`. The source must re-resolve GUIDs and actual group, map, instance, phase,
+distance and detection on every call. Native JSON cannot implement this source or supply its observations.
+The helper independently requires the exact current game `WorldTicket` and `DispatchGuard` before and after
+capture. No request-created world authority, role inference, private AI state or selected-target access exists.
+Only guid/name and observed UI health are emitted; role and visibleTargetGuid stay omitted until a separately
+reviewed observable provenance source exists. Missing/hidden group units are omitted. Malformed or more than 40
+roster entries fail closed; a non-group scope returns unavailable, not invented party members.
+
+`QueryObservation` and `MarkObservation` contain owned values and a captured 5-second wall/monotonic deadline.
+They confer no authority. `Current` resolves the world and observations again, compares the current values and
+rejects equality expiry, authority/group/perception/revision changes, removed units and changed marks. Call it
+immediately before publication; never queue the source, a game pointer, or a world-reading closure to a worker.
+Marks are current group-UI icons 0..7 on currently visible targets (including visible enemies), requested by a
+trusted game hook. Unknown/removed/hidden marks and duplicate icon entries fail closed. At most 32 inputs are
+accepted; eight distinct current icons is the actual schema's maximum. No historical mark stream, removal event,
+new event kind, synchronous network call or per-tick world/group scan is introduced.
+
+J5c2 must implement the source using real Player/Group reads and wire the query branch of `WorldChannel::Update`
+to these observations. It must revalidate provenance after serialization and immediately before inserting the
+packet into the completion map (inside the world publication boundary); the existing final guard alone does not
+check a marked target or a query unit. An optional final-validation hook on `RegisterEvents`, before `_done`
+publication, is required for the same reason. Do not publish then try to retract a receipt: an authenticated I/O
+consumer can already own a returned packet. Keep observer callbacks synchronous and bounded on the world thread.
+
+An event producer must reserve a distinct game `WorldTicket` against an already observed current scope, with
+lifetime at most 5000 ms, capture marks, validate the source at the final channel publication seam, and cancel/close
+that ticket on every failed registration. Cap both event ticket clocks at the captured observation deadline;
+registration must not renew the age of an earlier observation. Return both the opaque route and receipt to the native
+producer only after successful publication; the producer takes the receipt with the local bearer and retains the
+move-only `ChannelPacket` throughout an asynchronous write/cancellation until payload disposal. Inbound queries,
+commands and outgoing events share 64 physical packet slots and dequeue remains 8 per tick. Healthy heartbeat
+refresh remains bounded by 64 scopes and must not scan the 4096-entry replay ledger. J6 effects remain CLOSED.
+
+The standalone `tests/bridge-query-selftest.cpp` links the actual helper, world policy, channel policy and physical
+mailbox with controlled current world objects. It checks visibility/missing units, omitted provenance, real query
+encoding, currentness/expiry/reconnect, separate event reservation/receipt and returned packet lifetime. Its caller
+illustrates the handoff, but is not production dispatcher wiring, real game-object adapter, native socket/tool
+integration or live J9C/X acceptance. Those J5c2/full-J5 exits remain open.
