@@ -21,6 +21,7 @@
 #include "Player.h"
 
 #include "AiFactory.h"
+#include "BridgeIntentEffect.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 
@@ -211,7 +212,12 @@ void OllamaBotRandomChatter::OnUpdate(uint32 diff)
     // The module's world tick. These run before any feature toggle can return
     // early, because pending replies still have to be delivered even when
     // random chatter itself is switched off.
-    OllamaDispatch_Update(diff);
+    // World::Update has joined MapMgr::Update's map workers before
+    // ScriptMgr::OnWorldUpdate calls this hook, so this frame is the
+    // post-map-join phase typed bridge effects need. Only this stack
+    // holds the token.
+    PlayerbotBridge::PostMapJoin const join;
+    OllamaDispatch_Update(diff, join);
 
     static uint32 maintenanceTimer = 0;
     if (maintenanceTimer <= diff)

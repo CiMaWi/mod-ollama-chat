@@ -250,6 +250,64 @@ void PureSeam()
           "only lanes whose interval passed are evicted");
 }
 
+// The production adapter's pure order step: fresh facts in, playerbots order fields out; nothing wire-authored.
+void EffectOrders()
+{
+    IntentContext const facts{22, 11, 33, 33, 33, 44, 44, std::nullopt};
+    ChannelCommand const attack{"a", 22, 11, ChannelIntent::AttackOwnTarget, std::monostate{}};
+    ChannelCommand const mark{"m", 22, 11, ChannelIntent::Mark, ChannelMark{44, 7}};
+    Check(EffectTargetGuid(attack, 44) == 44 && EffectTargetGuid(attack, 0) == 0 && EffectTargetGuid(mark, 99) == 44,
+          "an attack resolves the bot's own target, a mark its payload target");
+    auto const attacking = BuildEffectOrder(attack, facts);
+    Check(attacking && attacking->intent == ChannelIntent::AttackOwnTarget && attacking->botGuid == 11 &&
+              attacking->controllerGuid == 22 && attacking->groupGuid == 33 && attacking->targetGuid == 44 &&
+              attacking->icon == 0,
+          "attack order from fresh facts and the captured group");
+    auto const marking = BuildEffectOrder(mark, facts);
+    Check(marking && marking->intent == ChannelIntent::Mark && marking->botGuid == 11 &&
+              marking->controllerGuid == 22 && marking->groupGuid == 33 && marking->targetGuid == 44 &&
+              marking->icon == 7,
+          "mark order carries its target and icon");
+
+    IntentContext unseen = facts;
+    unseen.eligibleVisibleTargetGuid = 0;
+    Check(!BuildEffectOrder(attack, unseen) && !BuildEffectOrder(mark, unseen), "an unseen target builds no order");
+    IntentContext retargeted = facts;
+    retargeted.ownTargetGuid = 45;
+    Check(!BuildEffectOrder(attack, retargeted), "an attack needs its own target to be the eligible one");
+    IntentContext elsewhere = facts;
+    elsewhere.eligibleVisibleTargetGuid = 45;
+    Check(!BuildEffectOrder(mark, elsewhere), "a mark needs its payload target to be the eligible one");
+    IntentContext moved = facts;
+    moved.botGroupGuid = 34;
+    Check(!BuildEffectOrder(attack, moved) && !BuildEffectOrder(mark, moved), "a changed group builds no order");
+    IntentContext ungrouped = facts;
+    ungrouped.expectedGroupGuid = ungrouped.controllerGroupGuid = ungrouped.botGroupGuid = 0;
+    Check(!BuildEffectOrder(attack, ungrouped), "no captured group builds no order");
+    ChannelCommand foreign = attack;
+    foreign.issuerGuid = 23;
+    Check(!BuildEffectOrder(foreign, facts), "another issuer builds no order");
+    ChannelCommand wired = attack;
+    wired.params = ChannelTarget{44};
+    Check(!BuildEffectOrder(wired, facts), "an attack never takes a wire target");
+    ChannelCommand icon = mark;
+    icon.params = ChannelMark{44, 8};
+    Check(!BuildEffectOrder(icon, facts), "an out-of-range icon builds no order");
+
+    ChannelCommand const pull{"p", 22, 11, ChannelIntent::Pull, ChannelTarget{44}};
+    Check(MapIntent(pull, facts) && !BuildEffectOrder(pull, facts) && EffectTargetGuid(pull, 44) == 0,
+          "a mappable verb without an accepted effect builds no order");
+    unsigned orders = 0;
+    for (int intent = 0; intent <= static_cast<int>(ChannelIntent::DungeonClear); ++intent)
+    {
+        ChannelCommand other = attack;
+        other.intent = static_cast<ChannelIntent>(intent);
+        if (!EffectSupported(other.intent))
+            orders += (BuildEffectOrder(other, facts) || EffectTargetGuid(other, 44)) ? 1 : 0;
+    }
+    Check(orders == 0, "no other verb resolves a target or builds an order");
+}
+
 void TypedVerbs()
 {
     Fixture f;
@@ -629,6 +687,7 @@ int main()
     try
     {
         PureSeam();
+        EffectOrders();
         TypedVerbs();
         OutcomesNeverReplay();
         FixedRefusals();

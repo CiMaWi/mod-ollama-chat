@@ -90,6 +90,8 @@ bool g_nativeSelected = false;  // World-thread cached selection, including fail
 OllamaBridge::Settings g_nativeSettings;
 OllamaBridgeObserver g_bridgeObserver = nullptr;
 bool g_channelEnabled = false;
+OllamaBridge::CommandStats g_loggedCommands;  // World-thread: the counters in the last watchlist line.
+Clock::time_point g_nextCommandsLog{};
 OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
                                            [](OllamaBridge::WorldTicket const& ticket,
                                               OllamaBridge::DispatchGuard& guard)
@@ -98,7 +100,7 @@ OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
                                                       (!g_nativeSelected ||
                                                        g_nativeObserver.Current(ticket.scope, OllamaBridge::Now()));
         },
-        OllamaBridge::Now, &OllamaChat_BridgeQuerySource());
+        OllamaBridge::Now, &OllamaChat_BridgeQuerySource(), &OllamaChat_BridgeCommandExecutor());
     std::deque<OllamaBridge::EventPublication> g_eventPublications;  // WORLD ONLY, bounded by MaxPackets.
     std::atomic<uint64_t> g_bridgeGeneration{0};
     std::atomic<uint32_t> g_bridgeInFlight{0};
@@ -973,7 +975,25 @@ static void UpdateNativeObserver()
     }
 }
 
-void OllamaDispatch_Update(uint32_t /*diff*/)
+namespace
+{
+// Smoke-test watchlist: typed command counters as fixed fields, after a change and at most once a minute.
+void LogBridgeCommands(Clock::time_point now)
+{
+    OllamaBridge::CommandStats const& stats = g_bridgeChannel.Commands();
+    if (now < g_nextCommandsLog || stats == g_loggedCommands)
+        return;
+    g_loggedCommands = stats;
+    g_nextCommandsLog = now + std::chrono::minutes(1);
+    LOG_INFO("module.ollamachat",
+             "[Ollama Chat] Bridge commands: proposed {} duplicates {} refused {} attempts {} applied {} "
+             "failed {} withheld {} effects {}",
+             stats.proposed, stats.duplicates, stats.refused, stats.attempts, stats.applied, stats.failed,
+             stats.withheld, OllamaBridge::kBridgeEffectsReleased ? "released" : "closed");
+}
+}  // namespace
+
+void OllamaDispatch_Update(uint32_t /*diff*/, PlayerbotBridge::PostMapJoin const& join)
 {
     UpdateNativeObserver();
     g_bridgeWorld.Expire(OllamaBridge::Now());
@@ -993,8 +1013,12 @@ void OllamaDispatch_Update(uint32_t /*diff*/)
         OllamaBridge_SetActivation(g_bridgeWorld.Selected());
         g_bridgeGeneration = g_bridgeWorld.Generation();
     }
-    g_bridgeChannel.Update();  // Bounded independent reverse lane; no HTTP, waits or generation-worker dependency.
+    // Bounded independent reverse lane; no HTTP, waits or generation-worker dependency. Typed effects get the
+    // post-map-join phase for this call only.
+    OllamaBridge::EffectPhase const phase(join);
+    g_bridgeChannel.Update(&phase);
     const auto now = Clock::now();
+    LogBridgeCommands(now);
 
     // Move due completions out under the lock, then deliver without it: the
     // delivery path re-enters ProcessBotChatMessage, which submits new work.

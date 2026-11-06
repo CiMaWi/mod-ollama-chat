@@ -14,6 +14,11 @@
 class Player;
 class Channel;
 
+namespace PlayerbotBridge
+{
+class PostMapJoin;
+}
+
 // --------------------------------------------------------------------------
 // Central dispatcher.
 //
@@ -109,12 +114,33 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
 // World-thread game adapter and bounded, audience-scoped conversation memory. No legacy memory is imported.
 bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard);
 OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource();
+// World-only typed effect adapter (bridge_effect.cpp). While kBridgeEffectsReleased is false it refuses
+// every command without a game read.
+OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor();
 void OllamaChat_BridgeRefresh();
 void OllamaChat_BridgeReset();
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply);
 
-// Drain finished generations and deliver them. World thread only.
-void OllamaDispatch_Update(uint32_t diff);
+// Drain finished generations and deliver them. World thread only. join is the post-map-join token that only
+// OllamaBotRandomChatter::OnUpdate constructs, on its stack; it is used during this call and never stored.
+void OllamaDispatch_Update(uint32_t diff, PlayerbotBridge::PostMapJoin const& join);
+
+namespace OllamaBridge
+{
+// The typed-effect phase. Only OllamaDispatch_Update builds one, from the post-map-join token, for its own
+// WorldChannel::Update call; it is neither copied nor stored.
+struct EffectPhase final
+{
+    EffectPhase(EffectPhase const&) = delete;
+    EffectPhase& operator=(EffectPhase const&) = delete;
+
+    PlayerbotBridge::PostMapJoin const& join;
+
+private:
+    friend void ::OllamaDispatch_Update(uint32_t, PlayerbotBridge::PostMapJoin const&);
+    explicit EffectPhase(PlayerbotBridge::PostMapJoin const& token) : join(token) {}
+};
+}  // namespace OllamaBridge
 
 void OllamaDispatch_Start();
 void OllamaDispatch_Stop();

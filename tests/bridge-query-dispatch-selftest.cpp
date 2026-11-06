@@ -148,6 +148,21 @@ bool OllamaChat_BridgeObserve(WorldTicket const&, DispatchGuard&);
 void OllamaChat_BridgeRefresh();
 WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
 bool OllamaDispatch_ChannelEvents(DispatchGuard const&, std::vector<uint8_t> const&);
+// The production channel names the world-only typed effect adapter, which needs game headers. This fixture stands in
+// with the closed release gate: every command is refused without a game read.
+CommandExecutor& OllamaChat_BridgeCommandExecutor()
+{
+    struct Closed final : CommandExecutor
+    {
+        EffectResult Execute(EffectPhase const&, WorldTicket const&, DispatchGuard const&, ChannelCommand const&,
+                             std::function<bool()> const&) override
+        {
+            return EffectResult::Rejected;
+        }
+    };
+    static Closed executor;
+    return executor;
+}
 
 namespace
 {

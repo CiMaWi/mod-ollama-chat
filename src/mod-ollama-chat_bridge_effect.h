@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <functional>
+#include <optional>
 #include <unordered_map>
+#include <variant>
 
 #include "mod-ollama-chat_bridge_channel.h"
 
@@ -42,6 +44,52 @@ inline ChannelOutcome EffectOutcome(EffectResult result, bool authorized)
     if (result == EffectResult::Rejected || result == EffectResult::Unavailable)
         return ChannelOutcome::Rejected;
     return authorized && result == EffectResult::Applied ? ChannelOutcome::Applied : ChannelOutcome::Failed;
+}
+
+// Plain typed order for the game boundary, built only from MapIntent over fresh facts and the captured group.
+struct EffectOrder
+{
+    ChannelIntent intent = ChannelIntent::Stay;
+    uint64_t botGuid = 0;
+    uint64_t controllerGuid = 0;
+    uint64_t groupGuid = 0;
+    uint64_t targetGuid = 0;
+    uint8_t icon = 0;
+};
+
+// The one unit an executor resolves for visibility: the bot's current own target for an attack, the payload's
+// target for a mark. Zero resolves nothing, so the target fact stays closed.
+inline uint64_t EffectTargetGuid(ChannelCommand const& command, uint64_t ownTargetGuid)
+{
+    if (command.intent == ChannelIntent::AttackOwnTarget)
+        return ownTargetGuid;
+    auto const* mark = command.intent == ChannelIntent::Mark ? std::get_if<ChannelMark>(&command.params) : nullptr;
+    return mark ? mark->guid : 0;
+}
+
+// A supported verb mapped from freshly resolved facts, with a nonzero target and captured group; otherwise none.
+inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command, IntentContext const& current)
+{
+    if (!EffectSupported(command.intent))
+        return std::nullopt;
+    auto const mapped = MapIntent(command, current);
+    if (!mapped)
+        return std::nullopt;
+    EffectOrder order;
+    order.intent = mapped->intent;
+    order.botGuid = mapped->botGuid;
+    order.controllerGuid = mapped->controllerGuid;
+    order.groupGuid = current.expectedGroupGuid;
+    if (auto const* target = std::get_if<ChannelTarget>(&mapped->params))
+        order.targetGuid = target->guid;
+    else if (auto const* mark = std::get_if<ChannelMark>(&mapped->params))
+    {
+        order.targetGuid = mark->guid;
+        order.icon = mark->icon;
+    }
+    if (!order.targetGuid || !order.groupGuid)
+        return std::nullopt;
+    return order;
 }
 
 // World-only and synchronous. Execute calls authorize once immediately before any mutation and mutates nothing
@@ -101,6 +149,8 @@ struct CommandStats
     uint64_t applied = 0;
     uint64_t failed = 0;
     uint64_t withheld = 0;  // Decided outcomes whose receipt was not published; never a retry.
+
+    bool operator==(CommandStats const&) const = default;
 };
 }  // namespace OllamaBridge
 
