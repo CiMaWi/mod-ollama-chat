@@ -6,6 +6,8 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "BridgeLiteralRoute.h"
+#include "AcquaintanceMgr.h"
+#include "PlayerbotAIConfig.h"
 #include "Config.h"
 #include "Common.h"
 #include "Guild.h"
@@ -44,6 +46,8 @@
 #include "mod-ollama-chat_memory.h"
 #include "mod-ollama-chat_topics.h"
 #include "mod-ollama-chat_random.h"
+#include "mod-ollama-chat_persona_bridge.h"
+#include "mod-ollama-chat_persona_db.h"
 #include <iomanip>
 #include "SpellMgr.h"
 #include "SpellInfo.h"
@@ -1103,6 +1107,7 @@ struct BridgeView
     OllamaBridge::Context context;
     std::string signature;
     std::vector<OllamaBridge::ChannelObservedMark> marks;
+    OllamaPersona::CardContext card;
 };
 
 struct BridgeBinding
@@ -1118,6 +1123,8 @@ struct BridgeBinding
 // World-thread only. Entries contain values, never Player/Group pointers. Refresh work is at most 64 * 40 members.
 std::vector<BridgeBinding> g_bridgeBindings;
 uint64_t g_bridgeRevision = 0;
+// The bridge generation the persona store was last activated for; OllamaChat_BridgeReset retires it.
+uint64_t g_cardGeneration = 0;
 
 void BridgeField(std::string& signature, std::string const& value)
 {
@@ -1203,6 +1210,31 @@ public:
         return targetGuid != 0;
     }
 };
+
+// BEGIN BRIDGE PERSONA CARD -- extracted verbatim by the offline persona adapter check.
+// Personal: the controlling speaker outside party scope, with a current acquaintance row for this exact pair. One
+// map lookup on world; fails closed while acquaintance is disabled or not loaded, and retries at a later exchange.
+bool BridgeCardPersonal(Player* bot, Player* speaker, Player* controller, OllamaBridge::DispatchSource source)
+{
+    if (speaker != controller || source == OllamaBridge::DispatchSource::Party ||
+        !sPlayerbotAIConfig.AcquaintanceEnable || !AcquaintanceMgr::Instance().IsLoaded())
+        return false;
+    // The 32-bit counters belong only to this playerbots API; the card key stays the full raw GUID.
+    return AcquaintanceMgr::Instance().Find(speaker->GetGUID().GetCounter(), bot->GetGUID().GetCounter()) != nullptr;
+}
+
+// Cache-only card read for one capture, no I/O. A closed gate, an ineligible pair or no current observation keeps
+// the view, its persona text and signature voice only. The caller signs the card token after the persona text.
+void BridgeCard(Player* bot, Player* speaker, Player* controller, BridgeView& view)
+{
+    auto const& store = OllamaPersona::WorldStore();
+    if (!store.Enabled())
+        return;
+    view.card =
+        OllamaPersona::ReadCard(store, OllamaDispatch_BridgeWorld().Generation(), view.guard.scope.botGuid,
+                                BridgeCardPersonal(bot, speaker, controller, view.guard.source), view.context.persona);
+}
+// END BRIDGE PERSONA CARD
 
 bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::DispatchSource source, BridgeView& view)
 {
@@ -1306,6 +1338,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     view.context.persona = Roleplay_BuildVoicePrompt(bot);
     if (view.context.persona.size() > 8192)
         return false;
+    BridgeCard(bot, speaker, controller, view);
     view.context.observations = {"Your name is " + bot->GetName() + ".", "The speaker is " + speaker->GetName() + "."};
     // Piggyback on this existing bounded observation; never add a world/group scan or tick hook.
     if (group)
@@ -1317,6 +1350,9 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
                 view.marks.push_back({guid.GetRawValue(), icon});
         }
     BridgeField(view.signature, view.context.persona);
+    // Readiness, revision and snapshot: a reload or update fails BridgeSame even when the text is unchanged.
+    if (auto const card = OllamaPersona::CardToken(view.card); !card.empty())
+        BridgeField(view.signature, card);
     return true;
 }
 
@@ -1329,8 +1365,34 @@ bool BridgeSame(BridgeBinding const& binding, BridgeView const& current)
 void BridgeErase(std::vector<BridgeBinding>::iterator it)
 {
     auto const& scope = it->view.guard.scope;
+    uint64_t const botGuid = scope.botGuid;
     OllamaDispatch_BridgeWorld().InvalidateScope(scope.botGuid, scope.contextId);
     g_bridgeBindings.erase(it);
+    // The bot's last binding died because it left the world: drop its card snapshot so the next meeting reloads
+    // from SQL. A changed capture alone keeps the cache; forgetting then would undo every load it signs.
+    if (!ObjectAccessor::FindConnectedPlayer(ObjectGuid(botGuid)) &&
+        std::none_of(g_bridgeBindings.begin(), g_bridgeBindings.end(),
+                     [&](BridgeBinding const& item) { return item.view.guard.scope.botGuid == botGuid; }))
+        OllamaPersona::ForgetPersona(botGuid);
+}
+
+// Fresh capture of the ticket's binding. A failed or changed capture erases the binding and returns end.
+std::vector<BridgeBinding>::iterator BridgeObserveFresh(OllamaBridge::WorldTicket const& ticket, BridgeView& current)
+{
+    auto it = std::find_if(g_bridgeBindings.begin(), g_bridgeBindings.end(), [&](BridgeBinding const& item)
+                           { return item.generation == ticket.generation && item.view.guard.scope == ticket.scope; });
+    if (it == g_bridgeBindings.end())
+        return it;
+    auto const now = OllamaBridge::Now();
+    auto const& captured = it->view.guard;
+    if (OllamaBridge::Expired(it->heartbeat, now) || OllamaBridge::Expired(it->idleUntil, now) ||
+        !BridgeCapture(captured.scope.botGuid, captured.speakerGuid, captured.source, current) ||
+        !BridgeSame(*it, current))
+    {
+        BridgeErase(it);
+        return g_bridgeBindings.end();
+    }
+    return it;
 }
 
 bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, std::string const& text, bool addressed,
@@ -1358,10 +1420,18 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     if (chainDepth || text.empty() || text.size() > MaxTextBytes ||
         ((origin == DispatchSource::Say || origin == DispatchSource::Yell) && !addressed))
         return false;
+    auto& cards = OllamaPersona::WorldStore();
+    uint64_t const generation = OllamaDispatch_BridgeWorld().Generation();
+    // Lazy and idempotent for the current bridge generation; the store refuses an older one.
+    if (cards.Enabled() && cards.Activate(generation))
+        g_cardGeneration = generation;
     OllamaChat_BridgeRefresh();
     BridgeView view;
     if (!BridgeCapture(bot->GetGUID().GetRawValue(), speaker->GetGUID().GetRawValue(), origin, view))
         return false;
+    // The one load request: a qualified current encounter of a personal pair. Captures elsewhere only read.
+    if (view.card.personal)
+        cards.Prepare(generation, view.guard.scope.botGuid, std::chrono::steady_clock::now());
     auto const bridgeSettings = OllamaDispatch_BridgeWorld().Snapshot();
     if (bridgeSettings.provider == "codex" && bridgeSettings.observerEnabled)
     {
@@ -1431,7 +1501,11 @@ OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource()
     return source;
 }
 
-void OllamaChat_BridgeReset() { g_bridgeBindings.clear(); }
+void OllamaChat_BridgeReset()
+{
+    g_bridgeBindings.clear();
+    OllamaPersona::RetirePersonas(g_cardGeneration);
+}
 
 void OllamaChat_BridgeRefresh()
 {
@@ -1477,24 +1551,29 @@ void OllamaChat_BridgeRefresh()
 
 bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard)
 {
-    auto it = std::find_if(g_bridgeBindings.begin(), g_bridgeBindings.end(), [&](BridgeBinding const& item)
-                           { return item.generation == ticket.generation && item.view.guard.scope == ticket.scope; });
+    BridgeView current;
+    auto const it = BridgeObserveFresh(ticket, current);
     if (it == g_bridgeBindings.end())
         return false;
-    BridgeView current;
-    auto const now = OllamaBridge::Now();
-    auto const& captured = it->view.guard;
-    if (OllamaBridge::Expired(it->heartbeat, now) || OllamaBridge::Expired(it->idleUntil, now) ||
-        !BridgeCapture(captured.scope.botGuid, captured.speakerGuid, captured.source, current) ||
-        !BridgeSame(*it, current))
-    {
-        BridgeErase(it);
-        return false;
-    }
     // Equality was established from fresh GUID resolution; revisions cannot be resurrected by matching values later.
     guard = std::move(current.guard);
-    guard.scope = captured.scope;
+    guard.scope = it->view.guard.scope;
     return true;
+}
+
+OllamaPersona::ProposalStatus OllamaChat_BridgeProposeCard(OllamaBridge::WorldTicket const& ticket,
+                                                           uint64_t expectedRevision, uint64_t stamp, std::string body)
+{
+    BridgeView current;
+    if (!OllamaDispatch_BridgeWorld().Current(ticket, OllamaBridge::Now()))
+        return OllamaPersona::ProposalStatus::Stale;
+    auto const it = BridgeObserveFresh(ticket, current);
+    if (it == g_bridgeBindings.end())
+        return OllamaPersona::ProposalStatus::Stale;
+    // The fresh capture re-checked gate, acquaintance, controlling speaker and the signed card token.
+    return OllamaPersona::ProposeCard(OllamaPersona::WorldStore(), it->generation, ticket.scope.botGuid,
+                                      current.card.personal, ticket.scope.provider, expectedRevision, stamp,
+                                      std::move(body));
 }
 
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply)

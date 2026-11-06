@@ -52,9 +52,10 @@ private:
                          CONNECTION_ASYNC);
     }
 
-    // Lost connections go to the core handler. It reconnects, re-prepares and fails (not replays) a transaction
-    // cut off before COMMIT. Other errors stay local: the core aborts on schema or parse errors, and this storage
-    // is optional. Codes from errmsg.h, which the core's database target keeps private.
+    // Lost connections go to the core handler. It reconnects, re-prepares and reruns a transaction cut off before
+    // COMMIT (up to 3 times, the compare-and-swap makes that safe) and fails one cut off during COMMIT. Other errors
+    // stay local: the core aborts on schema or parse errors, and this storage is optional. Codes from errmsg.h,
+    // which the core's database target keeps private.
     bool _HandleMySQLErrno(uint32 errNo, char const* err, uint8 attempts) override
     {
         switch (errNo)
@@ -287,6 +288,13 @@ void DiscardStagedPersonaWrites(std::optional<uint64_t> botGuid)
 {
     if (dbSession)
         dbSession->port.DiscardStaged(botGuid);
+}
+
+void ForgetPersona(uint64_t botGuid) { ForgetPersona(WorldStore(), dbSession ? &dbSession->port : nullptr, botGuid); }
+
+void RetirePersonas(uint64_t generation)
+{
+    RetirePersonas(WorldStore(), dbSession ? &dbSession->port : nullptr, generation);
 }
 
 void StopPersonaDb()

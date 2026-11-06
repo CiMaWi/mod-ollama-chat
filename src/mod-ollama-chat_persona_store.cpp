@@ -238,4 +238,80 @@ Store& WorldStore()
     static Store store;
     return store;
 }
+
+CardContext ReadCard(Store const& store, uint64_t generation, uint64_t botGuid, bool personal, std::string& persona)
+{
+    CardContext card{CardStatus::Unready, personal};
+    if (!personal)
+        return card;
+    StoreView const view = store.Observe(generation, botGuid);
+    if (view.status == StoreStatus::Loading)
+        card.status = CardStatus::Loading;
+    if (!view.state)
+        return card;
+    card.revision = view.state->revision;
+    card.stamp = view.stamp;
+    if (view.status == StoreStatus::Missing)
+    {
+        card.status = CardStatus::Missing;
+        return card;
+    }
+    Card const* accepted = SelectAccepted(*view.state, true);
+    card.status = accepted ? CardStatus::Accepted : CardStatus::DraftOnly;
+    if (accepted && persona.size() + CardSeparator.size() + accepted->body.size() <= MaxCardBytes)
+    {
+        persona += CardSeparator;
+        persona += accepted->body;
+    }
+    return card;
+}
+
+std::string CardToken(CardContext const& card)
+{
+    char const* name = nullptr;
+    switch (card.status)
+    {
+        case CardStatus::Unready:
+            return {};
+        case CardStatus::Loading:
+            name = "loading";
+            break;
+        case CardStatus::Missing:
+            name = "missing";
+            break;
+        case CardStatus::DraftOnly:
+            name = "draft";
+            break;
+        case CardStatus::Accepted:
+            name = "accepted";
+            break;
+    }
+    return std::string("card:") + name + ":" + std::to_string(card.revision) + ":" + std::to_string(card.stamp);
+}
+
+std::optional<Source> ProviderSource(std::string_view provider)
+{
+    if (provider == "claude")
+        return Source::Claude;
+    if (provider == "codex")
+        return Source::Codex;
+    return std::nullopt;
+}
+
+ProposalStatus ProposeCard(Store& store, uint64_t generation, uint64_t botGuid, bool personal,
+                           std::string_view provider, uint64_t expectedRevision, uint64_t stamp, std::string body)
+{
+    if (!store.Enabled())
+        return ProposalStatus::Disabled;
+    auto const source = ProviderSource(provider);
+    if (!source)
+        return ProposalStatus::Unauthenticated;
+    if (!personal)
+        return ProposalStatus::Ineligible;
+    StoreView const view = store.Observe(generation, botGuid);
+    if (!view.state || view.stamp != stamp || view.state->revision != expectedRevision)
+        return ProposalStatus::Stale;
+    Update const update{UpdateKind::ProposeAlternative, botGuid, expectedRevision, *source, std::move(body)};
+    return store.SubmitUpdate(generation, stamp, true, update) ? ProposalStatus::Queued : ProposalStatus::Rejected;
+}
 }  // namespace OllamaPersona

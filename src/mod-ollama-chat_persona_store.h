@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <list>
+#include <string_view>
 #include <unordered_map>
 
 #include "mod-ollama-chat_persona_card.h"
@@ -130,6 +131,52 @@ private:
 };
 
 Store& WorldStore();
+
+// Card context of one bridge capture. Unready means voice only: gate closed, pair not personal, or no current
+// observation; it adds nothing to the context or its signature. A loaded row without an accepted card is DraftOnly
+// (ValidState: a nonzero revision always holds a card).
+enum class CardStatus : uint8_t
+{
+    Unready,
+    Loading,
+    Missing,  // Confirmed absent row, revision zero.
+    DraftOnly,
+    Accepted
+};
+
+struct CardContext
+{
+    CardStatus status = CardStatus::Unready;
+    bool personal = false;
+    uint64_t revision = 0;
+    uint64_t stamp = 0;
+};
+
+constexpr std::string_view CardSeparator = "\n\n";
+
+// World only, cache only, no I/O. Personal means the acquainted controlling speaker outside party scope. Only then
+// is the accepted body appended to the voice, and only if both fit in MaxCardBytes: the voice keeps priority and
+// a card is never truncated.
+CardContext ReadCard(Store const& store, uint64_t generation, uint64_t botGuid, bool personal, std::string& persona);
+// Signature field of a capture, empty when Unready. Revision and stamp are canonical decimal.
+std::string CardToken(CardContext const& card);
+
+enum class ProposalStatus : uint8_t
+{
+    Queued,
+    Disabled,
+    Unauthenticated,
+    Ineligible,
+    Stale,
+    Rejected
+};
+
+// Provenance comes only from the authenticated provider of the bridge ticket, never from generated text.
+std::optional<Source> ProviderSource(std::string_view provider);
+// World only. Queues a provider alternative for a personal pair whose current observation still shows the expected
+// revision and stamp. Queued is not persisted. A provider never accepts or edits the accepted card.
+ProposalStatus ProposeCard(Store& store, uint64_t generation, uint64_t botGuid, bool personal,
+                           std::string_view provider, uint64_t expectedRevision, uint64_t stamp, std::string body);
 }  // namespace OllamaPersona
 
 #endif

@@ -175,6 +175,23 @@ private:
     bool _closed = false;
 };
 
+// World-thread lifecycle. A staged write is disposed before the store drops its key; issued work stays pinned until
+// its terminal completion, which the store then discards. Nothing is replayed; the next load reconciles from SQL.
+inline void ForgetPersona(Store& store, PersonaDbPort* port, uint64_t botGuid)
+{
+    if (port)
+        port->DiscardStaged(botGuid);
+    store.Forget(botGuid);
+}
+
+// Every staged write belongs to the ending bridge generation, even when the store has already left it.
+inline void RetirePersonas(Store& store, PersonaDbPort* port, uint64_t generation)
+{
+    if (port)
+        port->DiscardStaged();
+    store.Retire(generation);
+}
+
 // Registers the keep-alive that pings the persona pool with the core's own pools.
 void AddPersonaDbScripts();
 // World-thread lifecycle. Open only on enabled startup, after Characters schema setup.
@@ -182,6 +199,9 @@ void StartPersonaDb();
 void PumpPersonaDb();
 // Call before retiring the generation (all staged writes) or forgetting a bot (its staged write).
 void DiscardStagedPersonaWrites(std::optional<uint64_t> botGuid = {});
+// The running session's lifecycle: a bot that left the world, and the end of a bridge generation.
+void ForgetPersona(uint64_t botGuid);
+void RetirePersonas(uint64_t generation);
 void StopPersonaDb();
 }  // namespace OllamaPersona
 
