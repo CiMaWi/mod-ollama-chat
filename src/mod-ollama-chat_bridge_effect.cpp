@@ -76,8 +76,23 @@ private:
             return EffectResult::Rejected;
 
         PlayerbotBridge::Order order;
-        order.Operation = effect->intent == ChannelIntent::Mark ? PlayerbotBridge::Intent::Mark
-                                                                : PlayerbotBridge::Intent::AttackOwnTarget;
+        switch (effect->intent)
+        {
+            case ChannelIntent::AttackOwnTarget:
+                order.Operation = PlayerbotBridge::Intent::AttackOwnTarget;
+                break;
+            case ChannelIntent::Mark:
+                order.Operation = PlayerbotBridge::Intent::Mark;
+                break;
+            case ChannelIntent::Follow:
+                order.Operation = PlayerbotBridge::Intent::Follow;
+                break;
+            case ChannelIntent::Stay:
+                order.Operation = PlayerbotBridge::Intent::Stay;
+                break;
+            default:
+                return EffectResult::Rejected;  // An unmapped verb never reaches playerbots.
+        }
         order.Bot = effect->botGuid;
         order.Controller = effect->controllerGuid;
         order.Group = effect->groupGuid;

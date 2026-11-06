@@ -31,10 +31,11 @@ enum class EffectResult : uint8_t
 };
 
 // DS.3: only verbs with an accepted typed game effect reach an executor. Every other verb gets the fixed refusal
-// here, before any game read; lasting-state verbs stay refused until J12.
+// here, before any game read; lasting-state verbs stay refused until J12. Follow and stay are one-time moves.
 inline bool EffectSupported(ChannelIntent intent)
 {
-    return intent == ChannelIntent::AttackOwnTarget || intent == ChannelIntent::Mark;
+    return intent == ChannelIntent::AttackOwnTarget || intent == ChannelIntent::Mark ||
+           intent == ChannelIntent::Follow || intent == ChannelIntent::Stay;
 }
 
 // Rejected and Unavailable promise no mutation. Only an attempt the channel authorized can be applied; any other
@@ -67,7 +68,8 @@ inline uint64_t EffectTargetGuid(ChannelCommand const& command, uint64_t ownTarg
     return mark ? mark->guid : 0;
 }
 
-// A supported verb mapped from freshly resolved facts, with a nonzero target and captured group; otherwise none.
+// A supported verb mapped from freshly resolved facts with the captured group; otherwise none. An attack or a mark
+// needs a nonzero target, a target-less verb must carry none.
 inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command, IntentContext const& current)
 {
     if (!EffectSupported(command.intent))
@@ -87,7 +89,8 @@ inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command
         order.targetGuid = mark->guid;
         order.icon = mark->icon;
     }
-    if (!order.targetGuid || !order.groupGuid)
+    bool const targeted = order.intent == ChannelIntent::AttackOwnTarget || order.intent == ChannelIntent::Mark;
+    if (!order.groupGuid || (targeted ? !order.targetGuid : order.targetGuid != 0))
         return std::nullopt;
     return order;
 }
