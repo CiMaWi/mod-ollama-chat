@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <thread>
 
-#include "httplib.h"
+#include "../src/httplib.h"
 
 #ifndef _WIN64
 #include <signal.h>

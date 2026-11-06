@@ -7,7 +7,7 @@
 // that bundle a different cpp-httplib version (e.g. mod-pbc 0.43.1, mod-ale
 // 0.13.1) into the same monolithic `modules` static library.
 #define httplib ollamachat_httplib
-#include <httplib.h>
+#include "./httplib.h"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +18,7 @@
 #include <regex>
 #include <set>
 #include <sstream>
+#include <string_view>
 #include <unordered_map>
 
 #include "Log.h"
@@ -29,6 +30,9 @@
 
 namespace
 {
+static_assert(std::string_view{CPPHTTPLIB_VERSION} == "0.23.1",
+    "mod-ollama-chat requires its bundled cpp-httplib 0.23.1");
+
 // Keep SIGPIPE protection local to this transport, independent of process signal handlers.
 #if defined(MSG_NOSIGNAL)
 constexpr int BridgeSendFlags = CPPHTTPLIB_SEND_FLAGS | MSG_NOSIGNAL;
