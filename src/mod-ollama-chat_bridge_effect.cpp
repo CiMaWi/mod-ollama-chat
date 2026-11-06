@@ -90,6 +90,9 @@ private:
             case ChannelIntent::Stay:
                 order.Operation = PlayerbotBridge::Intent::Stay;
                 break;
+            case ChannelIntent::Flee:  // Flees from the bot's own current target, resolved by playerbots.
+                order.Operation = PlayerbotBridge::Intent::Flee;
+                break;
             default:
                 return EffectResult::Rejected;  // An unmapped verb never reaches playerbots.
         }

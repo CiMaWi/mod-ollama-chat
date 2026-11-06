@@ -31,11 +31,11 @@ enum class EffectResult : uint8_t
 };
 
 // DS.3: only verbs with an accepted typed game effect reach an executor. Every other verb gets the fixed refusal
-// here, before any game read; lasting-state verbs stay refused until J12. Follow and stay are one-time moves.
+// here, before any game read; lasting-state verbs stay refused until J12. Follow, stay and flee are one-time moves.
 inline bool EffectSupported(ChannelIntent intent)
 {
     return intent == ChannelIntent::AttackOwnTarget || intent == ChannelIntent::Mark ||
-           intent == ChannelIntent::Follow || intent == ChannelIntent::Stay;
+           intent == ChannelIntent::Follow || intent == ChannelIntent::Stay || intent == ChannelIntent::Flee;
 }
 
 // Rejected and Unavailable promise no mutation. Only an attempt the channel authorized can be applied; any other
