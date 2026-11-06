@@ -9,6 +9,7 @@
 #include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_dispatch.h"
 #include "mod-ollama-chat_memory.h"
+#include "mod-ollama-chat_persona_store.h"
 #include "mod-ollama-chat_roleplay.h"
 #include "mod-ollama-chat_topics.h"
 #include "mod-ollama-chat-utilities.h"
@@ -938,6 +939,8 @@ void LoadOllamaChatConfig()
     // the g_Ollama* globals directly -- reassigning those here would free the
     // buffers under a worker mid-request.
     OllamaConfig_Publish();
+    bool const personaCardsEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.PersonaCardsEnabled", false);
+    OllamaPersona::WorldStore().Configure(g_Enable && personaCardsEnabled);
     // Explicit world-thread load/reload notification also retires work when the module is disabled.
     // The random-chatter update hook may return before dispatcher Update in that state.
     OllamaDispatch_BridgeConfigured(sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ChannelEnabled", false));

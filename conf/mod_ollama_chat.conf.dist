@@ -142,6 +142,16 @@ OllamaChat.Bridge.Token =
 #     Default:     0 (existing generation behavior; reverse mailbox unavailable)
 OllamaChat.Bridge.ChannelEnabled = 0
 
+# OllamaChat.Bridge.PersonaCardsEnabled
+#     Description: Use durable persona cards in the native bridge for eligible bot/controller pairs.
+#                  Requires Playerbots.Acquaintance.Enable and the Characters update
+#                  data/sql/characters/updates/2026_11_06_persona_cards.sql.
+#                  Stores up to 256 bot states in memory, with 16 pending operations and
+#                  up to 8 completions processed per world update. Failed lookups retry
+#                  on a qualified encounter after 30 seconds. Uses existing voice when unavailable.
+#     Default:     0 (false)
+OllamaChat.Bridge.PersonaCardsEnabled = 0
+
 # OllamaChat.Bridge.ObserverEnabled / ObserverTokenRef
 #     Description: Default-off Codex world-observer transport (Windows only, like the native service).
 #                  TokenRef is the absolute fixed-local-drive path to the service's protected observer.json,
