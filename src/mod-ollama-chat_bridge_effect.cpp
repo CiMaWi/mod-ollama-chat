@@ -64,7 +64,24 @@ private:
         facts.botGroupGuid = GroupGuid(bot);
         if (command.intent == ChannelIntent::AttackOwnTarget)
             facts.ownTargetGuid = bot->GetTarget().GetRawValue();
-        // pathableNearbyPosition stays closed: no delivered verb carries a position.
+        // A position becomes a fact only where playerbots finds a short complete path near the bot and the controller
+        // (one read-only path query). MapIntent then requires the wire position to equal it exactly, and playerbots
+        // checks it again after authorization.
+        if (auto const* candidate =
+                command.intent == ChannelIntent::Position ? std::get_if<ChannelPosition>(&command.params) : nullptr)
+        {
+            PlayerbotBridge::Order probe;
+            probe.Operation = PlayerbotBridge::Intent::Position;
+            probe.Bot = ticket.scope.botGuid;
+            probe.Controller = ticket.scope.controllerGuid;
+            probe.VisibilityDistance = distance;
+            probe.MapId = candidate->mapId;
+            probe.X = candidate->x;
+            probe.Y = candidate->y;
+            probe.Z = candidate->z;
+            if (PlayerbotBridge::PositionReachable(phase.join, probe))
+                facts.pathableNearbyPosition = *candidate;
+        }
         if (uint64_t const candidate = EffectTargetGuid(command, facts.ownTargetGuid))
         {
             Unit* unit = ObjectAccessor::GetUnit(*bot, ObjectGuid(candidate));
@@ -93,6 +110,9 @@ private:
             case ChannelIntent::Flee:  // Flees from the bot's own current target, resolved by playerbots.
                 order.Operation = PlayerbotBridge::Intent::Flee;
                 break;
+            case ChannelIntent::Position:
+                order.Operation = PlayerbotBridge::Intent::Position;
+                break;
             default:
                 return EffectResult::Rejected;  // An unmapped verb never reaches playerbots.
         }
@@ -102,6 +122,10 @@ private:
         order.Target = effect->targetGuid;
         order.Icon = effect->icon;
         order.VisibilityDistance = distance;
+        order.MapId = effect->position.mapId;
+        order.X = effect->position.x;
+        order.Y = effect->position.y;
+        order.Z = effect->position.z;
         switch (PlayerbotBridge::Execute(phase.join, order, authorize))
         {
             case PlayerbotBridge::Result::Rejected:

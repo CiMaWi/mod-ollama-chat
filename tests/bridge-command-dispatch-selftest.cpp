@@ -1,6 +1,7 @@
 // Actual WorldChannel, WorldPolicy and ChannelPolicy with an instrumented typed effect seam; no game or PB code.
 #include <algorithm>
 #include <iostream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -216,10 +217,10 @@ void PureSeam()
     unsigned supported = 0;
     for (int intent = 0; intent <= static_cast<int>(ChannelIntent::DungeonClear); ++intent)
         supported += EffectSupported(static_cast<ChannelIntent>(intent)) ? 1 : 0;
-    Check(supported == 5 && EffectSupported(ChannelIntent::AttackOwnTarget) && EffectSupported(ChannelIntent::Mark) &&
+    Check(supported == 6 && EffectSupported(ChannelIntent::AttackOwnTarget) && EffectSupported(ChannelIntent::Mark) &&
               EffectSupported(ChannelIntent::Follow) && EffectSupported(ChannelIntent::Stay) &&
-              EffectSupported(ChannelIntent::Flee),
-          "only the five PB-backed verbs reach an executor");
+              EffectSupported(ChannelIntent::Flee) && EffectSupported(ChannelIntent::Position),
+          "only the six PB-backed verbs reach an executor");
     Check(EffectOutcome(EffectResult::Applied, true) == ChannelOutcome::Applied &&
               EffectOutcome(EffectResult::Failed, true) == ChannelOutcome::Failed &&
               EffectOutcome(EffectResult::Rejected, true) == ChannelOutcome::Rejected &&
@@ -301,8 +302,9 @@ void EffectOrders()
         ChannelCommand const oneShot{"o", 22, 11, intent, std::monostate{}};
         auto const ordered = BuildEffectOrder(oneShot, facts);
         Check(ordered && ordered->intent == intent && ordered->botGuid == 11 && ordered->controllerGuid == 22 &&
-                  ordered->groupGuid == 33 && ordered->targetGuid == 0 && ordered->icon == 0,
-              "a target-less one-shot order carries the captured group and no target");
+                  ordered->groupGuid == 33 && ordered->targetGuid == 0 && ordered->icon == 0 &&
+                  ordered->position == ChannelPosition{},
+              "a target-less one-shot order carries the captured group, no target and no position");
         Check(EffectTargetGuid(oneShot, 44) == 0, "a target-less one-shot resolves no unit");
         auto const unseenOrder = BuildEffectOrder(oneShot, unseen);
         auto const retargetedOrder = BuildEffectOrder(oneShot, retargeted);
@@ -321,7 +323,53 @@ void EffectOrders()
         Check(!BuildEffectOrder(other, facts), "a one-shot never takes a wire target");
         other.params = ChannelMark{44, 3};
         Check(!BuildEffectOrder(other, facts), "a one-shot never takes a wire mark");
+        other.params = ChannelPosition{1.5, -2.25, 3.0, 1};
+        IntentContext pathable = facts;
+        pathable.pathableNearbyPosition = ChannelPosition{1.5, -2.25, 3.0, 1};
+        Check(!BuildEffectOrder(other, pathable), "a one-shot never takes a wire position");
     }
+
+    ChannelPosition const spot{1.5, -2.25, 3.0, 1};
+    ChannelCommand const position{"x", 22, 11, ChannelIntent::Position, spot};
+    Check(!MapIntent(position, facts) && !BuildEffectOrder(position, facts),
+          "a position without the pathable fact builds no order");
+    IntentContext pathable = facts;
+    pathable.pathableNearbyPosition = spot;
+    auto const moving = BuildEffectOrder(position, pathable);
+    Check(moving && moving->intent == ChannelIntent::Position && moving->botGuid == 11 &&
+              moving->controllerGuid == 22 && moving->groupGuid == 33 && moving->targetGuid == 0 && moving->icon == 0 &&
+              moving->position == spot,
+          "a position order copies the checked coordinates and map");
+    Check(EffectTargetGuid(position, 44) == 0, "a position resolves no unit");
+    for (ChannelPosition const checked : {ChannelPosition{1.5, -2.25, 3.0, 2}, ChannelPosition{1.5, -2.25, 3.5, 1},
+                                          ChannelPosition{-2.25, 1.5, 3.0, 1}})
+    {
+        IntentContext checkedElsewhere = facts;
+        checkedElsewhere.pathableNearbyPosition = checked;
+        Check(!BuildEffectOrder(position, checkedElsewhere), "a position other than the checked one builds no order");
+    }
+    IntentContext pathableMoved = pathable;
+    pathableMoved.botGroupGuid = 34;
+    IntentContext pathableUngrouped = pathable;
+    pathableUngrouped.expectedGroupGuid = pathableUngrouped.controllerGroupGuid = pathableUngrouped.botGroupGuid = 0;
+    Check(!BuildEffectOrder(position, pathableMoved) && !BuildEffectOrder(position, pathableUngrouped),
+          "a position needs the captured group");
+    ChannelCommand stray = position;
+    stray.issuerGuid = 23;
+    Check(!BuildEffectOrder(stray, pathable), "another issuer builds no position");
+    stray = position;
+    stray.botGuid = 12;
+    Check(!BuildEffectOrder(stray, pathable), "another bot builds no position");
+    stray = position;
+    stray.params = ChannelTarget{44};
+    Check(!BuildEffectOrder(stray, pathable), "a position never takes a wire target");
+    stray.params = std::monostate{};
+    Check(!BuildEffectOrder(stray, pathable), "a position needs its coordinates");
+    ChannelPosition const unbounded{std::numeric_limits<double>::infinity(), -2.25, 3.0, 1};
+    stray.params = unbounded;
+    IntentContext infinite = facts;
+    infinite.pathableNearbyPosition = unbounded;
+    Check(!BuildEffectOrder(stray, infinite), "a non-finite position never maps, even as a matching fact");
 
     ChannelCommand const pull{"p", 22, 11, ChannelIntent::Pull, ChannelTarget{44}};
     Check(MapIntent(pull, facts) && !BuildEffectOrder(pull, facts) && EffectTargetGuid(pull, 44) == 0,
@@ -367,10 +415,33 @@ void TypedVerbs()
               "one authorized target-less one-shot order");
         Check(f.Result(receipt, intent) == "applied", "one-shot receipt");
     }
+    Json const spot{{"x", 1.5}, {"y", -2.25}, {"z", 3.0}, {"mapId", 1}};
+    f.Advance(CommandRate::IntervalMs);
+    f.probe.facts.pathableNearbyPosition = ChannelPosition{1.5, -2.25, 3.0, 1};
+    receipt = f.Send(f.Command("position-1", "position", spot));
+    auto const* position = std::get_if<ChannelPosition>(&f.probe.order->params);
+    Check(f.probe.calls == 6 && f.probe.grants == 6 && f.probe.mutations == 6 &&
+              f.probe.order->intent == ChannelIntent::Position && position &&
+              *position == ChannelPosition{1.5, -2.25, 3.0, 1},
+          "one authorized position order with the exact checked coordinates");
+    Check(f.Result(receipt, "position-1") == "applied", "position receipt");
     auto const& stats = f.channel.Commands();
-    Check(stats.proposed == 5 && stats.attempts == 5 && stats.applied == 5 && !stats.refused && !stats.failed &&
+    Check(stats.proposed == 6 && stats.attempts == 6 && stats.applied == 6 && !stats.refused && !stats.failed &&
               !stats.withheld && !stats.duplicates && f.channel.Drained(),
           "watchlist counters and slots");
+
+    // Without the adapter's pathable fact, or with a different checked position, the order never maps.
+    Fixture g;
+    Check(g.Result(g.Send(g.Command("unpathable", "position", spot)), "unpathable") == "rejected" &&
+              g.probe.calls == 1 && !g.probe.grants && !g.probe.mutations,
+          "an unpathable position is refused before authorization");
+    g.Advance(CommandRate::IntervalMs);
+    g.probe.facts.pathableNearbyPosition = ChannelPosition{1.5, -2.25, 4.0, 1};
+    Check(g.Result(g.Send(g.Command("elsewhere", "position", spot)), "elsewhere") == "rejected" && g.probe.calls == 2 &&
+              !g.probe.grants && !g.probe.mutations,
+          "a position other than the checked one is refused before authorization");
+    Check(g.channel.Commands().attempts == 2 && g.channel.Commands().refused == 2 && !g.channel.Commands().applied,
+          "refused positions are counted attempts without an effect");
 }
 
 void OutcomesNeverReplay()
@@ -413,7 +484,6 @@ void FixedRefusals()
                                                    {"assign_role", Json{{"role", "tank"}}},
                                                    {"save_mana", Json{{"enabled", true}}},
                                                    {"formation", Json{{"shape", "close"}}},
-                                                   {"position", Json{{"x", 1.0}, {"y", 2.0}, {"z", 3.0}, {"mapId", 1}}},
                                                    {"dungeon_clear", Json{{"mode", "on"}}}};
     unsigned refused = 0;
     for (auto const& [intent, params] : others)
@@ -421,8 +491,8 @@ void FixedRefusals()
         auto const id = "refused-" + std::to_string(refused++);
         Check(f.Result(f.Send(f.Command(id, intent, params)), id) == "rejected", "fixed refusal receipt");
     }
-    Check(refused == 8 && f.probe.calls == 0 && f.channel.Commands().refused == 8 && !f.channel.Commands().attempts,
-          "all eight other verbs refused with no executor call");
+    Check(refused == 7 && f.probe.calls == 0 && f.channel.Commands().refused == 7 && !f.channel.Commands().attempts,
+          "all seven other verbs refused with no executor call");
     Check(f.Result(f.Send(f.Attack("after-refusals")), "after-refusals") == "applied" && f.probe.calls == 1,
           "refusals spend no rate interval");
 
@@ -430,17 +500,22 @@ void FixedRefusals()
     Check(closed.Result(closed.Send(closed.Attack("no-executor")), "no-executor") == "rejected" &&
               !closed.channel.Commands().attempts,
           "null executor keeps today's refusal");
-    for (char const* intent : {"follow", "stay", "flee"})
+    std::pair<char const*, Json> const oneShots[] = {
+        {"follow", Json::object()},
+        {"stay", Json::object()},
+        {"flee", Json::object()},
+        {"position", Json{{"x", 1.0}, {"y", 2.0}, {"z", 3.0}, {"mapId", 1}}}};
+    for (auto const& [intent, params] : oneShots)
     {
         Fixture none({.executor = false});
-        Check(none.Result(none.Send(none.Command(intent, intent)), intent) == "rejected" &&
+        Check(none.Result(none.Send(none.Command(intent, intent, params)), intent) == "rejected" &&
                   !none.channel.Commands().attempts,
               "null executor refuses a one-shot");
         // The closed production executor refuses before any game read: the verb is attempted, nothing changes.
         Fixture shut;
         shut.probe.early = EffectResult::Rejected;
-        Check(shut.Result(shut.Send(shut.Command(intent, intent)), intent) == "rejected" && shut.probe.calls == 1 &&
-                  !shut.probe.mutations && shut.channel.Commands().attempts == 1 &&
+        Check(shut.Result(shut.Send(shut.Command(intent, intent, params)), intent) == "rejected" &&
+                  shut.probe.calls == 1 && !shut.probe.mutations && shut.channel.Commands().attempts == 1 &&
                   shut.channel.Commands().refused == 1,
               "a closed executor refuses a one-shot without an effect");
         Check(shut.Result(shut.Send(shut.Attack("lane")), "lane") == "rejected" && shut.probe.calls == 1,
