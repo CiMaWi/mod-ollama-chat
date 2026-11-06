@@ -6,6 +6,7 @@
 #include <variant>
 
 #include "mod-ollama-chat_bridge.h"
+#include "mod-ollama-chat_bridge_intent.h"
 
 namespace OllamaBridge
 {
@@ -47,41 +48,6 @@ struct ChannelEnvelope
     int64_t deadlineUnixMs = 0;
 };
 
-enum class ChannelIntent : uint8_t
-{
-    Follow,
-    Stay,
-    Flee,
-    Regroup,
-    AttackOwnTarget,
-    Pull,
-    Mark,
-    FocusHealing,
-    AssignRole,
-    SaveMana,
-    Formation,
-    Position,
-    DungeonClear
-};
-
-enum class ChannelRole : uint8_t
-{
-    Tank,
-    Healer,
-    Damage
-};
-enum class ChannelShape : uint8_t
-{
-    Close,
-    Spread,
-    Line
-};
-enum class ChannelMode : uint8_t
-{
-    On,
-    Off,
-    Pause
-};
 enum class ChannelFailure : uint8_t
 {
     Unavailable,
@@ -94,34 +60,6 @@ enum class ChannelOutcome : uint8_t
     Applied,
     Rejected,
     Failed
-};
-
-struct ChannelTarget
-{
-    uint64_t guid = 0;
-};
-struct ChannelMark
-{
-    uint64_t guid = 0;
-    uint8_t icon = 0;
-};
-struct ChannelPosition
-{
-    double x = 0;
-    double y = 0;
-    double z = 0;
-    uint32_t mapId = 0;
-};
-using ChannelParams = std::variant<std::monostate, ChannelTarget, ChannelMark, ChannelRole, bool, ChannelShape,
-                                   ChannelPosition, ChannelMode>;
-
-struct ChannelCommand
-{
-    std::string commandId;
-    uint64_t issuerGuid = 0;
-    uint64_t botGuid = 0;
-    ChannelIntent intent = ChannelIntent::Stay;
-    ChannelParams params;
 };
 
 struct ChannelQuery

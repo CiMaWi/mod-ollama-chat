@@ -1,13 +1,13 @@
 #include "mod-ollama-chat_bridge_channel.h"
 
 #include <algorithm>
-#include <cmath>
 #include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#include <utility>
 
 namespace OllamaBridge
 {
@@ -105,13 +105,24 @@ ChannelCommand Command(Json const& body)
         throw std::runtime_error("invalid");
     auto const intent = String(body.at("intent"));
     auto const& params = body.at("params");
-    char const* names[] = {"follow",    "stay",     "flee",          "regroup",     "attack_own_target",
-                           "pull",      "mark",     "focus_healing", "assign_role", "save_mana",
-                           "formation", "position", "dungeon_clear"};
-    auto const found = std::find(std::begin(names), std::end(names), intent);
-    if (found == std::end(names))
+    constexpr std::pair<char const*, ChannelIntent> intents[] = {{"follow", ChannelIntent::Follow},
+                                                                 {"stay", ChannelIntent::Stay},
+                                                                 {"flee", ChannelIntent::Flee},
+                                                                 {"regroup", ChannelIntent::Regroup},
+                                                                 {"attack_own_target", ChannelIntent::AttackOwnTarget},
+                                                                 {"pull", ChannelIntent::Pull},
+                                                                 {"mark", ChannelIntent::Mark},
+                                                                 {"focus_healing", ChannelIntent::FocusHealing},
+                                                                 {"assign_role", ChannelIntent::AssignRole},
+                                                                 {"save_mana", ChannelIntent::SaveMana},
+                                                                 {"formation", ChannelIntent::Formation},
+                                                                 {"position", ChannelIntent::Position},
+                                                                 {"dungeon_clear", ChannelIntent::DungeonClear}};
+    auto const found =
+        std::find_if(std::begin(intents), std::end(intents), [&](auto const& entry) { return intent == entry.first; });
+    if (found == std::end(intents))
         throw std::runtime_error("invalid");
-    command.intent = static_cast<ChannelIntent>(found - std::begin(names));
+    command.intent = found->second;
     switch (command.intent)
     {
         case ChannelIntent::Follow:
@@ -171,8 +182,6 @@ ChannelCommand Command(Json const& body)
             ChannelPosition position{params.at("x").get<double>(), params.at("y").get<double>(),
                                      params.at("z").get<double>(),
                                      static_cast<uint32_t>(Integer(params.at("mapId"), UINT32_MAX))};
-            if (!std::isfinite(position.x) || !std::isfinite(position.y) || !std::isfinite(position.z))
-                throw std::runtime_error("invalid");
             command.params = position;
             break;
         }
@@ -187,6 +196,8 @@ ChannelCommand Command(Json const& body)
             break;
         }
     }
+    if (!ValidIntentParams(command.intent, command.params))
+        throw std::runtime_error("invalid");
     return command;
 }
 
