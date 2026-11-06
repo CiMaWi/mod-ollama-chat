@@ -17,10 +17,18 @@ Deadline ChannelDeadline(Deadline captured, Clock now)
     captured.steadyMs = now.steadyMs + RemainingMs(captured, now);
     return captured;
 }
+
+// The registered route's envelope; Receive admits only messages whose envelope equals it.
+ChannelEnvelope RouteEnvelope(WorldTicket const& ticket)
+{
+    return {ticket.scope.instance, ticket.scope.provider, ticket.scope.epoch, ticket.request.requestId,
+            ticket.request.deadline.unixMs};
+}
 }  // namespace
 
-WorldChannel::WorldChannel(WorldPolicy& world, Observer observer, ReadClock clock, QueryWorldSource* source)
-    : _world(world), _source(source), _observer(std::move(observer)), _clock(std::move(clock))
+WorldChannel::WorldChannel(WorldPolicy& world, Observer observer, ReadClock clock, QueryWorldSource* source,
+                           CommandExecutor* executor)
+    : _world(world), _source(source), _executor(executor), _observer(std::move(observer)), _clock(std::move(clock))
 {
 }
 
@@ -115,9 +123,7 @@ bool WorldChannel::RegisterEvents(WorldTicket const& ticket, DispatchGuard const
         Expired(packet->_until, _clock()))
     {
         std::string ignored;
-        _policy.FinishFailure({ticket.scope.instance, ticket.scope.provider, ticket.scope.epoch,
-                               ticket.request.requestId, ticket.request.deadline.unixMs},
-                              ChannelFailure::Cancelled, ticket.scope, _clock(), ignored);
+        _policy.FinishFailure(RouteEnvelope(ticket), ChannelFailure::Cancelled, ticket.scope, _clock(), ignored);
         return false;
     }
     _bindings.emplace(ticket.request.requestId, std::move(binding));
@@ -161,9 +167,7 @@ void WorldChannel::Close(WorldTicket const& ticket)
     if (it == _bindings.end())
         return;
     std::string body;
-    ChannelEnvelope const envelope{ticket.scope.instance, ticket.scope.provider, ticket.scope.epoch,
-                                   ticket.request.requestId, ticket.request.deadline.unixMs};
-    _policy.FinishFailure(envelope, ChannelFailure::Cancelled, ticket.scope, _clock(), body);
+    _policy.FinishFailure(RouteEnvelope(ticket), ChannelFailure::Cancelled, ticket.scope, _clock(), body);
     _bindings.erase(it);
     std::lock_guard<std::mutex> lock(_mutex);
     std::erase_if(_receive, [&](auto const& packet) { return packet->_route == ticket.request.requestId; });
@@ -225,7 +229,58 @@ ChannelError WorldChannel::Take(std::string_view bearer, uint64_t receipt, std::
     return ChannelError::None;
 }
 
-std::size_t WorldChannel::Update()
+ChannelError WorldChannel::Finish(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
+                                  WorldScope const& scope, Clock now, std::string& body)
+{
+    ++(outcome == ChannelOutcome::Applied  ? _stats.applied
+       : outcome == ChannelOutcome::Failed ? _stats.failed
+                                           : _stats.refused);
+    return _policy.FinishCommand(envelope, commandId, outcome, scope, now, body);
+}
+
+ChannelError WorldChannel::Command(Binding const& binding, ChannelEnvelope const& envelope,
+                                   ChannelCommand const& command, EffectPhase const* phase, Deadline until,
+                                   bool& attempted, std::string& body)
+{
+    // Receive already consumed this command id in the replay ledger; no path below can run it twice.
+    attempted = false;
+    ++_stats.proposed;
+    // DS.3 fixed refusal before any game read: unsupported verb, no executor or world phase, or rate denial.
+    if (!EffectSupported(command.intent) || !_executor || !phase ||
+        !_rate.Admit(binding.ticket.scope.botGuid, _clock()))
+        return Finish(envelope, command.commandId, ChannelOutcome::Rejected, binding.ticket.scope, _clock(), body);
+    Binding const bound = binding;  // Executor game code must not depend on map storage it could disturb.
+    bool asked = false;
+    std::optional<Clock> authorized;
+    std::function<bool()> const authorize = [&]() -> bool
+    {
+        if (std::exchange(asked, true))
+            return false;  // One authorization per command.
+        auto const now = _clock();
+        if (!_enabled || !(_selected == _world.Selected()) || Expired(until, now) ||
+            !_bindings.contains(bound.ticket.request.requestId) || !_world.Current(bound.ticket, now) ||
+            !_policy.Current(envelope, bound.ticket.scope, now) || !Fresh(bound, now))
+            return false;
+        authorized = now;
+        return true;
+    };
+    ++_stats.attempts;
+    auto const result = _executor->Execute(*phase, bound.ticket, bound.guard, command, authorize);
+    attempted = authorized && (result == EffectResult::Applied || result == EffectResult::Failed);
+    // The outcome is recorded once at its authorization time; receipt exposure is joined separately afterwards.
+    return Finish(envelope, command.commandId, EffectOutcome(result, authorized.has_value()), bound.ticket.scope,
+                  authorized.value_or(_clock()), body);
+}
+
+bool WorldChannel::ReceiptCurrent(WorldTicket const& ticket, Clock now) const
+{
+    // An attempted effect may change facts Fresh checks (target, combat, marks). Its receipt needs only the
+    // selected epoch, the current ticket and channel scope and an unexpired deadline; a stale one is withheld.
+    return _enabled && _selected == _world.Selected() && _world.Current(ticket, now) &&
+           _policy.Current(RouteEnvelope(ticket), ticket.scope, now, false);
+}
+
+std::size_t WorldChannel::Update(EffectPhase const* phase)
 {
     if (!_enabled || !Activate())
         return 0;
@@ -247,15 +302,19 @@ std::size_t WorldChannel::Update()
         auto const it = _bindings.find(packet->_route);
         if (it == _bindings.end() || Expired(packet->_until, _clock()) || !Fresh(it->second, _clock()))
             continue;  // Actual payload disposal, not merely a logical cancellation.
-        auto const& binding = it->second;
         bool eventTerminal = false;
+        bool command = false;    // A command outcome was decided for this packet.
+        bool attempted = false;  // An authorized effect attempt; its receipt uses the post-effect join.
         std::optional<QueryObservation> observed;
         {
+            auto const& binding = it->second;
             ChannelMessage message;
             auto const settings = _world.Snapshot();
             packet->error =
                 _policy.Receive(settings.token, packet->body, binding.ticket.scope, _clock(), message, packet->_route);
             packet->body.clear();
+            if (packet->error == ChannelError::Duplicate)
+                ++_stats.duplicates;
             if (packet->error == ChannelError::None && Fresh(binding, _clock()))
             {
                 if (std::holds_alternative<ChannelQuery>(message.payload))
@@ -272,10 +331,12 @@ std::size_t WorldChannel::Update()
                         packet->error = _policy.FinishFailure(message.envelope, ChannelFailure::Unavailable,
                                                               binding.ticket.scope, _clock(), packet->body);
                 }
-                else if (auto const* command = std::get_if<ChannelCommand>(&message.payload))
+                else if (auto const* staged = std::get_if<ChannelCommand>(&message.payload))
+                {
+                    command = true;
                     packet->error =
-                        _policy.FinishCommand(message.envelope, command->commandId, ChannelOutcome::Rejected,
-                                              binding.ticket.scope, _clock(), packet->body);
+                        Command(binding, message.envelope, *staged, phase, packet->_until, attempted, packet->body);
+                }
                 else
                 {
                     eventTerminal = binding.events;
@@ -286,9 +347,21 @@ std::size_t WorldChannel::Update()
                 packet->_until.steadyMs = std::min(packet->_until.steadyMs, until.steadyMs);
             }
         }  // Dispose parsed payload/settings BEFORE publishing the physical slot to another thread.
-        // J6 execution remains closed. Query observations are checked again after serialization below.
-        if (!Fresh(binding, _clock()))
+        // An executor ran game code: resolve the route again instead of trusting the earlier map reference.
+        auto const route = _bindings.find(packet->_route);
+        auto const exposable = [&]
+        {
+            return route != _bindings.end() &&
+                   (attempted ? ReceiptCurrent(route->second.ticket, _clock()) : Fresh(route->second, _clock()));
+        };
+        // Query observations are checked again after serialization below.
+        if (!exposable())
+        {
+            if (command)
+                ++_stats.withheld;
             continue;
+        }
+        auto const& binding = route->second;
         if (eventTerminal)
         {
             auto const ticket = binding.ticket;
@@ -299,10 +372,12 @@ std::size_t WorldChannel::Update()
         packet->_until.unixMs = std::min(packet->_until.unixMs, binding.ticket.request.deadline.unixMs);
         packet->_until.steadyMs = std::min(packet->_until.steadyMs, binding.ticket.request.deadline.steadyMs);
         std::lock_guard<std::mutex> lock(_mutex);
-        if (packet->_serial == _serial && !Expired(packet->_until, _clock()) && Fresh(binding, _clock()) &&
+        if (packet->_serial == _serial && !Expired(packet->_until, _clock()) && exposable() &&
             (!observed || FilteredQueryAdapter(_world, *_source, _clock).Current(*observed)) &&
             !Expired(packet->_until, _clock()))
             _done.emplace(packet->receipt, std::move(packet));
+        else if (command)
+            ++_stats.withheld;
     }
     return processed;
 }

@@ -12,6 +12,7 @@
 
 #include "mod-ollama-chat_bridge.h"
 #include "mod-ollama-chat_bridge_channel.h"
+#include "mod-ollama-chat_bridge_effect.h"
 
 namespace OllamaBridge
 {
@@ -19,6 +20,7 @@ constexpr std::size_t MaxWorldPending = 64;
 constexpr std::size_t MaxWorldScopes = 64;
 constexpr uint64_t MaxEpochRequests = 4096;
 constexpr int64_t WorldLivenessMs = 5000;
+static_assert(CommandRate::MaxBots == MaxWorldScopes, "one rate entry per live world scope");
 
 struct WorldTicket
 {
@@ -287,8 +289,9 @@ public:
     using Observer = std::function<bool(WorldTicket const&, DispatchGuard&)>;
     static constexpr std::size_t MaxPackets = 64;
     static constexpr std::size_t TickBudget = 8;
+    // A null executor keeps every command on the fixed refusal.
     explicit WorldChannel(WorldPolicy& world, Observer observer, ReadClock clock = Now,
-                          QueryWorldSource* source = nullptr);
+                          QueryWorldSource* source = nullptr, CommandExecutor* executor = nullptr);
     void Configure(bool enabled);
     void Retire();
     bool Activate();
@@ -301,9 +304,12 @@ public:
     // Synchronous world capture; reserves a separate event route and never renews an observation.
     bool ObserveEvents(DispatchGuard const& guard, std::vector<uint8_t> const& icons, EventPublication& publication);
     void Close(WorldTicket const& ticket);
-    std::size_t Update();
+    // World tick. Typed effects run only with the post-map-join phase, which is used during this call only;
+    // without a phase every command gets the fixed refusal.
+    std::size_t Update(EffectPhase const* phase = nullptr);
     bool Drained() const { return _used->load() == 0; }
     std::size_t Used() const { return _used->load(); }
+    CommandStats const& Commands() const { return _stats; }
     ChannelError Receive(std::string_view bearer, std::string_view route, std::string_view body, uint64_t& receipt);
     ChannelError Take(std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet);
 
@@ -316,11 +322,20 @@ private:
     };
     bool Authenticated(std::string_view bearer) const;  // Caller holds _mutex.
     bool Fresh(Binding const& binding, Clock now) const;
+    // Finishes one admitted command exactly once; attempted reports an authorized effect attempt.
+    ChannelError Command(Binding const& binding, ChannelEnvelope const& envelope, ChannelCommand const& command,
+                         EffectPhase const* phase, Deadline until, bool& attempted, std::string& body);
+    ChannelError Finish(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
+                        WorldScope const& scope, Clock now, std::string& body);
+    bool ReceiptCurrent(WorldTicket const& ticket, Clock now) const;
     WorldPolicy& _world;
-    QueryWorldSource* const _source;  // WORLD ONLY; never copied into a packet or worker task.
-    Observer const _observer;         // Invoked only synchronously by the world owner, never by Receive/Take.
+    QueryWorldSource* const _source;   // WORLD ONLY; never copied into a packet or worker task.
+    CommandExecutor* const _executor;  // WORLD ONLY; invoked synchronously from Update with a world phase.
+    Observer const _observer;          // Invoked only synchronously by the world owner, never by Receive/Take.
     ReadClock const _clock;
     ChannelPolicy _policy;
+    CommandRate _rate;  // Survives Retire: a new epoch never reopens a bot's command interval.
+    CommandStats _stats;
     bool _enabled = false;
     Identity _selected;
     std::unordered_map<std::string, Binding> _bindings;
