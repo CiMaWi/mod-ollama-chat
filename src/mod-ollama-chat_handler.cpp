@@ -5,6 +5,7 @@
 #include "Channel.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "BridgeLiteralRoute.h"
 #include "Config.h"
 #include "Common.h"
 #include "Guild.h"
@@ -1516,6 +1517,22 @@ void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::str
 }
 // END BRIDGE WORLD ADAPTER
 
+// A line playerbots executes through its own chat hook (or may: Uncertain) gets no bridge request. Say and yell
+// have no playerbots command hook. Pure text and shared-table check, independent of which hook runs first.
+static bool BridgeLiteralCommand(Player* bot, ChatChannelSourceLocal source, std::string const& text)
+{
+    uint32_t type = 0;
+    if (source == SRC_WHISPER_LOCAL)
+        type = CHAT_MSG_WHISPER;
+    else if (source == SRC_PARTY_LOCAL)
+        type = CHAT_MSG_PARTY;
+    else
+        return false;
+
+    return PlayerbotBridge::ClassifyBotLiteral(PlayerbotsMgr::instance().GetPlayerbotAI(bot), type, text) !=
+           PlayerbotBridge::LiteralClass::NotLiteral;
+}
+
 void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32_t lang, std::string& msg, ChatChannelSourceLocal sourceLocal, Channel* channel, Player* receiver, uint8_t chainDepth)
 {
     if (player == nullptr) {
@@ -2151,6 +2168,14 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     {
         if (!bot)
             continue;
+
+        // Before the governor, so a playerbots command line spends no budget and sends no request.
+        if (bridgeProvider && BridgeLiteralCommand(bot, sourceLocal, msg))
+        {
+            if (g_DebugEnabled)
+                LOG_INFO("module.ollamachat", "[Ollama Chat] Bot {} skipped: playerbots command line.", bot->GetName());
+            continue;
+        }
 
         // Everything below runs on the world thread: prompt building reads
         // live world state, and the governor decides before we spend an LLM
