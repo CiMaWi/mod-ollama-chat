@@ -530,6 +530,77 @@ void FixedRefusals()
           "a phase-less refusal spends no rate interval");
 }
 
+// The J6 action matrix: each of the 13 wire verbs ends as exactly one of a delivered effect (one executor call, one
+// authorized mutation, an applied receipt, the bot's rate interval spent) or its fixed refusal (a rejected receipt, no
+// executor call, nothing attempted, no rate interval spent). A fresh channel per verb keeps the rows independent.
+void VerbMatrix()
+{
+    struct Row
+    {
+        char const* intent;
+        Json params;
+        bool delivered;
+    };
+    Json const spot{{"x", 1.5}, {"y", -2.25}, {"z", 3.0}, {"mapId", 1}};
+    Row const rows[] = {{"attack_own_target", Json::object(), true},
+                        {"mark", Json{{"targetGuid", "44"}, {"icon", 3}}, true},
+                        {"follow", Json::object(), true},
+                        {"stay", Json::object(), true},
+                        {"flee", Json::object(), true},
+                        {"position", spot, true},
+                        {"pull", Json{{"targetGuid", "44"}}, false},
+                        {"regroup", Json::object(), false},
+                        {"formation", Json{{"shape", "close"}}, false},
+                        {"save_mana", Json{{"enabled", true}}, false},
+                        {"focus_healing", Json{{"targetGuid", "22"}}, false},
+                        {"assign_role", Json{{"role", "tank"}}, false},
+                        {"dungeon_clear", Json{{"mode", "on"}}, false}};
+    Check(std::size(rows) == static_cast<size_t>(ChannelIntent::DungeonClear) + 1, "the matrix names every wire verb");
+    unsigned delivered = 0;
+    unsigned refusals = 0;
+    for (auto const& row : rows)
+    {
+        Fixture f;
+        f.probe.facts.pathableNearbyPosition = ChannelPosition{1.5, -2.25, 3.0, 1};
+        Check(f.Result(f.Send(f.Command("matrix", row.intent, row.params)), "matrix") ==
+                  (row.delivered ? "applied" : "rejected"),
+              "matrix receipt");
+        auto const& stats = f.channel.Commands();
+        if (row.delivered)
+        {
+            ++delivered;
+            Check(f.probe.calls == 1 && f.probe.grants == 1 && f.probe.mutations == 1 && stats.attempts == 1 &&
+                      stats.applied == 1 && !stats.refused,
+                  "a delivered verb reaches the executor once with one authorized mutation");
+            Check(f.Result(f.Send(f.Attack("after-delivered")), "after-delivered") == "rejected" && f.probe.calls == 1,
+                  "a delivered verb spends the bot's rate interval");
+        }
+        else
+        {
+            ++refusals;
+            Check(f.probe.calls == 0 && f.probe.grants == 0 && f.probe.mutations == 0 && !stats.attempts &&
+                      stats.refused == 1 && !stats.applied && !stats.failed,
+                  "a fixed refusal never reaches the executor and is not an attempt");
+            Check(f.Result(f.Send(f.Attack("after-refusal")), "after-refusal") == "applied" && f.probe.calls == 1,
+                  "a fixed refusal spends no rate interval");
+        }
+    }
+    Check(delivered == 6 && refusals == 7, "six delivered verbs and seven fixed refusals");
+    // Standing follow and stay (a duration or a standing flag) have no wire shape: the exact parameter check refuses
+    // the packet as invalid input before any command exists, so nothing is admitted, attempted or executed.
+    for (char const* intent : {"follow", "stay"})
+        for (Json const& extra : {Json{{"standing", true}}, Json{{"durationMs", 30000}}})
+        {
+            Fixture f;
+            Check(f.Result(f.Send(f.Command("standing", intent, extra)), "standing") == "invalid_input",
+                  "a standing follow or stay has no typed shape");
+            Check(f.probe.calls == 0 && !f.channel.Commands().proposed && !f.channel.Commands().attempts,
+                  "a standing verb never reaches the executor");
+            Check(f.Result(f.Send(f.Attack("after-standing")), "after-standing") == "applied",
+                  "a refused standing verb spends no rate interval");
+        }
+}
+
 void TerminalAndIds()
 {
     Fixture f;
@@ -821,6 +892,7 @@ int main()
         TypedVerbs();
         OutcomesNeverReplay();
         FixedRefusals();
+        VerbMatrix();
         TerminalAndIds();
         RetirementBeforeTick();
         QueueAndRate();

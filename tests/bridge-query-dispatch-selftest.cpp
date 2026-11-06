@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include "mod-ollama-chat_bridge_query.h"
+#include "mod-ollama-chat_persona_db.h"
 
 using namespace OllamaBridge;
 using Json = nlohmann::json;
@@ -32,6 +33,7 @@ struct ObjectGuid
     uint64_t value = 0;
     explicit ObjectGuid(uint64_t id = 0) : value(id) {}
     uint64_t GetRawValue() const { return value; }
+    uint32_t GetCounter() const { return static_cast<uint32_t>(value); }
     bool operator==(ObjectGuid const&) const = default;
 };
 struct Group;
@@ -139,9 +141,36 @@ float g_YellDistance = 100;
 bool OllamaIsRealPlayer(Player* player) { return player && player->human; }
 std::string Roleplay_BuildVoicePrompt(Player*) { return "A quiet traveler."; }
 
+// The extracted capture reads the persona card through the production store (compiled in, gate closed: voice only)
+// and the acquaintance table; this fixture has neither enabled, so a card is never offered.
+struct Acquaintance
+{
+};
+struct AcquaintanceMgr
+{
+    static AcquaintanceMgr& Instance()
+    {
+        static AcquaintanceMgr manager;
+        return manager;
+    }
+    bool IsLoaded() const { return false; }
+    Acquaintance const* Find(uint32_t, uint32_t) const { return nullptr; }
+};
+struct PlayerbotAIConfig
+{
+    bool AcquaintanceEnable = false;
+} playerbotConfig;
+#define sPlayerbotAIConfig playerbotConfig
+
 Clock clockNow;
 WorldPolicy g_bridgeWorld;
 }  // namespace
+
+namespace OllamaPersona
+{
+void ForgetPersona(uint64_t) {}
+void RetirePersonas(uint64_t) {}
+}  // namespace OllamaPersona
 
 QueryWorldSource& OllamaChat_BridgeQuerySource();
 bool OllamaChat_BridgeObserve(WorldTicket const&, DispatchGuard&);
@@ -176,6 +205,12 @@ auto g_bridgeObserver = ::OllamaChat_BridgeObserve;
 
 #include "dispatch-channel.inc"
 #include "handler-query.inc"
+
+namespace
+{
+// BridgeSubmit, which this fixture does not extract, is the only caller of the extracted card opportunity.
+[[maybe_unused]] auto const g_cardOpportunityUse = &BridgeCardOpportunity;
+}  // namespace
 
 namespace
 {

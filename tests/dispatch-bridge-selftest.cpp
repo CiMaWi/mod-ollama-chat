@@ -2,6 +2,7 @@
 // Handler adapter is extracted verbatim too; game objects/route/governor/cleanup/API are controlled stand-ins.
 // No full handler/dispatch TU or live-game proof.
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -13,7 +14,9 @@
 #include <thread>
 #include <vector>
 
+#include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
+#include "mod-ollama-chat_persona_db.h"
 
 enum class OllamaProvider
 {
@@ -36,6 +39,40 @@ enum ChatChannelSourceLocal
 using OllamaBridgeObserver = bool (*)(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&);
 #define LOG_INFO(...) ((void)0)
 #define LOG_ERROR(...) ((void)0)
+
+OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource();
+// The production channel names the world-only typed effect adapter, which needs game headers. This fixture stands in
+// with the closed release gate: every command is refused without a game read.
+OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
+{
+    struct Closed final : OllamaBridge::CommandExecutor
+    {
+        OllamaBridge::EffectResult Execute(OllamaBridge::EffectPhase const&, OllamaBridge::WorldTicket const&,
+                                           OllamaBridge::DispatchGuard const&, OllamaBridge::ChannelCommand const&,
+                                           std::function<bool()> const&) override
+        {
+            return OllamaBridge::EffectResult::Rejected;
+        }
+    };
+    static Closed executor;
+    return executor;
+}
+OllamaPersona::ProposalStatus OllamaChat_BridgeProposeCard(OllamaBridge::WorldTicket const&, uint64_t, uint64_t,
+                                                           std::string);
+
+// Seams the bridge translation units name but this lifecycle check never reaches: the observer transport, the persona
+// store lifecycle (gate closed here) and the events route of the production channel glue.
+OllamaHttpResult OllamaHttp_PostObserver(OllamaBridge::Settings const&, OllamaObserverOperation, std::string const&,
+                                         int64_t)
+{
+    return {};
+}
+namespace OllamaPersona
+{
+void ForgetPersona(uint64_t) {}
+void RetirePersonas(uint64_t) {}
+}  // namespace OllamaPersona
+bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const&, std::vector<uint8_t> const&) { return false; }
 
 #include "dispatch-types.inc"
 
@@ -127,35 +164,45 @@ struct ObjectGuid
     uint64_t value;
     explicit ObjectGuid(uint64_t guid) : value(guid) {}
     uint64_t GetRawValue() const { return value; }
+    uint32_t GetCounter() const { return static_cast<uint32_t>(value); }
     bool operator==(ObjectGuid const&) const = default;
 };
 struct Group;
-struct Player
+struct Player;
+struct Unit
 {
+    virtual ~Unit() = default;
     uint64_t guid = 11;
-    bool online = true;
     bool inWorld = true;
-    bool human = false;
     bool visible = true;
     uint32_t map = 1;
     uint32_t instance = 1;
     uint32_t phase = 1;
-    uint32_t team = 0;
     float distance = 0;
+    float health = 75;
     std::string name = "Bot";
-    Group* group = nullptr;
     bool IsInWorld() const { return inWorld; }
     ObjectGuid GetGUID() const { return ObjectGuid(guid); }
-    Group* GetGroup() const { return group; }
-    uint32_t GetTeamId() const { return team; }
     uint32_t GetMapId() const { return map; }
     uint32_t GetInstanceId() const { return instance; }
     uint32_t GetPhaseMask() const { return phase; }
     std::string GetName() const { return name; }
-    bool IsInMap(Player* p) const { return inWorld && p->inWorld && map == p->map && instance == p->instance; }
-    bool InSamePhase(Player* p) const { return (phase & p->phase) != 0; }
-    bool IsWithinDistInMap(Player* p, float d) const { return IsInMap(p) && InSamePhase(p) && p->distance <= d; }
-    bool CanSeeOrDetect(Player* p, bool ignoreStealth, bool) const { return ignoreStealth || (visible && p->visible); }
+    float GetHealthPct() const { return health; }
+    virtual Player* ToPlayer() { return nullptr; }
+    bool IsInMap(Unit* p) const { return inWorld && p->inWorld && map == p->map && instance == p->instance; }
+    bool InSamePhase(Unit* p) const { return (phase & p->phase) != 0; }
+    bool IsWithinDistInMap(Unit* p, float d) const { return IsInMap(p) && InSamePhase(p) && p->distance <= d; }
+    bool CanSeeOrDetect(Unit* p, bool ignoreStealth, bool) const { return ignoreStealth || (visible && p->visible); }
+};
+struct Player : Unit
+{
+    bool online = true;
+    bool human = false;
+    uint32_t team = 0;
+    Group* group = nullptr;
+    Group* GetGroup() const { return group; }
+    uint32_t GetTeamId() const { return team; }
+    Player* ToPlayer() override { return this; }
 };
 struct Group
 {
@@ -171,6 +218,8 @@ struct Group
     auto const& GetMemberSlots() const { return members; }
     ObjectGuid GetGUID() const { return ObjectGuid(guid); }
     ObjectGuid GetLeaderGUID() const { return ObjectGuid(leader); }
+    std::array<uint64_t, 8> marks{};
+    ObjectGuid GetTargetIcon(uint8_t icon) const { return ObjectGuid(marks.at(icon)); }
     bool IsMember(ObjectGuid id) const
     {
         return std::any_of(members.begin(), members.end(), [&](Slot const& slot) { return slot.guid == id; });
@@ -208,6 +257,7 @@ struct ObjectAccessor
         static Player player;
         return &player;
     }
+    static Unit* GetUnit(Unit const&, ObjectGuid guid) { return FindConnectedPlayer(guid); }
 };
 struct PlayerbotsMgr
 {
@@ -224,6 +274,26 @@ struct PlayerbotsMgr
         return &ai;
     }
 };
+// The extracted capture reads the persona card through the production store (compiled in, gate closed: voice only)
+// and the acquaintance table; this fixture has neither enabled, so a card is never offered.
+struct Acquaintance
+{
+};
+struct AcquaintanceMgr
+{
+    static AcquaintanceMgr& Instance()
+    {
+        static AcquaintanceMgr manager;
+        return manager;
+    }
+    bool IsLoaded() const { return false; }
+    Acquaintance const* Find(uint32_t, uint32_t) const { return nullptr; }
+};
+struct PlayerbotAIConfig
+{
+    bool AcquaintanceEnable = false;
+} playerbotConfig;
+#define sPlayerbotAIConfig playerbotConfig
 bool Governor_IsRepetitive(ObjectGuid, std::string const&, std::string const&) { return false; }
 bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool)
 {

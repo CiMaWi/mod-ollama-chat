@@ -468,13 +468,18 @@ std::array<unsigned char, N> GetRandomBytes()
     return bytes;
 }
 }  // namespace Acore::Crypto
+// The channel, its event queue and the enable flag the extracted lifecycle also drives. Queries and commands are not
+// part of this check, so the channel runs without a query source or executor (nothing is admitted).
+bool g_channelEnabled = false;
+std::deque<EventPublication> g_eventPublications;
+WorldChannel g_bridgeChannel(g_bridgeWorld, [](WorldTicket const&, DispatchGuard&) { return false; });
 #include "observer-adapter.inc"
 
 void Adapter()
 {
     g_nativeObserver.Start();
     g_bridgeInFlight = 1;
-    OllamaDispatch_BridgeConfigured();
+    OllamaDispatch_BridgeConfigured(false);
     UpdateNativeObserver();
     Check(g_nativeSelected && activated.epoch.empty() && adapterCalls == 0, "adapter waits for retired worker");
     g_bridgeInFlight = 0;
@@ -493,7 +498,7 @@ void Adapter()
     Check(g_bridgeGeneration != 0, "selected generation published after actual drain");
     config.bridge.observerToken = std::string(64, 'f');
     g_bridgeInFlight = 1;
-    OllamaDispatch_BridgeConfigured();
+    OllamaDispatch_BridgeConfigured(false);
     Check(activated.epoch.empty() && g_bridgeGeneration == 0, "actual configured helper token reload revokes");
     UpdateNativeObserver();
     Check(g_bridgeWorld.Selected().epoch.empty(), "actual helper waits for retiring worker");
@@ -506,15 +511,15 @@ void Adapter()
         });
     Check(first != activated.epoch, "world creates fresh suffix on reopen");
     config.provider = OllamaProvider::Ollama;
-    OllamaDispatch_BridgeConfigured();
+    OllamaDispatch_BridgeConfigured(false);
     Check(!g_nativeSelected && activated.epoch.empty() && !g_nativeObserver.State().enabled, "provider switch revokes");
     config.provider = OllamaProvider::Bridge;
     config.bridge.observerEnabled = false;
-    OllamaDispatch_BridgeConfigured();
+    OllamaDispatch_BridgeConfigured(false);
     Check(!g_nativeSelected && g_bridgeWorld.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures),
           "legacy selection unchanged");
     g_Enable = false;
-    OllamaDispatch_BridgeConfigured();
+    OllamaDispatch_BridgeConfigured(false);
     Check(!g_nativeSelected && g_bridgeWorld.Selected().epoch.empty(), "module disabled inactive");
     g_nativeObserver.Stop();
 }
