@@ -150,13 +150,14 @@ struct CardContext
     bool personal = false;
     uint64_t revision = 0;
     uint64_t stamp = 0;
+    bool included = false;  // The persona text ends with the accepted body; false when none or it did not fit.
 };
 
 constexpr std::string_view CardSeparator = "\n\n";
 
 // World only, cache only, no I/O. Personal means the acquainted controlling speaker outside party scope. Only then
 // is the accepted body appended to the voice, and only if both fit in MaxCardBytes: the voice keeps priority and
-// a card is never truncated.
+// a card is never truncated. An omitted card still reads Accepted, with included false.
 CardContext ReadCard(Store const& store, uint64_t generation, uint64_t botGuid, bool personal, std::string& persona);
 // Signature field of a capture, empty when Unready. Revision and stamp are canonical decimal.
 std::string CardToken(CardContext const& card);

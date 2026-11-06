@@ -2,6 +2,7 @@
 #define MOD_OLLAMA_CHAT_API_H
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 #include "mod-ollama-chat_bridge.h"
@@ -23,6 +24,7 @@ struct OllamaApiResult
     uint64_t    latencyMs = 0;
     bool        thinkUsed = false;
     int         retryAfterSeconds = 0;   // provider's Retry-After on 429/503, else 0
+    std::optional<std::string> personaProposal;  // bridge card proposal, never chat text
 
     bool empty() const { return text.empty(); }
 };

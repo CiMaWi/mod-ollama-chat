@@ -151,6 +151,8 @@ OllamaChat.Bridge.ChannelEnabled = 0
 #                  on a qualified encounter after 30 seconds. Uses existing voice when unavailable.
 #                  Storage opens at server startup: turning this on by reload leaves it
 #                  unavailable until the next restart.
+#                  Requires a bridge that accepts input.personaCard (J13C/X): the Claude
+#                  bridge currently rejects it, so eligible direct replies would fail.
 #     Default:     0 (false)
 OllamaChat.Bridge.PersonaCardsEnabled = 0
 

@@ -262,6 +262,7 @@ CardContext ReadCard(Store const& store, uint64_t generation, uint64_t botGuid, 
     {
         persona += CardSeparator;
         persona += accepted->body;
+        card.included = true;
     }
     return card;
 }

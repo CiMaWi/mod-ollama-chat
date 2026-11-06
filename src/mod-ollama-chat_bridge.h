@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -16,6 +17,8 @@ namespace OllamaBridge
 constexpr std::size_t MaxRequestBytes = 65536;
 constexpr std::size_t MaxResponseBytes = 32768;
 constexpr std::size_t MaxTextBytes = 4096;
+// Persona card proposal body; equal to OllamaPersona::MaxCardBytes (checked where both are visible).
+constexpr std::size_t MaxCardProposalBytes = 8192;
 constexpr int64_t MaxLifetimeMs = 120000;
 constexpr int64_t CircuitCooldownMs = 5000;
 
@@ -51,6 +54,16 @@ struct Participant
     uint64_t visibleTargetGuid = 0;
 };
 
+// Optional persona card opportunity, set on world only for the eligible pair of a ready card store. The bridge may
+// then return one proposal for exactly this revision. The stamp names the store snapshot and never goes on the wire.
+struct CardOpportunity
+{
+    bool offered = false;
+    uint64_t revision = 0;  // Canonical decimal on the wire; 0 means no row yet.
+    uint64_t stamp = 0;
+    bool accepted = false;  // Only when the persona text ends with the accepted card (not when it did not fit).
+};
+
 struct Context
 {
     uint64_t speakerGuid = 0;
@@ -65,6 +78,7 @@ struct Context
     bool speakerControlsBot = false;
     std::vector<std::string> observations;
     std::vector<Participant> party;
+    CardOpportunity card;  // Absent from the wire unless offered.
 };
 
 // Exact captured game binding; owned values only, never a grant supplied by the model.
@@ -113,6 +127,8 @@ struct Result
     std::string text;
     std::string error;  // Fixed reason only; never remote text, credentials or JSON exceptions.
     int status = 0;
+    // Validated card proposal body for the offered revision; never part of text. Staging it is a separate world step.
+    std::optional<std::string> personaProposal;
 };
 
 bool ValidIdentifier(std::string const& value);

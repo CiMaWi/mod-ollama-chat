@@ -23,7 +23,9 @@ bool ValidContext(Context const& input)
     if (!input.speakerGuid || input.channel.empty() || input.channel.size() > 128 || input.text.empty() ||
         input.text.size() > MaxTextBytes || input.systemPrompt.size() > 8192 || input.persona.size() > 8192 ||
         input.memory.size() > 8192 || input.groupScope.size() > 128 || input.observations.size() > 32 ||
-        input.party.size() > 40)
+        input.party.size() > 40 ||
+        (input.card.offered ? !input.card.stamp || (input.card.accepted && !input.card.revision)
+                            : input.card.revision || input.card.stamp || input.card.accepted))
         return false;
 
     for (auto const& observation : input.observations)
@@ -83,6 +85,12 @@ bool MatchesString(nlohmann::json const& body, char const* key, std::string cons
 {
     auto const it = body.find(key);
     return it != body.end() && it->is_string() && it->get_ref<std::string const&>() == expected;
+}
+
+bool Blank(std::string const& value)
+{
+    return std::all_of(value.begin(), value.end(),
+                       [](unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
 }
 }  // namespace
 
@@ -215,6 +223,9 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
                                      {"directAddress", input.directAddress},
                                      {"speakerControlsBot", input.speakerControlsBot},
                                      {"party", std::move(party)}}}};
+        if (input.card.offered)
+            envelope["input"]["personaCard"] = {{"revision", std::to_string(input.card.revision)},
+                                                {"accepted", input.card.accepted}};
         if (settings.provider == "codex" && settings.observerEnabled)
         {
             if (!ValidObserverSettings(settings) || !ValidScope(request.scope, settings, request.epoch) ||
@@ -365,12 +376,16 @@ Result Parse(Settings const& settings, Request const& request, std::string const
             return true;
         };
         auto const parsed = nlohmann::json::parse(body, callback);
-        if (!parsed.is_object() || parsed.size() != 8 || !parsed.contains("version") ||
+        // The one optional key: a card proposal, only in a generation result for a request that offered the card.
+        bool const proposal = parsed.is_object() && parsed.contains("personaProposal");
+        if (!parsed.is_object() || parsed.size() != (proposal ? 9u : 8u) || !parsed.contains("version") ||
             !parsed["version"].is_number_integer() || parsed["version"] != 1 ||
             !MatchesString(parsed, "instance", settings.instance) ||
             !MatchesString(parsed, "provider", settings.provider) || !MatchesString(parsed, "epoch", request.epoch) ||
             !MatchesString(parsed, "requestId", request.requestId) || !parsed.contains("deadlineUnixMs") ||
             !parsed["deadlineUnixMs"].is_number_integer() || parsed["deadlineUnixMs"] != request.deadline.unixMs)
+            return result;
+        if (proposal && (!request.input.card.offered || !MatchesString(parsed, "type", "generation.result")))
             return result;
 
         if (MatchesString(parsed, "type", "failure"))
@@ -384,11 +399,23 @@ Result Parse(Settings const& settings, Request const& request, std::string const
             !parsed["text"].is_string())
             return result;
         auto const& text = parsed["text"].get_ref<std::string const&>();
-        if (text.empty() || text.size() > MaxTextBytes ||
-            std::all_of(text.begin(), text.end(),
-                        [](unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }) ||
-            text.find('\0') != std::string::npos)
+        if (text.empty() || text.size() > MaxTextBytes || Blank(text) || text.find('\0') != std::string::npos)
             return result;
+        if (proposal)
+        {
+            // Exactly {revision, body}: the offered revision as canonical decimal and a bounded nonblank body. The
+            // parser has already refused ill-formed UTF-8.
+            auto const& card = parsed["personaProposal"];
+            if (!card.is_object() || card.size() != 2 ||
+                !MatchesString(card, "revision", std::to_string(request.input.card.revision)) ||
+                !card.contains("body") || !card["body"].is_string())
+                return result;
+            auto const& cardBody = card["body"].get_ref<std::string const&>();
+            if (cardBody.empty() || cardBody.size() > MaxCardProposalBytes || Blank(cardBody) ||
+                cardBody.find('\0') != std::string::npos)
+                return result;
+            result.personaProposal = cardBody;
+        }
         result.ok = true;
         result.text = text;
         result.error.clear();

@@ -87,7 +87,16 @@ enum class DispatchSource : uint8_t
     Say,
     Yell
 };
-}
+
+// Field names of the production CardOpportunity; the adapter sets them by name, so a rename fails here too.
+struct CardOpportunity
+{
+    bool offered = false;
+    uint64_t revision = 0;
+    uint64_t stamp = 0;
+    bool accepted = false;
+};
+}  // namespace OllamaBridge
 
 namespace
 {
@@ -163,8 +172,8 @@ int main()
     Check(store.Activate(1), "activate generation");
     view = Capture(&bot, &master, &master, From::Whisper);
     Check(view.card.status == CardStatus::Unready && view.card.personal && view.context.persona == Voice &&
-              CardToken(view.card).empty(),
-          "personal pair without an observation stays voice only");
+              CardToken(view.card).empty() && !BridgeCardOpportunity(view.card).offered,
+          "personal pair without an observation stays voice only, with no opportunity");
 
     Check(
         BridgeCardPersonal(&bot, &master, &master, From::Say) && BridgeCardPersonal(&bot, &master, &master, From::Yell),
@@ -186,6 +195,9 @@ int main()
 
     store.Prepare(1, BotGuid, {});
     Check(port.job && port.job->botGuid == BotGuid, "load request uses the full GUID");
+    view = Capture(&bot, &master, &master, From::Whisper);
+    Check(view.card.status == CardStatus::Loading && !BridgeCardOpportunity(view.card).offered,
+          "a loading card offers nothing");
     port.ready = StoreCompletion{BotGuid, port.job->id, LookupStatus::Found,
                                  State{BotGuid, 1, Card{Source::Manual, Body}, "", ""}};
     store.Pump({});
@@ -199,6 +211,21 @@ int main()
               bystander.card.status == CardStatus::Unready && bystander.context.persona == Voice &&
               CardToken(party.card).empty() && CardToken(bystander.card).empty(),
           "party scope and other speakers get no card text and no card token");
+    OllamaBridge::CardOpportunity offer = BridgeCardOpportunity(view.card);
+    Check(view.card.included && offer.offered && offer.revision == 1 && offer.stamp != 0 &&
+              offer.stamp == view.card.stamp && offer.accepted,
+          "an included accepted card is offered as accepted");
+    Check(!BridgeCardOpportunity(party.card).offered && !BridgeCardOpportunity(bystander.card).offered,
+          "party scope and other speakers get no opportunity");
+    BridgeView crowded;
+    crowded.guard.source = From::Whisper;
+    crowded.context.persona = std::string(MaxCardBytes - CardSeparator.size() - Body.size() + 1, 'v');
+    std::string const crowdedVoice = crowded.context.persona;
+    BridgeCard(&bot, &master, &master, crowded);
+    offer = BridgeCardOpportunity(crowded.card);
+    Check(crowded.card.status == CardStatus::Accepted && !crowded.card.included &&
+              crowded.context.persona == crowdedVoice && offer.offered && offer.revision == 1 && !offer.accepted,
+          "an accepted card left out as too long is offered as not accepted");
     world.generation = 2;
     view = Capture(&bot, &master, &master, From::Whisper);
     Check(view.card.status == CardStatus::Unready && view.context.persona == Voice,

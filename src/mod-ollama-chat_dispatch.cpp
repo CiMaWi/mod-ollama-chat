@@ -4,6 +4,7 @@
 #include "mod-ollama-chat_expression.h"
 #include "mod-ollama-chat_governor.h"
 #include "mod-ollama-chat_memory.h"
+#include "mod-ollama-chat_persona_bridge.h"
 #include "mod-ollama-chat_response.h"
 #include "mod-ollama-chat_roleplay.h"
 #include "mod-ollama-chat_sentiment.h"
@@ -34,6 +35,8 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+
+static_assert(OllamaBridge::MaxCardProposalBytes == OllamaPersona::MaxCardBytes);
 
 namespace
 {
@@ -69,6 +72,7 @@ namespace
         std::string       text;
         uint32_t          emoteId = 0;
         Clock::time_point deliverAt;
+        std::optional<std::string> personaProposal;  // Bridge card proposal; never chat text.
     };
 
     // --- shared state -----------------------------------------------------
@@ -156,6 +160,7 @@ void RunBridgeTask(Task& task)
         auto api = QueryOllamaBridge(completion.request.bridgeSettings, completion.request.bridgeTicket.request);
         completion.bridgeOutcome = BridgeOutcome(api);
         completion.text = std::move(api.text);
+        completion.personaProposal = std::move(api.personaProposal);
     }
     catch (...)
     {
@@ -463,16 +468,9 @@ bool PrepareBridge(Completion& c)
         }
     }
 
-    void DeliverBridge(Completion const& c, OllamaWorldSnapshot const& world)
+    // The chat line of a consumed bridge generation. Every exit returns to DeliverBridge, which holds the claim.
+    void DeliverBridgeLine(Completion const& c, OllamaWorldSnapshot const& world)
     {
-        if (!BridgeCurrent(c) || !g_bridgeWorld.Consume(c.request.bridgeTicket, OllamaBridge::Now()))
-            return;
-        // Keep policy authorization live through every effect, then dispose the one-shot claim on every exit.
-        struct TerminalRelease
-        {
-            OllamaBridge::WorldTicket const& ticket;
-            ~TerminalRelease() { g_bridgeWorld.Cancel(ticket); }
-        } release{c.request.bridgeTicket};
         Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(c.request.botGuid));
         if (!bot || !bot->IsInWorld())
             return;
@@ -497,6 +495,38 @@ bool PrepareBridge(Completion& c)
             OllamaChat_BridgeRemember(c.request.bridgeTicket, c.text);
         // Neither outage nor success enters legacy memory, history, expression, sentiment or bot-chain paths.
     }
+
+    // BEGIN BRIDGE CARD DELIVERY -- extracted verbatim by the offline persona bridge check.
+    // Stages the provider's card proposal of a successful generation that was offered one, against the revision and
+    // stamp the request was built from. The handler re-captures the binding; staging is not persistence.
+    void ProposeBridgeCard(Completion const& c)
+    {
+        auto const& card = c.request.bridgeTicket.request.input.card;
+        if (c.bridgeOutcome != OllamaBridge::WorldOutcome::Success || !c.personaProposal || !card.offered)
+            return;
+        auto const status =
+            OllamaChat_BridgeProposeCard(c.request.bridgeTicket, card.revision, card.stamp, *c.personaProposal);
+        if (g_DebugEnabled)
+            LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge card proposal for bot {}: status {}", c.request.botGuid,
+                     static_cast<int>(status));
+    }
+
+    void DeliverBridge(Completion const& c, OllamaWorldSnapshot const& world)
+    {
+        if (!BridgeCurrent(c) || !g_bridgeWorld.Consume(c.request.bridgeTicket, OllamaBridge::Now()))
+            return;
+        // Keep policy authorization live through every effect, then dispose the one-shot claim on every exit.
+        struct TerminalRelease
+        {
+            OllamaBridge::WorldTicket const& ticket;
+            ~TerminalRelease() { g_bridgeWorld.Cancel(ticket); }
+        } release{c.request.bridgeTicket};
+        DeliverBridgeLine(c, world);
+        // After the line, still under the claim: a staged write shows the card as loading, which would fail the
+        // line's later captures. A delivered or dropped line does not decide the proposal, nor the proposal the line.
+        ProposeBridgeCard(c);
+    }
+    // END BRIDGE CARD DELIVERY
 
     void Deliver(Completion const& c, OllamaWorldSnapshot const& world)
     {

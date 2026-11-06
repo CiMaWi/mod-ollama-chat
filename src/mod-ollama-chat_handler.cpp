@@ -1234,6 +1234,22 @@ void BridgeCard(Player* bot, Player* speaker, Player* controller, BridgeView& vi
         OllamaPersona::ReadCard(store, OllamaDispatch_BridgeWorld().Generation(), view.guard.scope.botGuid,
                                 BridgeCardPersonal(bot, speaker, controller, view.guard.source), view.context.persona);
 }
+
+// The generation's card opportunity: only a personal pair whose store is ready (Loading and Unready have no stamp).
+// Accepted only when the persona text really ends with the accepted card, never for one left out as too long.
+OllamaBridge::CardOpportunity BridgeCardOpportunity(OllamaPersona::CardContext const& card)
+{
+    OllamaBridge::CardOpportunity opportunity;
+    if (!card.personal ||
+        (card.status != OllamaPersona::CardStatus::Missing && card.status != OllamaPersona::CardStatus::DraftOnly &&
+         card.status != OllamaPersona::CardStatus::Accepted))
+        return opportunity;
+    opportunity.offered = true;
+    opportunity.revision = card.revision;
+    opportunity.stamp = card.stamp;
+    opportunity.accepted = card.status == OllamaPersona::CardStatus::Accepted && card.included;
+    return opportunity;
+}
 // END BRIDGE PERSONA CARD
 
 bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::DispatchSource source, BridgeView& view)
@@ -1480,6 +1496,8 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     }
     it->idleUntil = CaptureDeadline(now, MaxLifetimeMs);
     auto input = it->view.context;
+    // BridgeSame just proved the binding's card current. Without an opportunity the request stays as before.
+    input.card = BridgeCardOpportunity(it->view.card);
     input.text = text;
     input.directAddress = addressed;
     input.memory = it->memory;

@@ -447,11 +447,12 @@ void CheckCards()
     std::string const exact(MaxCardBytes - CardSeparator.size() - multibyte.size(), 'v');
     persona = exact;
     card = ReadCard(store, 1, OtherBot, true, persona);
-    Check(card.status == CardStatus::Accepted && persona.size() == MaxCardBytes && persona.ends_with(multibyte),
+    Check(card.status == CardStatus::Accepted && card.included && persona.size() == MaxCardBytes &&
+              persona.ends_with(multibyte),
           "voice and card fill the 8192-byte budget exactly");
     persona = exact + "v";
     card = ReadCard(store, 1, OtherBot, true, persona);
-    Check(card.status == CardStatus::Accepted && persona == exact + "v",
+    Check(card.status == CardStatus::Accepted && !card.included && persona == exact + "v",
           "voice keeps priority and a card that does not fit is omitted whole, never cut");
 }
 
