@@ -149,6 +149,8 @@ OllamaChat.Bridge.ChannelEnabled = 0
 #                  Stores up to 256 bot states in memory, with 16 pending operations and
 #                  up to 8 completions processed per world update. Failed lookups retry
 #                  on a qualified encounter after 30 seconds. Uses existing voice when unavailable.
+#                  Storage opens at server startup: turning this on by reload leaves it
+#                  unavailable until the next restart.
 #     Default:     0 (false)
 OllamaChat.Bridge.PersonaCardsEnabled = 0
 

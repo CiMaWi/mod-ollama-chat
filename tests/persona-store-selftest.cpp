@@ -3,7 +3,7 @@
 #include <iostream>
 #include <utility>
 
-#include "mod-ollama-chat_persona_store.h"
+#include "mod-ollama-chat_persona_db.h"
 
 namespace
 {
@@ -342,13 +342,215 @@ void CheckCapacity()
     LoadMissing(store, port, 2, Bot, Start + StoreRetryDelay);
     Check(store.Observe(2, Bot).state, "expired cooldown frees space for a new bot");
 }
+
+class FakePersonaDb final : public PersonaDbIo
+{
+public:
+    void Lookup(uint64_t botGuid, LookupCallback callback) override
+    {
+        Check(lookups.try_emplace(botGuid, std::move(callback)).second, "one issued query per bot");
+    }
+
+    void Commit(std::vector<StoreOperation> const& writes, CommitCallback callback) override
+    {
+        Check(!commit && !writes.empty(), "one nonempty transaction per proof round");
+        batch = writes;
+        commit = std::move(callback);
+    }
+
+    void Poll() override {}
+
+    void Close() override
+    {
+        closedWithCommit = static_cast<bool>(commit);
+        lookups.clear();
+        commit = {};
+    }
+
+    void Read(uint64_t botGuid, std::optional<PersonaDbRow> const& row)
+    {
+        auto issued = lookups.extract(botGuid);
+        Check(!issued.empty(), "reply to an issued query");
+        issued.mapped()(row);
+    }
+
+    void FinishCommit(bool committed)
+    {
+        Check(static_cast<bool>(commit), "reply to an issued transaction");
+        auto done = std::move(commit);
+        commit = {};
+        done(committed);
+    }
+
+    std::unordered_map<uint64_t, LookupCallback> lookups;
+    std::vector<StoreOperation> batch;
+    CommitCallback commit;
+    bool closedWithCommit = false;
+};
+
+PersonaDbRow MissingRow(uint64_t botGuid) { return {botGuid, {}, {}, {}, {}, {}, {}}; }
+
+PersonaDbRow ClaudeRow(uint64_t botGuid, uint64_t revision, std::string_view body)
+{
+    return {botGuid, botGuid, revision, uint8_t{0}, {}, body, {}};
+}
+
+void CheckPreparedDecode()
+{
+    auto decode = [](std::optional<PersonaDbRow> const& row) { return DecodePersonaLookup(Bot, 7, false, row); };
+    auto const missing = decode(MissingRow(Bot));
+    Check(missing.lookup == LookupStatus::Missing && !missing.row && missing.botGuid == Bot && missing.id == 7,
+          "matching seed with all joined fields NULL confirms absence");
+    Check(decode({}).lookup == LookupStatus::Failed, "null result cannot confirm absence");
+    Check(decode(MissingRow(OtherBot)).lookup == LookupStatus::Failed,
+          "a different full seed GUID cannot prove absence");
+    auto row = MissingRow(Bot);
+    row.acceptedSource = uint8_t{0};
+    Check(decode(row).lookup == LookupStatus::Failed, "partial nullable row is corrupt");
+
+    row = ClaudeRow(Bot, 0xF000000000000000, "Draft");
+    auto const found = decode(row);
+    Check(found.lookup == LookupStatus::Found && found.row && found.row->botGuid == Bot &&
+              found.row->revision == *row.revision && !found.row->accepted && found.row->claudeAlternative == "Draft" &&
+              found.row->codexAlternative.empty(),
+          "preserve full GUID, unsigned revision and absent accepted slot");
+    row.botGuid = OtherBot;
+    Check(decode(row).lookup == LookupStatus::Failed, "wrong joined GUID is corrupt");
+    row.botGuid = Bot;
+    row.revision = 0;
+    Check(decode(row).lookup == LookupStatus::Failed, "persisted revision zero cannot become absence");
+    row.revision = 1;
+    row.acceptedBody = "Manual";
+    Check(decode(row).lookup == LookupStatus::Failed, "body with absent source fails closed");
+    row.acceptedSource = uint8_t{9};
+    Check(decode(row).lookup == LookupStatus::Failed, "unknown provenance fails closed");
+    row.acceptedSource = uint8_t{1};
+    row.codexAlternative = "Codex";
+    auto const accepted = decode(row);
+    Check(accepted.row && accepted.row->accepted && accepted.row->accepted->source == Source::Manual &&
+              accepted.row->accepted->body == "Manual" && accepted.row->codexAlternative == "Codex",
+          "distinct accepted and draft slots decode independently");
+    row.claudeAlternative = "";
+    Check(decode(row).lookup == LookupStatus::Failed, "nonnull empty alternative is corrupt");
+    row.claudeAlternative = std::string_view("x\0y", 3);
+    Check(decode(row).lookup == LookupStatus::Failed, "embedded null is preserved for validation");
+    std::string const large(MaxCardBytes + 1, 'x');
+    row.claudeAlternative = large;
+    Check(decode(row).lookup == LookupStatus::Failed, "oversize result is rejected");
+}
+
+void CheckPreparedWrites()
+{
+    FakePersonaDb io;
+    PersonaDbPort port(io);
+    Store store;
+    Check(store.SetPort(&port), "attach prepared port");
+    store.Configure(true);
+    Check(store.Activate(1), "activate prepared store");
+    auto const ready = [&](uint64_t guid, PersonaDbRow const& row, StoreTime now)
+    {
+        store.Prepare(1, guid, now);
+        io.Read(guid, row);
+        store.Pump(now);
+    };
+    auto const propose = [&](uint64_t guid, uint64_t revision, std::string const& body)
+    {
+        Check(store.SubmitUpdate(1, store.Observe(1, guid).stamp, true,
+                                 {UpdateKind::ProposeAlternative, guid, revision, Source::Claude, body}),
+              "queue revision-bound proposal");
+    };
+    ready(Bot, MissingRow(Bot), Start);
+    ready(OtherBot, ClaudeRow(OtherBot, 7, "Old"), Start);
+    propose(Bot, 0, "New");
+    propose(OtherBot, 7, "Update");
+    Check(!io.commit && io.lookups.empty(), "staged writes do not issue before world pump");
+    port.Pump();
+    Check(io.batch.size() == 2 && io.batch[0].write->priorRevision == 0 && io.batch[0].write->next.revision == 1 &&
+              io.batch[1].write->priorRevision == 7 && io.batch[1].write->next.revision == 8,
+          "batch combines distinct insert and CAS update with exact prior revisions");
+    Check(io.lookups.empty(), "readback waits for the transaction callback");
+    io.FinishCommit(true);
+    Check(io.lookups.size() == 2, "successful commit issues independent fresh lookups");
+    io.Read(OtherBot, ClaudeRow(OtherBot, 7, "Old"));
+    store.Pump(Start);
+    Check(!store.Observe(1, OtherBot).state && store.Observe(1, Bot).status == StoreStatus::Loading,
+          "committed zero-row CAS is unavailable while its peer remains pinned");
+    io.Read(Bot, ClaudeRow(Bot, 1, "New"));
+    store.Pump(Start);
+    Check(store.Observe(1, Bot).status == StoreStatus::Loaded && !store.Pending(),
+          "exact persisted candidate publishes even if concurrent attribution is unknown");
+
+    auto const retry = Start + StoreRetryDelay;
+    ready(OtherBot, MissingRow(OtherBot), retry);
+    propose(OtherBot, 0, "Conflict");
+    propose(Bot, 1, "Rolled back");
+    port.Pump();
+    io.FinishCommit(false);
+    store.Pump(retry);
+    Check(io.lookups.empty() && !store.Pending() && !store.Observe(1, Bot).state && !store.Observe(1, OtherBot).state,
+          "failed insert can roll back whole batch, requiring ordinary reload of both rows");
+
+    auto const later = retry + StoreRetryDelay;
+    ready(Bot, ClaudeRow(Bot, 1, "New"), later);
+    ready(OtherBot, ClaudeRow(OtherBot, 10, "Actual"), later);
+    propose(Bot, 1, "Planned");
+    propose(OtherBot, 10, "Planned");
+    port.Pump();
+    io.FinishCommit(true);
+    io.Read(Bot, {});
+    io.Read(OtherBot, ClaudeRow(OtherBot, 12, "Newer"));
+    store.Pump(later);
+    Check(!store.Observe(1, Bot).state && !store.Observe(1, OtherBot).state,
+          "failed readback and newer persisted row cannot publish");
+}
+
+void CheckPreparedLifecycle()
+{
+    FakePersonaDb io;
+    PersonaDbPort port(io);
+    auto const stage = [&](uint64_t guid, uint64_t id)
+    { return port.TrySubmit({guid, id, StoreWrite{0, State{guid, 1, {}, "Draft", ""}}}); };
+    Check(stage(Bot, 1) && stage(OtherBot, 2), "stage two distinct bots");
+    port.DiscardStaged(Bot);
+    Check(!stage(Bot, 3), "discarded write still pins its key through disposal");
+    auto cancelled = port.TryPop();
+    Check(cancelled && cancelled->id == 1 && cancelled->lookup == LookupStatus::Failed,
+          "discarded write returns terminal failure");
+    port.Pump();
+    Check(io.batch.size() == 1 && io.batch[0].botGuid == OtherBot, "discard before enqueue preserves other staged bot");
+    port.DiscardStaged();
+    Check(!port.TryPop() && !stage(OtherBot, 4), "retirement cannot unpin an issued transaction");
+    Check(stage(Bot, 3), "another operation may stage after disposal");
+    port.Close();
+    Check(io.closedWithCommit, "shutdown joins issued transaction before terminal disposal");
+    Check(port.TryPop().has_value() && port.TryPop().has_value() && !port.TryPop() && !stage(Bot, 5),
+          "shutdown disposes each issued or unissued operation once and closes admission");
+
+    FakePersonaDb saturatedIo;
+    PersonaDbPort saturated(saturatedIo);
+    for (uint64_t i = 1; i <= MaxStoreOperations; ++i)
+        Check(saturated.TrySubmit({i, i, {}}), "bounded lookup accepted");
+    Check(!saturated.TrySubmit({Bot, Bot, {}}), "port stops at physical capacity");
+    saturatedIo.Read(1, MissingRow(1));
+    Check(!saturated.TrySubmit({Bot, Bot, {}}), "ready result continues to count against capacity");
+    Check(saturated.TryPop().has_value() && saturated.TrySubmit({Bot, Bot, {}}),
+          "terminal disposal releases the physical slot");
+}
 }  // namespace
 
-int main()
+int main(int argc, char** argv)
 {
-    CheckLoads();
-    CheckWrites();
-    CheckLifecycle();
-    CheckCapacity();
+    if (argc == 1)
+    {
+        CheckLoads();
+        CheckWrites();
+        CheckLifecycle();
+        CheckCapacity();
+    }
+    else if (argc != 2 || std::string_view(argv[1]) != "--prepared-db")
+        return 2;
+    CheckPreparedDecode();
+    CheckPreparedWrites();
+    CheckPreparedLifecycle();
     std::cout << "persona-store selftest: " << checks << " checks passed\n";
 }

@@ -497,6 +497,7 @@ class OllamaChatConfigWorldScript : public WorldScript
 public:
     OllamaChatConfigWorldScript();
     void OnStartup() override;
+    void OnUpdate(uint32 diff) override;
     void OnShutdown() override;
 };
 

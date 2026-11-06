@@ -9,7 +9,7 @@
 #include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_dispatch.h"
 #include "mod-ollama-chat_memory.h"
-#include "mod-ollama-chat_persona_store.h"
+#include "mod-ollama-chat_persona_db.h"
 #include "mod-ollama-chat_roleplay.h"
 #include "mod-ollama-chat_topics.h"
 #include "mod-ollama-chat-utilities.h"
@@ -940,6 +940,7 @@ void LoadOllamaChatConfig()
     // buffers under a worker mid-request.
     OllamaConfig_Publish();
     bool const personaCardsEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.PersonaCardsEnabled", false);
+    OllamaPersona::DiscardStagedPersonaWrites();
     OllamaPersona::WorldStore().Configure(g_Enable && personaCardsEnabled);
     // Explicit world-thread load/reload notification also retires work when the module is disabled.
     // The random-chatter update hook may return before dispatcher Update in that state.
@@ -1247,6 +1248,7 @@ OllamaChatConfigWorldScript::OllamaChatConfigWorldScript() : WorldScript("Ollama
 void OllamaChatConfigWorldScript::OnStartup()
 {
     LoadOllamaChatConfig();
+    OllamaPersona::StartPersonaDb();
     LoadBotPersonalityList();
     LoadBotConversationHistoryFromDB();
     InitializeSentimentTracking();
@@ -1286,11 +1288,14 @@ void OllamaChatConfigWorldScript::OnStartup()
     }
 }
 
+void OllamaChatConfigWorldScript::OnUpdate(uint32 /*diff*/) { OllamaPersona::PumpPersonaDb(); }
+
 void OllamaChatConfigWorldScript::OnShutdown()
 {
     // Stop accepting work and join the workers before anything they touch goes
     // away. Detached threads had no such guarantee.
     OllamaDispatch_Stop();
+    OllamaPersona::StopPersonaDb();
 
     SaveBotConversationHistoryToDB();
     Memory_SaveAll();
