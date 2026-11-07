@@ -913,6 +913,28 @@ void AdapterTests()
     DeliverBridge(done, {});
     Check(!routeCalls, "changed hearing invalidates delayed yell");
     done = {};
+    // J5e: a whisper reaches the bot from any distance and out of sight; say and party keep the hearing bound and
+    // name the drop.
+    AdapterFixture();
+    players[2].visible = false;
+    players[2].distance = 1000;
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, "From afar."), "J5e: an out-of-sight whisper is admitted");
+    done = Finish();
+    Check(PrepareBridge(done), "J5e: out-of-sight whisper prepared");
+    DeliverBridge(done, {});
+    Check(routeCalls == 1, "J5e: out-of-sight whisper reply delivered");
+    done = {};
+    OllamaChat_BridgeRefresh();
+    Check(!g_bridgeBindings.empty(), "J5e: the out-of-sight whisper binding survives a refresh");
+    for (auto const source : {DispatchSource::Say, DispatchSource::Party})
+    {
+        BridgeView view;
+        char const* why = nullptr;
+        Check(!BridgeCapture(players[0].guid, players[2].guid, source, view, &why) && why &&
+                  std::string(why) == "out_of_range",
+              "J5e: an out-of-sight say or party line is dropped as out_of_range");
+    }
+    Check(!AdapterSubmit(SRC_SAY_LOCAL) && !AdapterSubmit(), "J5e: out-of-sight say and party are refused");
     AdapterFixture();
     Check(AdapterSubmit(), "scope renewal fixture");
     done = Finish();
@@ -942,7 +964,7 @@ void AdapterTests()
         done = {};
         Check(!g_bridgeBindings[0].memory.empty(), "memory exists before invalidation");
         if (loss == 0)
-            players[2].visible = false;
+            players[2].inWorld = false;  // J5e: a whisper ignores distance and sight, not presence
         else if (loss == 1)
             g_bridgeBindings[0].heartbeat.unixMs = 1;
         else if (loss == 2)
@@ -957,7 +979,7 @@ void AdapterTests()
         }
         OllamaChat_BridgeRefresh();
         Check(g_bridgeBindings.empty(), "loss or reload erases actual stored memory");
-        players[2].visible = true;
+        players[2].inWorld = true;
         Check(AdapterSubmit(SRC_WHISPER_LOCAL), "fresh scope after memory invalidation");
         Check(g_queue.front().request.bridgeTicket.request.input.memory.empty(),
               "fresh scope cannot recover old memory");
@@ -1099,6 +1121,8 @@ void CardFixture()
         cardPort.Complete();
     AdapterFixture();
     playerbotConfig.AcquaintanceEnable = acquaintanceLoaded = true;
+    // J5e: a same-state Configure keeps loaded rows, so the fixture switches off first to start empty.
+    OllamaPersona::WorldStore().Configure(false);
     OllamaPersona::WorldStore().Configure(true);
     Check(OllamaPersona::WorldStore().SetPort(&cardPort), "card: store port attached");
 }

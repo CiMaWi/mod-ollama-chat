@@ -1118,13 +1118,14 @@ void OllamaDispatch_Update(uint32_t /*diff*/, PlayerbotBridge::PostMapJoin const
     // Typed effects and plan restores get the post-map-join phase for this call only.
     OllamaBridge::EffectPhase const phase(join);
     UpdateBridgeLifecycle(phase);
+    // J5e: the plan restores above run while disabled too, so their counters line stays visible.
+    LogBridgePlans(Clock::now());
     if (!g_Enable)
         return;  // Disabled: the plan restores above are the only work (OnUpdate calls this tick in that state too).
     // Bounded independent reverse lane; no HTTP, waits or generation-worker dependency.
     g_bridgeChannel.Update(&phase);
     const auto now = Clock::now();
     LogBridgeCommands(now);
-    LogBridgePlans(now);
 
     // Move due completions out under the lock, then deliver without it: the
     // delivery path re-enters ProcessBotChatMessage, which submits new work.

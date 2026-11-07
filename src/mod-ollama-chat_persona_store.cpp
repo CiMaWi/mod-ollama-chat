@@ -19,9 +19,11 @@ bool SameRow(State const& left, State const& right)
 
 void Store::Configure(bool enabled)
 {
+    // J5e: `.ollama reload` calls this every time; only an on/off change empties the rows.
+    if (_enabled != enabled)
+        InvalidateAll();
     _enabled = enabled;
     _generation = 0;
-    InvalidateAll();
 }
 
 bool Store::SetPort(StorePort* port)
@@ -43,7 +45,8 @@ bool Store::Activate(uint64_t generation)
         return true;
     if (generation <= _lastGeneration)
         return false;
-    InvalidateAll();
+    // J5e: loaded rows survive a new bridge generation (SQL stays the truth); every read and update still requires
+    // the current generation, so an older ticket is refused.
     _lastGeneration = generation;
     _generation = generation;
     return true;
@@ -54,7 +57,6 @@ void Store::Retire(uint64_t generation)
     if (!IsCurrent(generation))
         return;
     _generation = 0;
-    InvalidateAll();
 }
 
 void Store::Forget(uint64_t botGuid)

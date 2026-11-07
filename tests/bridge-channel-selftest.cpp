@@ -235,8 +235,7 @@ void Schemas()
         Check(f.Receive(bad) == ChannelError::Invalid, "strict exact envelope or payload field");
     }
     for (auto const& pair :
-         std::vector<std::pair<std::string, Json>>{{"stay", {{"targetGuid", "1"}}},
-                                                   {"pull", {{"targetGuid", "01"}}},
+         std::vector<std::pair<std::string, Json>>{{"pull", {{"targetGuid", "01"}}},
                                                    {"mark", {{"targetGuid", "1"}, {"icon", 8}}},
                                                    {"mark", {{"targetGuid", "1"}, {"icon", 1.0}}},
                                                    {"assign_role", {{"role", "leader"}}},
@@ -250,6 +249,15 @@ void Schemas()
         bad["intent"] = pair.first;
         bad["params"] = pair.second;
         Check(f.Receive(bad) == ChannelError::Invalid, "strict intent parameters");
+    }
+    // J5e: follow or stay with any keyed params is a standing shape: still 400 invalid_input, but with its reason.
+    for (auto const& pair : std::vector<std::pair<std::string, Json>>{
+             {"stay", {{"targetGuid", "1"}}}, {"follow", {{"standing", true}}}, {"stay", {{"durationMs", 30000}}}})
+    {
+        auto bad = f.Command();
+        bad["intent"] = pair.first;
+        bad["params"] = pair.second;
+        Check(f.Receive(bad) == ChannelError::Standing, "J5e: follow or stay with params is a standing shape");
     }
     Check(f.policy.CommandReservations() == 0, "malformed payloads reserve no effect ids");
     unsigned sequence = 0;

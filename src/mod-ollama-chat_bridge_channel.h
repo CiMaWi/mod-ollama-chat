@@ -27,7 +27,8 @@ enum class ChannelError : uint8_t
     Duplicate,
     Capacity,
     Closed,
-    Unknown
+    Unknown,
+    Standing  // J5e: named invalid_input on the wire, with reason standing_not_supported.
 };
 
 char const* ChannelErrorName(ChannelError error);
@@ -118,8 +119,10 @@ public:
                              std::vector<Participant> const& observedUnits, Clock now, std::string& body);
     ChannelError FinishFailure(ChannelEnvelope const& envelope, ChannelFailure failure, WorldScope const& current,
                                Clock now, std::string& body);
+    // J5e: a rejected or failed outcome carries `reason` and `reasonText` (None words as cannot_now or failed).
     ChannelError FinishCommand(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
-                               WorldScope const& current, Clock now, std::string& body);
+                               WorldScope const& current, Clock now, std::string& body,
+                               CommandRefusal refusal = CommandRefusal::None);
     std::size_t RequestReservations() const { return _requests.size(); }
     std::size_t CommandReservations() const { return _commands.size(); }
     std::size_t Pending() const;

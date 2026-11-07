@@ -9,6 +9,7 @@
 #include "mod-ollama-chat_response.h"
 #include "mod-ollama-chat_roleplay.h"
 #include "mod-ollama-chat-utilities.h"
+#include "mod-ollama-chat_lab.h"
 #include "Log.h"
 #include "DatabaseEnv.h"
 #include <thread>
@@ -17,6 +18,8 @@
 #include "ObjectAccessor.h"
 #include "Player.h"
 #include "PlayerbotMgr.h"
+#include "PlayerbotAI.h"
+#include "RandomPlayerbotMgr.h"
 #include <fmt/core.h>
 
 using namespace Acore::ChatCommands;
@@ -42,13 +45,20 @@ ChatCommandTable OllamaChatConfigCommand::GetCommands() const
         { "list", HandleOllamaPersonalityListCommand, SEC_ADMINISTRATOR, Console::Yes }
     };
 
+    // J5e: lab-only test helpers (no config option; administrators and the console).
+    static ChatCommandTable ollamaLabCommandTable =
+    {
+        { "logout", HandleOllamaLabLogoutCommand, SEC_ADMINISTRATOR, Console::Yes }
+    };
+
     static ChatCommandTable ollamaReloadCommandTable =
     {
         { "reload",      HandleOllamaReloadCommand,  SEC_ADMINISTRATOR, Console::Yes },
         { "status",      HandleOllamaStatusCommand,  SEC_ADMINISTRATOR, Console::Yes },
         { "test",        HandleOllamaTestCommand,    SEC_ADMINISTRATOR, Console::Yes },
         { "sentiment",   ollamaSentimentCommandTable },
-        { "personality", ollamaPersonalityCommandTable }
+        { "personality", ollamaPersonalityCommandTable },
+        { "lab",         ollamaLabCommandTable }
     };
 
     static ChatCommandTable commandTable =
@@ -57,6 +67,35 @@ ChatCommandTable OllamaChatConfigCommand::GetCommands() const
     };
 
     return commandTable;
+}
+
+// J5e: `.ollama lab logout <botName>` logs one bot out through the holder that owns it (its master's, else the
+// random-bot holder). Commands run on the world thread; the result goes to the console or the issuing GM only.
+bool OllamaChatConfigCommand::HandleOllamaLabLogoutCommand(ChatHandler* handler, Optional<std::string> botName)
+{
+    std::string const name = botName ? *botName : std::string();
+    Player* player = name.empty() ? nullptr : ObjectAccessor::FindPlayerByName(name);
+    PlayerbotAI* ai = player ? PlayerbotsMgr::instance().GetPlayerbotAI(player) : nullptr;
+    bool const bot = ai && ai->IsBotAI();
+    PlayerbotHolder* holder = nullptr;
+    if (bot)
+    {
+        ObjectGuid const guid = player->GetGUID();
+        Player* master = ai->GetMaster();
+        PlayerbotMgr* owner = master ? PlayerbotsMgr::instance().GetPlayerbotMgr(master) : nullptr;
+        if (owner && owner->GetPlayerBot(guid))
+            holder = owner;
+        else if (sRandomPlayerbotMgr.GetPlayerBot(guid))
+            holder = &sRandomPlayerbotMgr;
+    }
+    auto const step = OllamaLab::DecideLogout(!name.empty(), player != nullptr, bot, holder != nullptr);
+    std::string const shown = player ? player->GetName() : name;
+    if (step == OllamaLab::LogoutStep::LoggedOut)
+        holder->LogoutPlayerBot(player->GetGUID());
+    std::string const message = OllamaLab::LogoutMessage(step, shown);
+    LOG_INFO("module.ollamachat", "{}", message);
+    handler->SendSysMessage(message);
+    return true;
 }
 
 bool OllamaChatConfigCommand::HandleOllamaReloadCommand(ChatHandler* handler)

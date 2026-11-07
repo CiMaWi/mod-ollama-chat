@@ -230,12 +230,12 @@ ChannelError WorldChannel::Take(std::string_view bearer, uint64_t receipt, std::
 }
 
 ChannelError WorldChannel::Finish(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
-                                  WorldScope const& scope, Clock now, std::string& body)
+                                  WorldScope const& scope, Clock now, std::string& body, CommandRefusal refusal)
 {
     ++(outcome == ChannelOutcome::Applied  ? _stats.applied
        : outcome == ChannelOutcome::Failed ? _stats.failed
                                            : _stats.refused);
-    return _policy.FinishCommand(envelope, commandId, outcome, scope, now, body);
+    return _policy.FinishCommand(envelope, commandId, outcome, scope, now, body, refusal);
 }
 
 ChannelError WorldChannel::Command(Binding const& binding, ChannelEnvelope const& envelope,
@@ -246,9 +246,14 @@ ChannelError WorldChannel::Command(Binding const& binding, ChannelEnvelope const
     attempted = false;
     ++_stats.proposed;
     // DS.3 fixed refusal before any game read: unsupported verb, no executor or world phase, or rate denial.
-    if (!EffectSupported(command.intent) || !_executor || !phase ||
-        !_rate.Admit(binding.ticket.scope.botGuid, _clock()))
-        return Finish(envelope, command.commandId, ChannelOutcome::Rejected, binding.ticket.scope, _clock(), body);
+    // J5e: each refusal names its reason (the rate gate is consulted only when the others pass, as before).
+    CommandRefusal const fixed = !EffectSupported(command.intent)                       ? CommandRefusal::NotSupported
+                                 : !_executor || !phase                                 ? CommandRefusal::Unavailable
+                                 : !_rate.Admit(binding.ticket.scope.botGuid, _clock()) ? CommandRefusal::TooSoon
+                                                                                        : CommandRefusal::None;
+    if (fixed != CommandRefusal::None)
+        return Finish(envelope, command.commandId, ChannelOutcome::Rejected, binding.ticket.scope, _clock(), body,
+                      fixed);
     Binding const bound = binding;  // Executor game code must not depend on map storage it could disturb.
     bool asked = false;
     std::optional<Clock> authorized;
@@ -268,8 +273,9 @@ ChannelError WorldChannel::Command(Binding const& binding, ChannelEnvelope const
     auto const result = _executor->Execute(*phase, bound.ticket, bound.guard, command, authorize);
     attempted = authorized && (result == EffectResult::Applied || result == EffectResult::Failed);
     // The outcome is recorded once at its authorization time; receipt exposure is joined separately afterwards.
-    return Finish(envelope, command.commandId, EffectOutcome(result, authorized.has_value()), bound.ticket.scope,
-                  authorized.value_or(_clock()), body);
+    auto const outcome = EffectOutcome(result, authorized.has_value());
+    return Finish(envelope, command.commandId, outcome, bound.ticket.scope, authorized.value_or(_clock()), body,
+                  outcome == ChannelOutcome::Rejected ? _executor->Refusal() : CommandRefusal::None);
 }
 
 bool WorldChannel::ReceiptCurrent(WorldTicket const& ticket, Clock now) const

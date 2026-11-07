@@ -29,11 +29,17 @@ public:
                          ChannelCommand const& command, std::function<bool()> const& authorize) override
     {
         // Release gate (open since J6b4): closed, it refuses before any game read, authorization or playerbots call.
+        _refusal = CommandRefusal::None;
         if constexpr (!kBridgeEffectsReleased)
+        {
+            _refusal = CommandRefusal::NotSupported;
             return EffectResult::Rejected;
+        }
         else
-            return Effect(phase, ticket, guard, command, authorize);
+            return Effect(phase, ticket, guard, command, authorize, _refusal);
     }
+
+    CommandRefusal Refusal() const override { return _refusal; }
 
     // World thread only; memory only (a restart forgets it). One ledger for the one executor.
     static BridgePlans& Plans()
@@ -125,17 +131,25 @@ private:
         return PlayerbotBridge::FormationShape::None;  // Playerbots refuses a formation without a shape.
     }
 
+    // J5e: `why` receives the reason of every refusal; the channel words a Rejected without one as cannot_now.
     static EffectResult Effect(EffectPhase const& phase, WorldTicket const& ticket, DispatchGuard const& guard,
-                               ChannelCommand const& command, std::function<bool()> const& authorize)
+                               ChannelCommand const& command, std::function<bool()> const& authorize,
+                               CommandRefusal& why)
     {
         // No game read off the joined world thread or for a verb without an accepted effect.
         if (!EffectSupported(command.intent) || !phase.join.Current())
+        {
+            why = EffectSupported(command.intent) ? CommandRefusal::Unavailable : CommandRefusal::NotSupported;
             return EffectResult::Rejected;
+        }
         // Bot and controller come from the registered scope, never from the wire; Receive matched the issuer.
         Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.botGuid));
         Player* controller = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.controllerGuid));
         if (!bot || !bot->IsInWorld() || !controller || !controller->IsInWorld())
+        {
+            why = CommandRefusal::Unavailable;
             return EffectResult::Rejected;
+        }
 
         float const distance = g_SayDistance;  // The whisper/party radius BridgeCapture uses.
         IntentContext facts;
@@ -170,7 +184,7 @@ private:
             if (VisibleUnit(bot, unit, distance) && VisibleUnit(controller, unit, distance))
                 facts.eligibleVisibleTargetGuid = candidate;
         }
-        auto const effect = BuildEffectOrder(command, facts);
+        auto const effect = BuildEffectOrder(command, facts, &why);
         if (!effect)
             return EffectResult::Rejected;
 
@@ -207,6 +221,7 @@ private:
                 order.Operation = PlayerbotBridge::Intent::FocusHealing;
                 break;
             default:
+                why = CommandRefusal::NotSupported;
                 return EffectResult::Rejected;  // An unmapped verb never reaches playerbots.
         }
         order.Bot = effect->botGuid;
@@ -227,10 +242,17 @@ private:
         PlanOwner const owner{effect->groupGuid, effect->controllerGuid, ticket.generation};
         int64_t const nowMs = Now().steadyMs;
         PlayerbotBridge::Baseline before;
-        if (kind && (Plans().Admit(key, owner, nowMs) == PlanAdmission::Refused ||
-                     !PlayerbotBridge::Capture(phase.join, effect->botGuid,
-                                               PlayerbotBridge::LastingPart(order.Operation), before)))
+        if (kind && Plans().Admit(key, owner, nowMs) == PlanAdmission::Refused)
+        {
+            why = CommandRefusal::Busy;
             return EffectResult::Rejected;
+        }
+        if (kind && !PlayerbotBridge::Capture(phase.join, effect->botGuid,
+                                              PlayerbotBridge::LastingPart(order.Operation), before))
+        {
+            why = CommandRefusal::CannotNow;
+            return EffectResult::Rejected;
+        }
         auto const outcome = PlayerbotBridge::Execute(phase.join, order, authorize);
         // After every attempt that may have written (Applied, or Failed after partial writes), the state now is what
         // the bridge set; Rejected and Unavailable promise no mutation and record nothing. An attempt left unrecorded
@@ -262,6 +284,8 @@ private:
         }
         return EffectResult::Failed;  // Failed or unknown after a possible attempt: never applied, never replayed.
     }
+
+    CommandRefusal _refusal = CommandRefusal::None;
 };
 }  // namespace
 }  // namespace OllamaBridge

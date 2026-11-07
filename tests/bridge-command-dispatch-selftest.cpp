@@ -190,9 +190,16 @@ struct Fixture
               "authenticated completion operation");
         return packet;
     }
+    // J5e: the last Result's refusal reason and sentence (empty when applied) and its packet error.
+    std::string reason;
+    std::string reasonText;
+    ChannelError packetError = ChannelError::None;
     // The single correlated receipt: its outcome, a fixed error name, or "absent" when withheld or disposed.
     std::string Result(uint64_t receipt, std::string const& id)
     {
+        reason.clear();
+        reasonText.clear();
+        packetError = ChannelError::None;
         std::unique_ptr<ChannelPacket> packet;
         auto const error = channel.Take(settings.token, receipt, packet);
         if (error != ChannelError::None)
@@ -201,12 +208,24 @@ struct Fixture
         if (packet->error != ChannelError::None)
         {
             Check(packet->body.empty(), "fixed error without payload");
+            packetError = packet->error;
             return ChannelErrorName(packet->error);
         }
         auto const body = Json::parse(packet->body);
-        Check(body.size() == 9 && body["type"] == "command.result" && body["commandId"] == id &&
+        bool const refused = body.value("outcome", "") != "applied";
+        Check(body.size() == (refused ? 11u : 9u) && body["type"] == "command.result" && body["commandId"] == id &&
                   body["requestId"] == ticket.request.requestId && body["epoch"] == "epoch-1",
               "correlated command.result");
+        if (refused)
+        {
+            reason = body.at("reason").get<std::string>();
+            reasonText = body.at("reasonText").get<std::string>();
+            Check(!reason.empty() && reason.size() <= 40 &&
+                      reason.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") == std::string::npos &&
+                      !reasonText.empty() && reasonText.size() <= 200 &&
+                      reasonText.find_first_of("\"\\") == std::string::npos,
+                  "a refusal carries a short code and a plain sentence");
+        }
         return body["outcome"].get<std::string>();
     }
 };
@@ -570,6 +589,8 @@ void VerbMatrix()
         Check(f.Result(f.Send(f.Command("matrix", row.intent, row.params)), "matrix") ==
                   (row.delivered ? "applied" : "rejected"),
               "matrix receipt");
+        Check(row.delivered ? f.reason.empty() : f.reason == "not_supported",
+              "a fixed refusal names its reason (not_supported)");
         auto const& stats = f.channel.Commands();
         if (row.delivered)
         {
@@ -579,6 +600,7 @@ void VerbMatrix()
                   "a delivered verb reaches the executor once with one authorized mutation");
             Check(f.Result(f.Send(f.Attack("after-delivered")), "after-delivered") == "rejected" && f.probe.calls == 1,
                   "a delivered verb spends the bot's rate interval");
+            Check(f.reason == "too_soon", "a rate refusal names its reason (too_soon)");
         }
         else
         {
@@ -593,12 +615,15 @@ void VerbMatrix()
     Check(delivered == 9 && refusals == 4, "nine delivered verbs and four fixed refusals");
     // Standing follow and stay (a duration or a standing flag) have no wire shape: the exact parameter check refuses
     // the packet as invalid input before any command exists, so nothing is admitted, attempted or executed.
+    // J5e: the refusal is the Standing error, which the listener words as invalid_input with reason
+    // standing_not_supported.
     for (char const* intent : {"follow", "stay"})
         for (Json const& extra : {Json{{"standing", true}}, Json{{"durationMs", 30000}}})
         {
             Fixture f;
-            Check(f.Result(f.Send(f.Command("standing", intent, extra)), "standing") == "invalid_input",
-                  "a standing follow or stay has no typed shape");
+            Check(f.Result(f.Send(f.Command("standing", intent, extra)), "standing") == "invalid_input" &&
+                      f.packetError == ChannelError::Standing,
+                  "a standing follow or stay has no typed shape and names its reason");
             Check(f.probe.calls == 0 && !f.channel.Commands().proposed && !f.channel.Commands().attempts,
                   "a standing verb never reaches the executor");
             Check(f.Result(f.Send(f.Attack("after-standing")), "after-standing") == "applied",

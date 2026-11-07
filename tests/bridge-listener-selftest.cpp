@@ -390,7 +390,8 @@ void PureRules()
               ListenerStatus(ChannelError::Inactive) == 503 && ListenerStatus(ChannelError::Invalid) == 400 &&
               ListenerStatus(ChannelError::TooLarge) == 413 && ListenerStatus(ChannelError::Stale) == 410 &&
               ListenerStatus(ChannelError::Duplicate) == 409 && ListenerStatus(ChannelError::Capacity) == 429 &&
-              ListenerStatus(ChannelError::Closed) == 410 && ListenerStatus(ChannelError::Unknown) == 400,
+              ListenerStatus(ChannelError::Closed) == 410 && ListenerStatus(ChannelError::Unknown) == 400 &&
+              ListenerStatus(ChannelError::Standing) == 400,
           "one ChannelError to status table");
 }
 
@@ -500,6 +501,16 @@ void Deadlines(Harness& h)
     quick(ChannelError::Stale, ChannelError::Unknown, 410, "stale");
     quick(ChannelError::Closed, ChannelError::Unknown, 410, "closed");
     quick(ChannelError::TooLarge, ChannelError::Unknown, 413, "too_large");
+    // J5e: a standing follow/stay keeps 400 invalid_input and adds its reason code and sentence.
+    h.mailbox.Set(ChannelError::Standing);
+    Reply const standing = Post(h.port, "gen-1", Envelope(3000));
+    Check(standing.status == 400 &&
+              standing.body ==
+                  "{\"error\":\"invalid_input\",\"reason\":\"standing_not_supported\",\"reasonText\":"
+                  "\"I can follow or stay until you say otherwise, but I cannot take it as a standing "
+                  "order.\"}" &&
+              Json::parse(standing.body).size() == 3,
+          "a standing shape answers invalid_input with its reason");
     quick(ChannelError::None, ChannelError::Stale, 410, "stale");  // Terminal Take error ends the wait.
     h.mailbox.Set(ChannelError::None);
     Reply const short300 = Post(h.port, "gen-1", Envelope(300));

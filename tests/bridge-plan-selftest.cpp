@@ -153,6 +153,28 @@ void GroupChanges()
     Check(regroup.Observe(Bot, OtherGroup, true) == 1, "group id changed");
     Check(regroup.Pending(Start).size() == 1 && regroup.Counters().regrouped == 1, "new group makes the plan pending");
     Check(regroup.Observe(OtherBot, 0, false) == 0, "unknown bot changes nothing");
+
+    // J5e: the live `group none` round counted regrouped 0 because its plans had lapsed by lifetime first. A plan one
+    // millisecond short of its lifetime still moves on a group change or a controller loss; at the deadline it
+    // expires instead and the later change counts nothing.
+    Ledger young;
+    young.Open(Generation);
+    Check(Apply(young, Key(PlanKind::Movement), 1, 2, Start), "apply young movement");
+    Check(young.Expire(Start + PlanLifetimeMs - 1) == 0 && young.Observe(Bot, 0, true) == 1 &&
+              young.Counters().regrouped == 1 && young.Counters().expired == 0,
+          "a plan younger than its lifetime counts regrouped on a group change");
+    Ledger youngLost;
+    youngLost.Open(Generation);
+    Check(Apply(youngLost, Key(PlanKind::Formation), 1, 2, Start), "apply young formation");
+    Check(youngLost.Expire(Start + PlanLifetimeMs - 1) == 0 && youngLost.Observe(Bot, Group, false) == 1 &&
+              youngLost.Counters().regrouped == 1,
+          "a plan younger than its lifetime counts regrouped on a controller loss");
+    Ledger lapsed;
+    lapsed.Open(Generation);
+    Check(Apply(lapsed, Key(PlanKind::Movement), 1, 2, Start), "apply lapsing movement");
+    Check(lapsed.Expire(Start + PlanLifetimeMs) == 1 && lapsed.Observe(Bot, 0, true) == 0 &&
+              lapsed.Counters().regrouped == 0 && lapsed.Counters().expired == 1,
+          "a lapsed plan counts expired, and the later group change counts nothing");
 }
 
 void StaleEpochs()

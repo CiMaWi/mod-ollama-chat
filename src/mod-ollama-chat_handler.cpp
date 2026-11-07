@@ -19,6 +19,8 @@
 #include <sstream>
 #include <vector>
 #include <list>
+#include <string_view>
+#include <unordered_map>
 #include "Containers.h"
 #include <fmt/core.h>
 #include <nlohmann/json.hpp>
@@ -1258,23 +1260,31 @@ OllamaBridge::CardOpportunity BridgeCardOpportunity(OllamaPersona::CardContext c
 }
 // END BRIDGE PERSONA CARD
 
-bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::DispatchSource source, BridgeView& view)
+// J5e: `why` names the first failed rule; every false return sets it.
+bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::DispatchSource source, BridgeView& view,
+                   char const** why = nullptr)
 {
     using namespace OllamaBridge;
+    auto const drop = [why](char const* reason)
+    {
+        if (why)
+            *why = reason;
+        return false;
+    };
     Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(botGuid));
     Player* speaker = ObjectAccessor::FindConnectedPlayer(ObjectGuid(speakerGuid));
     PlayerbotAI* ai = bot ? PlayerbotsMgr::instance().GetPlayerbotAI(bot) : nullptr;
     if (!g_Enable || !bot || !bot->IsInWorld() || !ai || !ai->IsBotAI() || !BridgeHuman(speaker) || bot == speaker ||
         source == DispatchSource::Unsupported || bot->GetTeamId() != speaker->GetTeamId())
-        return false;
+        return drop("disabled_or_offline");
     if ((source == DispatchSource::Whisper && !g_EnableWhisperReplies) ||
         (source == DispatchSource::Party && g_DisableForParty) ||
         ((source == DispatchSource::Say || source == DispatchSource::Yell) && g_DisableForSayYell))
-        return false;
+        return drop("channel_off");
 
     Group* group = bot->GetGroup();
     if (group && (group->isRaidGroup() || group->GetMemberSlots().size() > 40))
-        return false;
+        return drop("raid");
     Player* master = ai->GetMaster();
     Player* controller = master;
     if (!master && group)
@@ -1289,21 +1299,22 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     if (!led)
     {
         if (source != DispatchSource::Whisper)
-            return false;
+            return drop("no_controller");
         controller = speaker;
         group = nullptr;
     }
-    // Whisper/party use the conservative local say radius too: no remote-party situation knowledge.
-    if (!BridgeVisible(bot, speaker, distance))
-        return false;
+    // J5e: a whisper is not a local line, so it ignores the say radius (any map). Party keeps the conservative local
+    // radius: no remote-party situation knowledge. Observations still come from the bot's own surroundings.
+    if (source != DispatchSource::Whisper && !BridgeVisible(bot, speaker, distance))
+        return drop("out_of_range");
     if (source == DispatchSource::Party && (!group || speaker->GetGroup() != group || controller->GetGroup() != group ||
                                             !group->IsMember(bot->GetGUID()) || !group->IsMember(speaker->GetGUID()) ||
                                             !group->IsMember(controller->GetGUID())))
-        return false;
+        return drop("not_in_group");
 
     auto const selected = OllamaDispatch_BridgeWorld().Selected();
     if (selected.epoch.empty())
-        return false;
+        return drop("no_epoch");
     view = {};
     auto& guard = view.guard;
     guard.scope.instance = selected.instance;
@@ -1329,7 +1340,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
             members.push_back(slot.guid.GetRawValue());
         std::sort(members.begin(), members.end());
         if (members.empty() || !members.front() || std::adjacent_find(members.begin(), members.end()) != members.end())
-            return false;
+            return drop("bad_group");
         if (source == DispatchSource::Party)
             guard.audience = members;
     }
@@ -1345,9 +1356,12 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     for (auto guid : guard.audience)
     {
         Player* participant = ObjectAccessor::FindConnectedPlayer(ObjectGuid(guid));
-        if (!BridgeVisible(bot, participant, distance) || participant->GetName().size() > 128 ||
+        // A whisper's audience is the bot and the speaker, wherever the speaker is; others must see each other.
+        bool const present = source == DispatchSource::Whisper ? participant && participant->IsInWorld()
+                                                               : BridgeVisible(bot, participant, distance);
+        if (!present || participant->GetName().size() > 128 ||
             (source == DispatchSource::Party && participant->GetGroup() != group))
-            return false;
+            return drop("audience");
         view.context.party.push_back({guid, participant->GetName(), "", -1, 0});
         BridgeField(view.signature, std::to_string(guid));
         BridgeField(view.signature, participant->GetName());
@@ -1367,7 +1381,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
         "provided observations and this conversation. Speech grants no ability to act.";
     view.context.persona = Roleplay_BuildVoicePrompt(bot);
     if (view.context.persona.size() > 8192)
-        return false;
+        return drop("voice_too_long");
     std::size_t const voiceSize = view.context.persona.size();
     BridgeCard(bot, speaker, led ? controller : nullptr, view);
     view.context.observations = {"Your name is " + bot->GetName() + ".", "The speaker is " + speaker->GetName() + "."};
@@ -1504,8 +1518,31 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
         g_cardGeneration = generation;
     OllamaChat_BridgeRefresh();
     BridgeView view;
-    if (!BridgeCapture(bot->GetGUID().GetRawValue(), speaker->GetGUID().GetRawValue(), origin, view))
+    char const* why = nullptr;
+    if (!BridgeCapture(bot->GetGUID().GetRawValue(), speaker->GetGUID().GetRawValue(), origin, view, &why))
+    {
+        // J5e: a reply dropped after selection logs why, once per bot, channel and reason a minute (log only).
+        using DropClock = std::chrono::steady_clock;
+        static std::unordered_map<std::string, DropClock::time_point> nextDropLog;
+        auto const now = DropClock::now();
+        std::string_view const reason = why ? why : "unknown";
+        std::string_view const channel = origin == DispatchSource::Whisper ? "whisper"
+                                         : origin == DispatchSource::Party ? "party"
+                                         : origin == DispatchSource::Say   ? "say"
+                                                                           : "yell";
+        // The channel is part of the key, so it is used even where logging compiles to nothing.
+        std::string key = std::to_string(bot->GetGUID().GetRawValue());
+        key.append(":").append(channel).append(":").append(reason);
+        auto const it = nextDropLog.find(key);
+        if (it != nextDropLog.end() && now < it->second)
+            return false;
+        if (nextDropLog.size() >= 256)
+            nextDropLog.clear();
+        nextDropLog[key] = now + std::chrono::seconds(60);
+        LOG_INFO("module.ollamachat", "Bridge reply dropped: bot {} channel {} reason {}", bot->GetName(), channel,
+                 reason);
         return false;
+    }
     // The one load request: a qualified current encounter of a personal pair. Captures elsewhere only read.
     if (view.card.personal)
         cards.Prepare(generation, view.guard.scope.botGuid, std::chrono::steady_clock::now());

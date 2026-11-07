@@ -285,14 +285,49 @@ void CheckLifecycle()
     Check(store.Observe(2, Bot).state && store.Observe(2, Bot).state->revision == 1,
           "new generation reconciles actual persisted state through a fresh read");
     store.Retire(2);
-    Check(!store.Observe(2, Bot).state && !store.Activate(2), "current retirement invalidates loaded views");
+    Check(!store.Observe(2, Bot).state && !store.Activate(2), "a retired generation reads nothing");
     Check(store.Activate(3), "new generation after retirement");
+    // J5e: a bridge restart keeps the loaded row; only the current generation reads or updates it.
+    Check(store.Observe(3, Bot).state && store.Observe(3, Bot).state->revision == 1 && store.Pending() == 0 &&
+              port.jobs.empty(),
+          "a loaded row survives retirement and a new generation without a new read");
+    Check(!store.Observe(2, Bot).state &&
+              !store.SubmitUpdate(2, store.Observe(3, Bot).stamp, true,
+                                  Update{UpdateKind::ProposeAlternative, Bot, 1, Source::Codex, "old ticket"}),
+          "an older generation's read and update stay refused");
+    store.Forget(Bot);
     store.Prepare(3, Bot, Start);
     auto retiredLoad = port.Take();
     store.Configure(false);
     port.Complete(retiredLoad, LookupStatus::Missing);
     store.Pump(Start);
     Check(store.Pending() == 0 && store.SetPort(nullptr), "disabled pump drains and permits port detachment");
+}
+
+// J5e: `.ollama reload` (same enabled state) and a new bridge generation keep loaded rows; the generation gate stays.
+void CheckReloadKeepsRows()
+{
+    FakePort port;
+    Store store;
+    Enable(store, port);
+    LoadMissing(store, port, 1, Bot, Start);
+    uint64_t const stamp = store.Observe(1, Bot).stamp;
+    store.Configure(true);
+    Check(!store.Observe(1, Bot).state, "a reload unbinds the generation until the bridge activates one");
+    Check(store.Activate(2) && store.Observe(2, Bot).state && store.Observe(2, Bot).stamp == stamp &&
+              port.jobs.empty() && store.Pending() == 0,
+          "a same-enabled reload keeps the loaded row for the next generation without a read");
+    store.Prepare(2, Bot, Start);
+    Check(port.jobs.empty(), "a kept row needs no new read");
+    Check(!store.Observe(1, Bot).state &&
+              !store.SubmitUpdate(1, stamp, true,
+                                  Update{UpdateKind::ProposeAlternative, Bot, 0, Source::Codex, "old ticket"}),
+          "an old-generation read and update are refused");
+    Check(store.Activate(3) && store.Observe(3, Bot).state && !store.Observe(2, Bot).state,
+          "a newer generation keeps the row and refuses the previous one");
+    store.Configure(false);
+    store.Configure(true);
+    Check(store.Activate(4) && !store.Observe(4, Bot).state, "an off/on change empties the rows");
 }
 
 void CheckCapacity()
@@ -329,8 +364,9 @@ void CheckCapacity()
     port.Complete(pinned, LookupStatus::Missing);
     store.Pump(Start);
 
+    store.Configure(false);  // J5e: only an off/on change empties the rows; the cooling check needs empty rows.
     store.Configure(true);
-    Check(store.Activate(2), "same-enabled reload binds a new generation");
+    Check(store.Activate(2), "off/on reload binds a new generation");
     port.accepting = false;
     for (uint64_t guid = 1; guid <= MaxStoreEntries; ++guid)
         store.Prepare(2, guid, Start);
@@ -693,8 +729,12 @@ void CheckPreparedCardLifecycle()
     io.FinishCommit(true);
     io.Read(OtherBot, ClaudeRow(OtherBot, 1, "Committed late"));
     store.Pump(Start);
-    Check(store.Pending() == 0 && store.Activate(2) && !store.Observe(2, OtherBot).state,
-          "a late commit after retirement drains without publication");
+    // J5e: retirement no longer empties the rows, but a write hides its row until a matching readback. The discarded
+    // write and the late readback that differs from the staged candidate publish nothing; both rows back off and
+    // reload from SQL later.
+    Check(store.Pending() == 0 && store.Activate(2), "the late commit drains and a new generation binds");
+    Check(!store.Observe(2, Bot).state, "after retirement the discarded write publishes nothing");
+    Check(!store.Observe(2, OtherBot).state, "after retirement a late mismatched commit publishes nothing");
     ForgetPersona(store, nullptr, Bot);
     RetirePersonas(store, nullptr, 2);
     Check(store.Pending() == 0 && !store.Activate(2), "helpers work without a session");
@@ -708,6 +748,7 @@ int main(int argc, char** argv)
         CheckLoads();
         CheckWrites();
         CheckLifecycle();
+        CheckReloadKeepsRows();
         CheckCapacity();
         CheckCards();
     }

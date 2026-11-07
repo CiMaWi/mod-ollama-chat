@@ -92,6 +92,12 @@ bool Text(std::string const& text, std::size_t max)
            std::any_of(text.begin(), text.end(), [](unsigned char c) { return c > ' '; });
 }
 
+// J5e: a standing follow/stay shape (any params) is refused with its own reason, still invalid_input on the wire.
+struct StandingShape : std::runtime_error
+{
+    StandingShape() : std::runtime_error("standing") {}
+};
+
 ChannelCommand Command(Json const& body)
 {
     if (!Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type", "commandId",
@@ -127,6 +133,14 @@ ChannelCommand Command(Json const& body)
     {
         case ChannelIntent::Follow:
         case ChannelIntent::Stay:
+            // J5e: params with keys (a standing or timed shape) name their reason; any other shape stays invalid.
+            if (!Exact(params, {}))
+            {
+                if (params.is_object())
+                    throw StandingShape();
+                throw std::runtime_error("invalid");
+            }
+            break;
         case ChannelIntent::Flee:
         case ChannelIntent::Regroup:
         case ChannelIntent::AttackOwnTarget:
@@ -237,6 +251,8 @@ char const* ChannelErrorName(ChannelError error)
             return "closed";
         case ChannelError::Unknown:
             return "unknown_request";
+        case ChannelError::Standing:
+            return "invalid_input";
     }
     return "invalid_input";
 }
@@ -538,6 +554,10 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
         message = {std::move(envelope), std::move(payload)};
         return ChannelError::None;
     }
+    catch (StandingShape const&)
+    {
+        return ChannelError::Standing;
+    }
     catch (std::exception const&)
     {
         return ChannelError::Invalid;
@@ -619,7 +639,7 @@ ChannelError ChannelPolicy::FinishFailure(ChannelEnvelope const& envelope, Chann
 
 ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::string const& commandId,
                                           ChannelOutcome outcome, WorldScope const& current, Clock now,
-                                          std::string& body)
+                                          std::string& body, CommandRefusal refusal)
 {
     body.clear();
     if (!Current(envelope, current, now, false))
@@ -636,6 +656,14 @@ ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::
     json["outcome"] = outcome == ChannelOutcome::Applied    ? "applied"
                       : outcome == ChannelOutcome::Rejected ? "rejected"
                                                             : "failed";
+    if (outcome != ChannelOutcome::Applied)
+    {
+        if (refusal == CommandRefusal::None)
+            refusal = outcome == ChannelOutcome::Failed ? CommandRefusal::Failed : CommandRefusal::CannotNow;
+        auto const words = DescribeRefusal(refusal);
+        json["reason"] = words.code;
+        json["reasonText"] = words.text;
+    }
     body = json.dump();
     found->second.terminal = true;
     return ChannelError::None;

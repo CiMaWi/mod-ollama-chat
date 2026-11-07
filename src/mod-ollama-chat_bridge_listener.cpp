@@ -33,7 +33,7 @@ struct StatusEntry
     int status;
 };
 
-constexpr std::array<StatusEntry, 10> StatusTable{{
+constexpr std::array<StatusEntry, 11> StatusTable{{
     {ChannelError::None, 200},
     {ChannelError::Unauthorized, 401},
     {ChannelError::Inactive, 503},
@@ -44,6 +44,7 @@ constexpr std::array<StatusEntry, 10> StatusTable{{
     {ChannelError::Capacity, 429},
     {ChannelError::Closed, 410},
     {ChannelError::Unknown, 400},  // A packet type with no reverse adapter (e.g. a generation result) is bad input.
+    {ChannelError::Standing, 400},
 }};
 
 bool JsonSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
@@ -67,6 +68,16 @@ void Reply(httplib::Response& res, int status, std::string_view name)
 
 void Reply(httplib::Response& res, ChannelError error)
 {
+    if (error == ChannelError::Standing)
+    {
+        // J5e: the fixed words need no escaping.
+        auto const words = DescribeRefusal(CommandRefusal::StandingNotSupported);
+        std::string body = "{\"error\":\"invalid_input\",\"reason\":\"";
+        body.append(words.code).append("\",\"reasonText\":\"").append(words.text).append("\"}");
+        res.status = ListenerStatus(error);
+        res.set_content(body, "application/json");
+        return;
+    }
     Reply(res, ListenerStatus(error), ChannelErrorName(error == ChannelError::Unknown ? ChannelError::Invalid : error));
 }
 

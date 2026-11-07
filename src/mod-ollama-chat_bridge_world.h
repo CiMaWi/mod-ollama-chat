@@ -330,7 +330,8 @@ private:
     ChannelError Command(Binding const& binding, ChannelEnvelope const& envelope, ChannelCommand const& command,
                          EffectPhase const* phase, Deadline until, bool& attempted, std::string& body);
     ChannelError Finish(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
-                        WorldScope const& scope, Clock now, std::string& body);
+                        WorldScope const& scope, Clock now, std::string& body,
+                        CommandRefusal refusal = CommandRefusal::None);
     bool ReceiptCurrent(WorldTicket const& ticket, Clock now) const;
     WorldPolicy& _world;
     QueryWorldSource* const _source;   // WORLD ONLY; never copied into a packet or worker task.

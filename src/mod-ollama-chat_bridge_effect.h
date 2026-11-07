@@ -82,11 +82,16 @@ inline uint64_t EffectTargetGuid(ChannelCommand const& command, uint64_t ownTarg
 // A supported verb mapped from freshly resolved facts with the captured group; otherwise none. An attack, a mark or a
 // focus heal needs a nonzero target, a target-less verb must carry none; a position carries its checked destination,
 // a formation its shape and save_mana its flag.
-inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command, IntentContext const& current)
+inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command, IntentContext const& current,
+                                                   CommandRefusal* why = nullptr)
 {
     if (!EffectSupported(command.intent))
+    {
+        if (why)
+            *why = CommandRefusal::NotSupported;
         return std::nullopt;
-    auto const mapped = MapIntent(command, current);
+    }
+    auto const mapped = MapIntent(command, current, why);
     if (!mapped)
         return std::nullopt;
     EffectOrder order;
@@ -123,6 +128,8 @@ public:
     virtual ~CommandExecutor() = default;
     virtual EffectResult Execute(EffectPhase const& phase, WorldTicket const& ticket, DispatchGuard const& guard,
                                  ChannelCommand const& command, std::function<bool()> const& authorize) = 0;
+    // J5e: the reason of the last Execute's refusal (None when unknown); read right after Execute, world thread.
+    virtual CommandRefusal Refusal() const { return CommandRefusal::None; }
 };
 
 // Bounded per-bot gate on the game-owned lane, independent of request and command ids and of channel epochs.
