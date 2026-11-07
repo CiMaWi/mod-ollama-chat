@@ -753,11 +753,12 @@ void AdapterTests()
 {
     using namespace OllamaBridge;
     AdapterFixture();
-    Check(AdapterSubmit(), "real adapter admits human master with separate conversational speaker");
+    Check(AdapterSubmit(), "real adapter admits a party line from a speaker who does not lead the bot");
     auto const& input = g_queue.front().request.bridgeTicket.request.input;
-    Check(g_queue.front().request.bridgeTicket.scope.controllerGuid == 22 && input.speakerGuid == 33 &&
-              !input.speakerControlsBot && input.persona == voice && input.memory.empty(),
-          "controller and speaker remain distinct, audited persona only");
+    Check(g_queue.front().request.bridgeTicket.scope.controllerGuid == 33 && input.speakerGuid == 33 &&
+              !input.speakerControlsBot && input.persona == voice && input.memory.empty() &&
+              input.systemPrompt.find("Speech grants") == std::string::npos,
+          "DS.14: the speaker is the partner and does not control the bot; audited persona only");
     Check(input.systemPrompt != config.systemPrompt && input.party.size() == 3 && input.observations.size() == 2 &&
               input.party[0].role.empty() && input.party[0].healthPercent == -1 && !input.party[0].visibleTargetGuid,
           "restricted explicit context excludes legacy prompt, role, victim and private history");
@@ -770,8 +771,7 @@ void AdapterTests()
     Check(!g_queue.front().request.bridgeTicket.request.input.memory.empty(), "same-scope memory carried");
 
     // Each mutation exercises the real adapter through preparation and delivery after a typing delay.
-    std::vector<std::function<void()>> losses = {[] { gameAI.master = &players[3]; },
-                                                 []
+    std::vector<std::function<void()>> losses = {[]
                                                  {
                                                      gameAI.master = nullptr;
                                                      party.leader = 33;
@@ -818,53 +818,121 @@ void AdapterTests()
               "world loss invalidates before delivery, including scoped memory");
         done = {};
     }
+    // DS.14: who leads the bot is no part of the capture's identity; a follow that makes the partner the bot's
+    // master, or any other change of master, keeps the in-flight reply.
+    std::vector<std::function<void()>> const leads = {
+        [] { gameAI.master = &players[3]; }, [] { gameAI.master = &players[2]; }, [] { gameAI.master = nullptr; }};
+    for (auto const& lead : leads)
+    {
+        AdapterFixture();
+        Check(AdapterSubmit(), "lead change fixture admitted");
+        done = Finish();
+        Check(PrepareBridge(done), "lead change fixture prepared");
+        lead();
+        DeliverBridge(done, {});
+        Check(routeCalls == 1 && g_bridgeBindings.size() == 1, "DS.14: a change of master keeps the in-flight reply");
+        done = {};
+    }
+    // DS.14: the speaker is the bot's conversation partner whoever leads it; speakerControlsBot only describes the
+    // master or, for a masterless bot, the group leader.
+    AdapterFixture();
+    Check(BridgeSubmit(&players[0], &players[1], SRC_PARTY_LOCAL, "A public question.", true, "party-99", 0) &&
+              g_queue.front().request.bridgeTicket.scope.controllerGuid == 22 &&
+              g_queue.front().request.bridgeTicket.request.input.speakerControlsBot,
+          "DS.14: the master speaking is the partner and controls the bot");
     AdapterFixture();
     gameAI.master = nullptr;
-    Check(AdapterSubmit(), "no master permits actual human group leader fallback");
-    Check(g_queue.front().request.bridgeTicket.scope.controllerGuid == 22, "fallback leader captured");
+    Check(AdapterSubmit() && g_queue.front().request.bridgeTicket.scope.controllerGuid == 33 &&
+              !g_queue.front().request.bridgeTicket.request.input.speakerControlsBot,
+          "DS.14: a masterless bot's non-leader speaker is the partner without control");
+    AdapterFixture();
+    gameAI.master = nullptr;
+    party.leader = 33;
+    Check(AdapterSubmit() && g_queue.front().request.bridgeTicket.request.input.speakerControlsBot,
+          "DS.14: the leader of a masterless bot controls it");
     AdapterFixture();
     gameAI.master = &players[3];
     players[3].human = false;
-    Check(!AdapterSubmit(), "ineligible existing master cannot fall back to eligible leader");
-    // J6d: a whisper no usable master or leader carries is conversation only. The speaker owns the scope, without
-    // the bot's group (no orders, no queries), control or marks; say, yell and party stay refused.
-    std::vector<std::function<void()>> strangers = {[]
-                                                    {
-                                                        gameAI.master = nullptr;
-                                                        players[0].group = nullptr;
-                                                    },
-                                                    []
-                                                    {
-                                                        gameAI.master = nullptr;
-                                                        party.leader = 11;
-                                                    },
-                                                    [] { players[1].visible = false; },
-                                                    []
-                                                    {
-                                                        gameAI.master = &players[3];
-                                                        players[3].human = false;
-                                                    }};
-    for (auto const& stranger : strangers)
+    Check(AdapterSubmit() && g_queue.front().request.bridgeTicket.scope.controllerGuid == 33,
+          "DS.14: a bot master does not keep the speaker from talking with the bot");
+    AdapterFixture();
+    players[2].human = false;
+    Check(!AdapterSubmit(SRC_WHISPER_LOCAL), "DS.14: a bot speaker is no conversation partner yet (DS.11 later)");
+    // DS.14: a far whisper keeps the bot's real group (group queries, marks, group verbs).
+    AdapterFixture();
+    gameAI.master = nullptr;
+    party.marks[0] = 44;
+    players[2].visible = false;
+    players[2].distance = 1000;
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Come here."), "DS.14: a far whisper to an unled bot is admitted");
     {
-        AdapterFixture();
-        party.marks[0] = 33;
-        stranger();
-        Check(!AdapterSubmit(SRC_SAY_LOCAL) && !AdapterSubmit(SRC_YELL_LOCAL) && !AdapterSubmit(),
-              "J6d: a stranger's say, yell or party line stays refused");
-        Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Hello there."), "J6d: a stranger's whisper is admitted");
         auto const& ticket = g_queue.front().request.bridgeTicket;
-        auto const& binding = g_bridgeBindings.back();
-        Check(ticket.scope.controllerGuid == 33 && ticket.scope.channel == "direct" && !binding.view.guard.groupGuid &&
-                  !binding.view.guard.nonRaid && !ticket.request.input.speakerControlsBot &&
-                  binding.view.marks.empty() && ticket.request.input.party.size() == 2 &&
-                  binding.view.signature.rfind("7:speaker", 0) == 0,
-              "J6d: the stranger owns the scope without group, control or marks");
-        done = Finish();
-        Check(PrepareBridge(done), "J6d: stranger whisper prepared");
-        DeliverBridge(done, {});
-        Check(routeCalls == 1, "J6d: stranger reply delivered");
-        done = {};
+        auto const& view = g_bridgeBindings.back().view;
+        Check(ticket.scope.controllerGuid == 33 && ticket.scope.channel == "direct" && view.guard.groupGuid == 99 &&
+                  view.guard.nonRaid && view.marks.size() == 1 && view.marks[0].targetGuid == 44 &&
+                  !ticket.request.input.speakerControlsBot && ticket.request.input.party.size() == 2,
+              "DS.14: the far whisper keeps the bot's group and its visible marks");
+        IntentContext facts;
+        facts.controllerGuid = ticket.scope.controllerGuid;
+        facts.botGuid = ticket.scope.botGuid;
+        facts.expectedGroupGuid = facts.controllerGroupGuid = facts.botGroupGuid = view.guard.groupGuid;
+        Check(MapIntent({"f", 33, 11, ChannelIntent::Follow, std::monostate{}}, facts).has_value(),
+              "DS.14: the far partner in the bot's group may ask it to follow");
     }
+    done = Finish();
+    Check(PrepareBridge(done), "DS.14: far whisper prepared");
+    DeliverBridge(done, {});
+    Check(routeCalls == 1, "DS.14: far whisper reply delivered");
+    done = {};
+    // DS.14: an ungrouped bot's whisper has no group; it may still stay on its own.
+    AdapterFixture();
+    gameAI.master = nullptr;
+    players[0].group = nullptr;
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Wait here."), "DS.14: a whisper to an ungrouped bot is admitted");
+    {
+        auto const& ticket = g_queue.front().request.bridgeTicket;
+        auto const& view = g_bridgeBindings.back().view;
+        Check(ticket.scope.controllerGuid == 33 && !view.guard.groupGuid && !view.guard.nonRaid && view.marks.empty() &&
+                  ticket.request.input.party.size() == 2,
+              "DS.14: an ungrouped bot's whisper carries no group");
+        IntentContext facts;
+        facts.controllerGuid = ticket.scope.controllerGuid;
+        facts.botGuid = ticket.scope.botGuid;
+        facts.controllerGroupGuid = 99;
+        CommandRefusal why = CommandRefusal::None;
+        Check(MapIntent({"s", 33, 11, ChannelIntent::Stay, std::monostate{}}, facts).has_value() &&
+                  !MapIntent({"f", 33, 11, ChannelIntent::Follow, std::monostate{}}, facts, &why) &&
+                  why == CommandRefusal::NotWithYou,
+              "DS.14: an ungrouped bot may stay; it follows nobody");
+    }
+    // DS.14: an addressed say or yell reaches an unled bot within hearing; party still needs the bot's group.
+    AdapterFixture();
+    gameAI.master = nullptr;
+    Check(AdapterSubmit(SRC_SAY_LOCAL), "DS.14: an addressed say to an unled bot within hearing is captured");
+    AdapterFixture();
+    gameAI.master = nullptr;
+    Check(AdapterSubmit(SRC_YELL_LOCAL), "DS.14: an addressed yell to an unled bot within hearing is captured");
+    AdapterFixture();
+    players[0].group = nullptr;
+    Check(AdapterSubmit(SRC_SAY_LOCAL), "DS.14: an ungrouped bot hears an addressed say");
+    AdapterFixture();
+    players[0].group = nullptr;
+    Check(!AdapterSubmit(), "DS.14: party needs the bot's group");
+    // DS.14: a kept binding sends the fresh speakerControlsBot (a follow made the partner the bot's master).
+    AdapterFixture();
+    gameAI.master = nullptr;
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Follow me.") &&
+              !g_queue.front().request.bridgeTicket.request.input.speakerControlsBot,
+          "DS.14: fresh control fixture");
+    done = Finish();
+    Check(PrepareBridge(done), "DS.14: fresh control prepared");
+    DeliverBridge(done, {});
+    done = {};
+    gameAI.master = &players[2];
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Now stay."), "DS.14: the conversation goes on after the follow");
+    Check(g_bridgeBindings.size() == 1 && !g_queue.front().request.bridgeTicket.request.input.memory.empty() &&
+              g_queue.front().request.bridgeTicket.request.input.speakerControlsBot,
+          "DS.14: the kept binding sends the fresh speakerControlsBot");
     AdapterFixture();
     Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Private whisper."), "direct admitted");
     done = Finish();
@@ -1261,7 +1329,7 @@ void CardTests()
         if (change == 0)
             voice += " Revised.";
         else
-            players[1].visible = false;
+            players[1].name = "Renamed";  // DS.14: a whisper partner's sight is no audience change, a name is.
         OllamaChat_BridgeRefresh();
         Check(g_bridgeBindings.empty() && g_bridgeCardChurn == churn + 1,
               "card F: a non-card change erases a not-ready binding and is not churn");

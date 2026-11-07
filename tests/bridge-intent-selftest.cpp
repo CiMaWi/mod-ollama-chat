@@ -1,8 +1,12 @@
 // Offline checks of the production wire decoder and pure intent mapping.
+#include <algorithm>
 #include <iostream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <set>
 #include <stdexcept>
+#include <string>
 
 #include "mod-ollama-chat_bridge_channel.h"
 
@@ -180,7 +184,8 @@ void WireRefusals()
     invalid(fixture.Wire(nul, empty));
     invalid(fixture.Wire("attack_own_target", {{"targetGuid", "12"}}));
     invalid(fixture.Wire("stay", Json::array()));
-    invalid(fixture.Wire("stay", {{"command", "do flee"}}));
+    Check(fixture.Receive(fixture.Wire("stay", {{"command", "do flee"}})) == ChannelError::Standing,
+          "J5e: a stay with params is the standing shape, refused as invalid_input without reserving its id");
     invalid(fixture.Wire("pull", {{"targetGuid", "12"}, {"other", true}}));
     for (Json const& guid : {Json(12), Json("0"), Json("01"), Json("-12"), Json("+12"), Json("12;stay"),
                              Json("18446744073709551616"), Json(" 12")})
@@ -222,20 +227,29 @@ void WorldRefusals()
     current.controllerGuid = 0;
     Check(!MapIntent(stay, current), "lost controller security");
     current.controllerGuid = Controller - 1;
-    Check(!MapIntent(stay, current), "replacement controller cannot reuse prior authority");
+    CommandRefusal why = CommandRefusal::None;
+    Check(!MapIntent(stay, current, &why) && why == CommandRefusal::CannotNow,
+          "an issuer other than the partner is refused as cannot_now");
     current = Current();
     current.botGuid = Bot + 1;
     Check(!MapIntent(stay, current), "wrong live bot");
     current = Current();
     current.controllerGroupGuid = 0;
-    Check(!MapIntent(stay, current), "controller left the group");
+    Check(MapIntent(stay, current).has_value(), "DS.14: a partner outside the bot's group may still ask it to stay");
     current = Current();
     current.botGroupGuid = 0;
-    Check(!MapIntent(stay, current), "bot left the group");
+    why = CommandRefusal::None;
+    Check(!MapIntent(stay, current, &why) && why == CommandRefusal::CannotNow, "bot left the captured group");
     current.controllerGroupGuid = current.botGroupGuid = Group + 1;
-    Check(!MapIntent(stay, current), "both players moved to a different group");
+    why = CommandRefusal::None;
+    Check(!MapIntent(stay, current, &why) && why == CommandRefusal::CannotNow,
+          "both players moved to a different group");
     current.expectedGroupGuid = current.controllerGroupGuid = current.botGroupGuid = 0;
-    Check(!MapIntent(stay, current), "ungrouped request has no authority");
+    Check(MapIntent(stay, current).has_value(), "DS.14: an ungrouped bot may stay on its own");
+    current.botGroupGuid = Group;
+    why = CommandRefusal::None;
+    Check(!MapIntent(stay, current, &why) && why == CommandRefusal::CannotNow,
+          "an ungrouped capture is stale once the bot joins a group");
     auto forged = stay;
     forged.issuerGuid = Bot;
     current = Current();
@@ -301,6 +315,99 @@ void TypedRefusals()
     }
 }
 
+// DS.14: plausibility per verb, never a leader gate. Group play needs the bot's captured group; follow, formation
+// and save_mana also need the partner in it. Everything else is the bot's own act, grouped or not.
+void PartnerRules()
+{
+    struct Verb
+    {
+        char const* name;
+        Json params;
+        bool group;    // Needs the bot's group.
+        bool partner;  // Needs the partner in that group too.
+    };
+    auto const empty = Json::object();
+    auto const guid = std::to_string(Target);
+    Verb const verbs[] = {{"follow", empty, true, true},
+                          {"formation", {{"shape", "line"}}, true, true},
+                          {"save_mana", {{"enabled", true}}, true, true},
+                          {"mark", {{"targetGuid", guid}, {"icon", 7}}, true, false},
+                          {"focus_healing", {{"targetGuid", guid}}, true, false},
+                          {"stay", empty, false, false},
+                          {"flee", empty, false, false},
+                          {"attack_own_target", empty, false, false},
+                          {"pull", {{"targetGuid", guid}}, false, false},
+                          {"position", {{"x", 17.25}, {"y", -36.5}, {"z", 7}, {"mapId", 571}}, false, false}};
+    auto const outcome = [](ChannelCommand const& command,
+                            IntentContext const& current) -> std::optional<CommandRefusal>
+    {
+        CommandRefusal why = CommandRefusal::None;
+        if (MapIntent(command, current, &why))
+            return std::nullopt;
+        return why;
+    };
+    Fixture fixture;
+    unsigned id = 0;
+    for (Verb const& verb : verbs)
+    {
+        auto const command = fixture.Stage(verb.name, verb.params, "partner-" + std::to_string(++id));
+        CommandRefusal const groupWhy =
+            command.intent == ChannelIntent::Follow ? CommandRefusal::NotWithYou : CommandRefusal::NotInGroup;
+        Check(!outcome(command, Current()), "grouped with the partner: every verb admitted");
+        for (uint64_t const partnerGroup : {uint64_t{0}, Group + 1})
+        {
+            auto outside = Current();
+            outside.controllerGroupGuid = partnerGroup;
+            auto const away = outcome(command, outside);
+            Check(verb.partner ? away == groupWhy : !away,
+                  "partner outside the bot's group: follow not_with_you, formation and save_mana not_in_group, "
+                  "the rest admitted");
+            auto alone = Current();
+            alone.expectedGroupGuid = alone.botGroupGuid = 0;
+            alone.controllerGroupGuid = partnerGroup;
+            auto const lone = outcome(command, alone);
+            Check(verb.group ? lone == groupWhy : !lone,
+                  "ungrouped bot: follow not_with_you, other group verbs not_in_group, its own acts admitted");
+        }
+    }
+}
+
+// J5e and DS.13: every refusal names a short code and a plain sentence the bot can say; DS.14 adds five.
+void RefusalWords()
+{
+    std::set<std::string> codes;
+    for (unsigned value = 1; value <= static_cast<unsigned>(CommandRefusal::Failed); ++value)
+    {
+        auto const words = DescribeRefusal(static_cast<CommandRefusal>(value));
+        std::string const code = words.code;
+        std::string const text = words.text;
+        Check(!code.empty() && code.size() <= 40 &&
+                  code.find_first_not_of("abcdefghijklmnopqrstuvwxyz_") == std::string::npos,
+              "a refusal code is a short lower-case word");
+        Check(!text.empty() && text.size() <= 200 && text.find_first_of("\"\\") == std::string::npos &&
+                  std::all_of(text.begin(), text.end(), [](char c) { return c >= 0x20 && c < 0x7F; }),
+              "a refusal sentence is plain ASCII without quotes or backslashes");
+        Check(codes.insert(code).second, "every refusal has its own code");
+        Check(code != "not_leader", "DS.14: no refusal names a leader");
+    }
+    auto const none = DescribeRefusal(CommandRefusal::None);
+    Check(!*none.code && !*none.text, "no refusal has no words");
+    Check(std::string(DescribeRefusal(static_cast<CommandRefusal>(200)).code) == "cannot_now",
+          "an unknown refusal is cannot_now");
+    auto const said = [](CommandRefusal refusal, char const* code, char const* text)
+    {
+        auto const words = DescribeRefusal(refusal);
+        return std::string(words.code) == code && std::string(words.text) == text;
+    };
+    Check(said(CommandRefusal::Dead, "dead", "I am in no state to do anything right now."), "dead sentence");
+    Check(said(CommandRefusal::Battleground, "battleground", "Not here; I have my own fight to see to."),
+          "battleground sentence");
+    Check(said(CommandRefusal::Travelling, "travelling", "I cannot do that while I am in flight."),
+          "travelling sentence");
+    Check(said(CommandRefusal::NotWithYou, "not_with_you", "We are not travelling together."), "not_with_you sentence");
+    Check(said(CommandRefusal::TooFar, "too_far", "You are too far away for me to reach."), "too_far sentence");
+}
+
 void StagedCommandCurrentness()
 {
     Fixture fixture;
@@ -332,6 +439,8 @@ int main()
         WireRefusals();
         WorldRefusals();
         TypedRefusals();
+        PartnerRules();
+        RefusalWords();
         StagedCommandCurrentness();
         std::cout << "PASS " << checks << " checks\n";
         return 0;

@@ -78,13 +78,13 @@ struct ChannelCommand
 // Only the game adapter supplies these facts. A missing fact leaves the associated check closed.
 struct IntentContext
 {
-    uint64_t controllerGuid = 0;  // Current human controller after the game's control/security check.
+    uint64_t controllerGuid = 0;  // DS.14: the conversation partner (the speaker), not a leader or master.
     uint64_t botGuid = 0;
-    uint64_t expectedGroupGuid = 0;  // Group captured with the registered work.
+    uint64_t expectedGroupGuid = 0;  // The bot's group captured with the registered work (0: ungrouped).
     uint64_t controllerGroupGuid = 0;
     uint64_t botGroupGuid = 0;
     uint64_t ownTargetGuid = 0;              // Current own target for AttackOwnTarget, independent of the wire payload.
-    uint64_t eligibleVisibleTargetGuid = 0;  // Resolved, controller-observable and eligible for this intent.
+    uint64_t eligibleVisibleTargetGuid = 0;  // Resolved, visible to the bot and eligible for this intent.
     std::optional<ChannelPosition> pathableNearbyPosition;  // Exact position checked in the current map and phase.
 };
 
@@ -145,7 +145,7 @@ inline bool ValidIntentParams(ChannelIntent intent, ChannelParams const& params)
 }
 
 // J5e: why an order was refused, so the bot can turn it into its own in-world reply. The wire carries the code and
-// the sentence (fixed ASCII, no quotes or backslashes, the bot speaking to the person who gave the order).
+// the sentence (fixed ASCII, no quotes or backslashes, the bot speaking to its conversation partner).
 enum class CommandRefusal : uint8_t
 {
     None,
@@ -153,7 +153,11 @@ enum class CommandRefusal : uint8_t
     StandingNotSupported,
     TooSoon,
     Unavailable,
-    NotLeader,
+    Dead,
+    Battleground,
+    Travelling,
+    NotWithYou,
+    TooFar,
     NotInGroup,
     NoTarget,
     TargetNotVisible,
@@ -184,8 +188,16 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
             return {"too_soon", "I just took an order; give me a moment."};
         case CommandRefusal::Unavailable:
             return {"unavailable", "I cannot take orders right now."};
-        case CommandRefusal::NotLeader:
-            return {"not_leader", "You do not lead my group, so I do not take orders from you."};
+        case CommandRefusal::Dead:
+            return {"dead", "I am in no state to do anything right now."};
+        case CommandRefusal::Battleground:
+            return {"battleground", "Not here; I have my own fight to see to."};
+        case CommandRefusal::Travelling:
+            return {"travelling", "I cannot do that while I am in flight."};
+        case CommandRefusal::NotWithYou:
+            return {"not_with_you", "We are not travelling together."};
+        case CommandRefusal::TooFar:
+            return {"too_far", "You are too far away for me to reach."};
         case CommandRefusal::NotInGroup:
             return {"not_in_group", "We are not in the same group."};
         case CommandRefusal::NoTarget:
@@ -204,6 +216,19 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
     return {"cannot_now", "I cannot do that right now."};
 }
 
+// DS.14: group play needs a group. Follow, formation and save_mana also need the partner in the bot's group; a mark
+// and a focus heal need only the bot's group (playerbots checks the rest of each verb's rule).
+inline bool IntentNeedsGroup(ChannelIntent intent)
+{
+    return intent == ChannelIntent::Follow || intent == ChannelIntent::Mark || intent == ChannelIntent::Formation ||
+           intent == ChannelIntent::SaveMana || intent == ChannelIntent::FocusHealing;
+}
+
+inline bool IntentNeedsPartnerInGroup(ChannelIntent intent)
+{
+    return intent == ChannelIntent::Follow || intent == ChannelIntent::Formation || intent == ChannelIntent::SaveMana;
+}
+
 // Call with freshly resolved facts for an already admitted command. Activation, request lifetime, replay and rate
 // checks belong to the channel and world executor. The resulting order carries values for this attempt only.
 // J5e: `why`, when given, receives the reason of a refusal.
@@ -216,12 +241,18 @@ inline std::optional<IntentOrder> MapIntent(ChannelCommand const& command, Inten
             *why = reason;
         return std::nullopt;
     };
+    // The partner and the bot are the registered scope's; Receive matched the issuer, so a mismatch is a defect.
     if (!current.controllerGuid || !current.botGuid || current.controllerGuid == current.botGuid ||
         current.controllerGuid != command.issuerGuid || current.botGuid != command.botGuid)
-        return refuse(CommandRefusal::NotLeader);
-    if (!current.expectedGroupGuid || current.controllerGroupGuid != current.expectedGroupGuid ||
-        current.botGroupGuid != current.expectedGroupGuid)
-        return refuse(CommandRefusal::NotInGroup);
+        return refuse(CommandRefusal::CannotNow);
+    // DS.14: no leader or master gate. The bot's group must still be the captured one (0: ungrouped then and now).
+    if (current.botGroupGuid != current.expectedGroupGuid)
+        return refuse(CommandRefusal::CannotNow);
+    if (IntentNeedsGroup(command.intent) &&
+        (!current.expectedGroupGuid ||
+         (IntentNeedsPartnerInGroup(command.intent) && current.controllerGroupGuid != current.expectedGroupGuid)))
+        return refuse(command.intent == ChannelIntent::Follow ? CommandRefusal::NotWithYou
+                                                              : CommandRefusal::NotInGroup);
     if (!ValidIntentParams(command.intent, command.params))
         return refuse(CommandRefusal::CannotNow);
 

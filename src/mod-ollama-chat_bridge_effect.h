@@ -79,9 +79,9 @@ inline uint64_t EffectTargetGuid(ChannelCommand const& command, uint64_t ownTarg
     return mark ? mark->guid : 0;
 }
 
-// A supported verb mapped from freshly resolved facts with the captured group; otherwise none. An attack, a mark or a
-// focus heal needs a nonzero target, a target-less verb must carry none; a position carries its checked destination,
-// a formation its shape and save_mana its flag.
+// A supported verb mapped from freshly resolved facts with the captured group (0: an ungrouped bot; MapIntent says
+// which verbs need one); otherwise none. An attack, a mark or a focus heal needs a nonzero target, a target-less verb
+// must carry none; a position carries its checked destination, a formation its shape and save_mana its flag.
 inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command, IntentContext const& current,
                                                    CommandRefusal* why = nullptr)
 {
@@ -114,7 +114,7 @@ inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command
         order.enabled = *enabled;
     bool const targeted = order.intent == ChannelIntent::AttackOwnTarget || order.intent == ChannelIntent::Mark ||
                           order.intent == ChannelIntent::FocusHealing;
-    if (!order.groupGuid || (targeted ? !order.targetGuid : order.targetGuid != 0))
+    if (targeted ? !order.targetGuid : order.targetGuid != 0)
         return std::nullopt;
     return order;
 }

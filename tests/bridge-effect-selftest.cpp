@@ -201,6 +201,7 @@ struct Env
     WorldTicket ticket;
     DispatchGuard guard;
     unsigned authorizeCalls = 0;
+    CommandRefusal why = CommandRefusal::None;  // The last Run's refusal reason.
 
     Env()
     {
@@ -239,7 +240,7 @@ struct Env
 
     EffectResult Run(ChannelCommand const& command)
     {
-        CommandRefusal why = CommandRefusal::None;
+        why = CommandRefusal::None;
         return BridgeCommandExecutor::Effect(phase, ticket, guard, command, Authorize(), why);
     }
 };
@@ -387,43 +388,87 @@ void Gates()
         Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Rejected && ownMarkNotes == 0,
               "a mark refused before playerbots re-baselines nothing");
     }
-    for (int which = 0; which < 4; ++which)
+    for (int which = 0; which < 3; ++which)
     {
         Env env;
         if (which == 0)
             ObjectAccessor::Players().erase(kBot);
         else if (which == 1)
             ObjectAccessor::Players().erase(kController);
-        else if (which == 2)
-            env.bot.inWorld = false;
         else
-            env.controller.inWorld = false;
-        Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0,
-              "missing or out-of-world bot/controller is rejected");
+            env.bot.inWorld = false;
+        Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 &&
+                  env.why == CommandRefusal::Unavailable,
+              "a missing or out-of-world bot, or an offline partner, is rejected");
+    }
+    {
+        // DS.14: the partner need only be online; playerbots checks what each verb needs of it.
+        Env env;
+        env.controller.inWorld = false;
+        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied && PlayerbotBridge::pb.executes == 1,
+              "a connected partner out of the world still gets the bot's own act");
     }
 }
 
 void Facts()
 {
-    // Group facts: controller group, bot group and the captured group must all agree and be nonzero.
-    for (int which = 0; which < 5; ++which)
+    // DS.14 group facts: the bot's group must still be the captured one (0: ungrouped then and now); the partner's
+    // group matters only to the verbs that need the partner in the bot's group.
+    for (int which = 0; which < 3; ++which)
     {
         Env env;
         if (which == 0)
-            env.controllerGroup.guid = kGroup + 1;
-        else if (which == 1)
             env.botGroup.guid = kGroup + 1;
-        else if (which == 2)
+        else if (which == 1)
             env.guard.groupGuid = kGroup + 1;
-        else if (which == 3)
-            env.bot.group = nullptr;
         else
+            env.bot.group = nullptr;
+        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 &&
+                  env.why == CommandRefusal::CannotNow,
+              "a bot whose group changed since the capture is rejected");
+    }
+    for (Verb const& verb : kVerbs)
+    {
+        CommandRefusal const groupWhy =
+            verb.intent == ChannelIntent::Follow ? CommandRefusal::NotWithYou : CommandRefusal::NotInGroup;
+        bool const needsPartner = verb.intent == ChannelIntent::Follow || verb.intent == ChannelIntent::Formation ||
+                                  verb.intent == ChannelIntent::SaveMana;
+        bool const needsGroup =
+            needsPartner || verb.intent == ChannelIntent::Mark || verb.intent == ChannelIntent::FocusHealing;
+        for (int which = 0; which < 2; ++which)
         {
-            env.guard.groupGuid = 0;
-            env.bot.group = env.controller.group = nullptr;
+            Env env;
+            PlayerbotBridge::pb.reachable = true;
+            if (which == 0)
+                env.controllerGroup.guid = kGroup + 1;  // The partner is in another group.
+            else
+                env.controller.group = nullptr;  // The partner is in none.
+            EffectResult const result = env.Run(ValidCmd(verb.intent));
+            Check(needsPartner
+                      ? result == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 && env.why == groupWhy
+                      : result == EffectResult::Applied && PlayerbotBridge::pb.order.Group == kGroup,
+                  "partner outside the bot's group: follow not_with_you, formation and save_mana not_in_group, the "
+                  "bot's own acts and its group's marks and heals applied in the bot's group");
         }
-        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0,
-              "group mismatch or no group is rejected");
+        Env env;
+        PlayerbotBridge::pb.reachable = true;
+        env.guard.groupGuid = 0;
+        env.bot.group = nullptr;
+        EffectResult const result = env.Run(ValidCmd(verb.intent));
+        Check(needsGroup ? result == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 && env.why == groupWhy
+                         : result == EffectResult::Applied && PlayerbotBridge::pb.order.Group == 0,
+              "ungrouped bot: follow not_with_you, other group verbs not_in_group, its own acts applied with group 0");
+    }
+    {
+        // DS.14: an ungrouped bot's stay reaches playerbots with group 0 and the ledger keeps it as a plan.
+        Env env;
+        env.guard.groupGuid = 0;
+        env.bot.group = env.controller.group = nullptr;
+        BridgePlans& plans = BridgeCommandExecutor::Plans();
+        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied && PlayerbotBridge::pb.order.Group == 0 &&
+                  plans.Size() == 1 && plans.LiveBots().size() == 1 && plans.LiveBots()[0].owner.groupGuid == 0 &&
+                  plans.LiveBots()[0].owner.controllerGuid == kController,
+              "an ungrouped stay is applied with group 0 and recorded as the partner's plan");
     }
     {
         // The captured group, not a re-read one, is what playerbots is given.
@@ -472,7 +517,7 @@ void Facts()
                   PlayerbotBridge::pb.order.Target == kTarget,
               "mark ignores the bot's own target");
     }
-    // Target visibility must hold for the bot and for the controller, in each respect.
+    // DS.14: target visibility must hold for the bot, in each respect; the partner's sight plays no part.
     for (ChannelIntent intent : {ChannelIntent::AttackOwnTarget, ChannelIntent::Mark})
         for (int observer = 0; observer < 2; ++observer)
             for (int respect = 0; respect < 6; ++respect)
@@ -493,13 +538,17 @@ void Facts()
                     ObjectAccessor::Units().erase(kTarget);
                 if (intent == ChannelIntent::AttackOwnTarget && respect == 5)
                     env.bot.target = kTarget;  // Guid stays; the unit cannot be resolved.
-                Check(env.Run(ValidCmd(intent)) == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0,
-                      "target not visible to both is rejected");
+                bool const partnerOnly = observer == 1 && respect < 4;
+                EffectResult const result = env.Run(ValidCmd(intent));
+                Check(partnerOnly ? result == EffectResult::Applied && PlayerbotBridge::pb.order.Target == kTarget
+                                  : result == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 &&
+                                        env.why == CommandRefusal::TargetNotVisible,
+                      "a target the bot does not see is rejected; one only the partner does not see is not");
             }
     {
         Env env;
         env.Run(ValidCmd(ChannelIntent::Mark));
-        Check(game.distanceCalls == 2 && game.lastDistance == g_SayDistance, "visibility uses g_SayDistance");
+        Check(game.distanceCalls == 1 && game.lastDistance == g_SayDistance, "visibility uses g_SayDistance");
         Env closed;
         g_SayDistance = 0.0f;
         Check(closed.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Rejected, "zero radius sees nothing");
@@ -714,37 +763,124 @@ void PlanTick()
         BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
         Check(pb.restores == 0 && plans.Size() == 1 && !plans.Empty(), "no tick work outside the post-map-join phase");
     }
-    for (int which = 0; which < 7; ++which)
+    // Review J6e-a B1: a stay or a focus heal admitted from a partner outside the grouped bot's group needed no partner
+    // in that group, so it holds across world ticks; the partner logging out restores it.
+    for (auto const intent : {ChannelIntent::Stay, ChannelIntent::FocusHealing})
+    {
+        for (int which = 0; which < 2; ++which)
+        {
+            Env env;
+            PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 4;
+            if (which == 0)
+                env.controllerGroup.guid = kGroup + 1;  // The partner is in another group.
+            else
+                env.controller.group = nullptr;  // The partner is in none.
+            Check(env.Run(ValidCmd(intent)) == EffectResult::Applied && plans.Size() == 1,
+                  "a stay or a focus heal from a partner outside the bot's group is applied and recorded");
+            auto const held = [intent]
+            {
+                return intent == ChannelIntent::Stay
+                           ? Movement() == 2
+                           : PlayerbotBridge::pb.state[kBot][Part::FocusHeal].FocusHealStrategy;
+            };
+            for (int64_t tick = 1; tick <= 3; ++tick)
+                BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + tick);
+            Check(pb.restores == 0 && plans.Size() == 1 && plans.Counters().regrouped == 0 && held(),
+                  "it holds across world ticks while the partner stays online outside the bot's group");
+            ObjectAccessor::Players().erase(kController);
+            BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 4);
+            Check(pb.restores == 1 && plans.Empty() && plans.Counters().regrouped == 1 && !held(),
+                  "the partner logging out restores it");
+        }
+    }
+    // Review J6e-a B1: a group change or the partner logging out ends every plan at once; the partner leaving the bot's
+    // group ends only a plan whose admission needed the partner in it (a follow), never a stay.
+    for (bool const follow : {false, true})
+    {
+        for (int which = 0; which < 5; ++which)
+        {
+            Env env;
+            PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 4;
+            Check(env.Run(ValidCmd(follow ? ChannelIntent::Follow : ChannelIntent::Stay)) == EffectResult::Applied,
+                  "follow or stay plan applied");
+            if (which == 0)
+                env.botGroup.guid = 99;  // The bot's group changed.
+            else if (which == 1)
+                env.bot.group = nullptr;  // The bot left its group.
+            else if (which == 2)
+                ObjectAccessor::Players().erase(kController);  // The partner logged out.
+            else if (which == 3)
+                env.controllerGroup.guid = 77;  // The partner is in another group.
+            else
+                env.controller.group = nullptr;  // The partner left the bot's group.
+            BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
+            bool const kept = !follow && which >= 3;
+            Check(kept ? pb.restores == 0 && plans.Size() == 1 && Movement() == 2
+                       : pb.restores == 1 && Movement() == 4 && plans.Empty() && plans.Counters().regrouped == 1,
+                  "a group change or the partner logging out restores at once; the partner leaving the bot's group "
+                  "restores a follow, never a stay");
+        }
+    }
+    // DS.14: who leads the bot plays no part; the plan holds while its partner stays in the bot's group.
+    for (int which = 0; which < 5; ++which)
     {
         Env env;
         ApplyStay(env);
         if (which == 0)
-            env.botGroup.guid = 99;  // The bot's group changed.
-        else if (which == 1)
-            env.bot.group = nullptr;  // The bot left its group.
-        else if (which == 2)
             env.botAI.master = &env.stranger;  // Another master.
-        else if (which == 3)
-            ObjectAccessor::Players().erase(kController);  // The controller logged out.
-        else if (which == 4)
-            env.controllerGroup.guid = 77;  // The controller is in another group.
-        else if (which == 5)
+        else if (which == 1)
+            env.botAI.master = nullptr;  // Masterless, led by the partner.
+        else if (which == 2)
         {
-            env.botAI.master = nullptr;  // Masterless, and someone else leads.
-            env.botGroup.leader = kStranger;
+            env.botAI.master = &env.stranger;  // The partner is neither master nor leader.
+            env.botGroup.leader = env.controllerGroup.leader = kStranger;
         }
+        else if (which == 3)
+            env.bot.ai = nullptr;  // No playerbots AI to ask.
         else
-            env.bot.ai = nullptr;  // No longer a bot.
+            env.controller.inWorld = false;  // Connected, between maps.
         BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
-        Check(pb.restores == 1 && Movement() == 4 && plans.Empty() && plans.Counters().regrouped == 1,
-              "a group change or lost controller authority restores at once");
+        Check(pb.restores == 0 && plans.Size() == 1 && Movement() == 2,
+              "the plan holds while its partner stays in the bot's group, whoever leads the bot");
     }
+    // DS.14: an ungrouped bot's plan holds while its partner is online and the bot stays ungrouped.
+    for (int which = 0; which < 4; ++which)
     {
         Env env;
+        env.guard.groupGuid = 0;
+        env.bot.group = env.controller.group = nullptr;
         ApplyStay(env);
-        env.botAI.master = nullptr;
+        bool kept = true;
+        if (which == 1)
+            env.controller.group = &env.controllerGroup;  // The partner joins a group of their own.
+        else if (which == 2)
+        {
+            ObjectAccessor::Players().erase(kController);  // The partner logged out.
+            kept = false;
+        }
+        else if (which == 3)
+        {
+            env.bot.group = &env.botGroup;  // The bot joined a group.
+            kept = false;
+        }
         BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
-        Check(pb.restores == 0 && plans.Size() == 1, "the controller leading a masterless bot keeps its plan");
+        Check(kept ? pb.restores == 0 && plans.Size() == 1 && Movement() == 2
+                   : pb.restores == 1 && Movement() == 4 && plans.Empty() && plans.Counters().regrouped == 1,
+              "an ungrouped plan holds while the bot stays alone and the partner online; it is restored when the "
+              "partner logs out or the bot joins a group");
+    }
+    // The partner rule is per plan: the partner leaving the bot's group ends its save_mana plan and keeps its stay.
+    {
+        Env env;
+        PlayerbotBridge::pb.state[kBot][Part::ManaSave].ManaSaveLevel = 1.0;
+        ApplyStay(env);
+        Check(env.Run(ValidCmd(ChannelIntent::SaveMana)) == EffectResult::Applied && plans.Size() == 2,
+              "a stay and a save_mana plan from the partner in the bot's group");
+        env.controller.group = nullptr;
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
+        Check(pb.restores == 1 && pb.state.at(kBot).at(Part::ManaSave).ManaSaveLevel == 1.0 && Movement() == 2 &&
+                  plans.Size() == 1 && plans.LiveApplied(MovementKey()) && plans.Counters().regrouped == 1,
+              "the partner leaving the bot's group restores save_mana and keeps the stay");
     }
     {
         Env env;
@@ -841,6 +977,41 @@ void ResultMapping()
             Check(ownMarkNotes == (mayHaveMarked ? 1u : 0u) && (!mayHaveMarked || ownMarkBot == kBot),
                   "only a mark that applied or may have applied re-baselines the marking bot's own marks");
         }
+
+    // DS.14: playerbots' reason for a refusal, in the bot's own words; no reason leaves the channel's cannot_now.
+    struct Reason
+    {
+        PlayerbotBridge::Refusal in;
+        CommandRefusal out;
+    };
+    Reason const reasons[] = {{PlayerbotBridge::Refusal::None, CommandRefusal::None},
+                              {PlayerbotBridge::Refusal::Dead, CommandRefusal::Dead},
+                              {PlayerbotBridge::Refusal::Battleground, CommandRefusal::Battleground},
+                              {PlayerbotBridge::Refusal::Travelling, CommandRefusal::Travelling},
+                              {PlayerbotBridge::Refusal::NotWithYou, CommandRefusal::NotWithYou},
+                              {PlayerbotBridge::Refusal::TooFar, CommandRefusal::TooFar},
+                              {PlayerbotBridge::Refusal::NotInGroup, CommandRefusal::NotInGroup},
+                              {PlayerbotBridge::Refusal::Unreachable, CommandRefusal::Unreachable},
+                              {PlayerbotBridge::Refusal::TargetNotVisible, CommandRefusal::TargetNotVisible},
+                              {PlayerbotBridge::Refusal::NoTarget, CommandRefusal::NoTarget},
+                              {PlayerbotBridge::Refusal::CannotNow, CommandRefusal::CannotNow},
+                              {static_cast<PlayerbotBridge::Refusal>(99), CommandRefusal::None}};
+    for (Reason const& reason : reasons)
+    {
+        {
+            Env env;
+            PlayerbotBridge::pb.result = PlayerbotBridge::Result::Rejected;
+            PlayerbotBridge::pb.refusal = reason.in;
+            Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Rejected && env.why == reason.out,
+                  "each playerbots refusal reason maps to its own words; none or an unknown one stays unworded");
+        }
+        {
+            Env env;
+            PlayerbotBridge::pb.refusal = reason.in;
+            Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Applied && env.why == CommandRefusal::None,
+                  "a reason is read only from a refusal");
+        }
+    }
 }
 }  // namespace
 

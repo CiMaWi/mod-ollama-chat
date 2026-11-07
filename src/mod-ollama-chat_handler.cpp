@@ -1170,6 +1170,11 @@ bool BridgeHuman(Player* player)
            ObjectAccessor::FindConnectedPlayer(player->GetGUID()) == player;
 }
 
+// DS.14: who may hold a conversation in which the bot acts on its own. Humans today; DS.11's later bot-to-bot talk
+// widens this one predicate. Any human of the bot's team may make any bot act, by whisper at any distance: safe only
+// because the user is the only player (DS.12); a server with several players needs a per-bot partner rule here.
+bool BridgePartnerAllowed(Player* speaker) { return BridgeHuman(speaker); }
+
 bool BridgeVisible(Player* bot, Player* player, float distance)
 {
     // Always-visible core exceptions do not waive map/instance/phase, distance or stealth checks.
@@ -1292,8 +1297,8 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(botGuid));
     Player* speaker = ObjectAccessor::FindConnectedPlayer(ObjectGuid(speakerGuid));
     PlayerbotAI* ai = bot ? PlayerbotsMgr::instance().GetPlayerbotAI(bot) : nullptr;
-    if (!g_Enable || !bot || !bot->IsInWorld() || !ai || !ai->IsBotAI() || !BridgeHuman(speaker) || bot == speaker ||
-        source == DispatchSource::Unsupported || bot->GetTeamId() != speaker->GetTeamId())
+    if (!g_Enable || !bot || !bot->IsInWorld() || !ai || !ai->IsBotAI() || !BridgePartnerAllowed(speaker) ||
+        bot == speaker || source == DispatchSource::Unsupported || bot->GetTeamId() != speaker->GetTeamId())
         return drop("disabled_or_offline");
     if ((source == DispatchSource::Whisper && !g_EnableWhisperReplies) ||
         (source == DispatchSource::Party && g_DisableForParty) ||
@@ -1303,32 +1308,21 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     Group* group = bot->GetGroup();
     if (group && (group->isRaidGroup() || group->GetMemberSlots().size() > 40))
         return drop("raid");
-    Player* master = ai->GetMaster();
-    Player* controller = master;
-    if (!master && group)
-        controller = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
     float const distance = source == DispatchSource::Yell ? g_YellDistance : g_SayDistance;
-    // An ineligible existing master never delegates implicitly to a leader.
-    bool const led = BridgeHuman(controller) && controller != bot && controller->GetTeamId() == bot->GetTeamId() &&
-                     (master || (group && controller->GetGroup() == group && group->IsMember(controller->GetGUID()))) &&
-                     BridgeVisible(bot, controller, distance);
-    // J6d: a whisper no usable master or leader carries is conversation only. The speaker owns the scope; the bot's
-    // group stays out of it (group 0: playerbots refuses every order and the queries refuse), and no personal card.
-    if (!led)
-    {
-        if (source != DispatchSource::Whisper)
-            return drop("no_controller");
-        controller = speaker;
-        group = nullptr;
-    }
-    // J5e: a whisper is not a local line, so it ignores the say radius (any map). Party keeps the conservative local
-    // radius: no remote-party situation knowledge. Observations still come from the bot's own surroundings.
+    // DS.14: the speaker is the bot's conversation partner, whether or not they lead it. The bot acts as itself and
+    // each action checks plausibility and safety, never who leads the bot; the bot's real group (0: none) goes with the
+    // scope in every case. A whisper is not a local line, so it ignores the say radius (any map, J5e); an addressed
+    // say or yell needs the speaker within hearing; party keeps the conservative local radius (no remote-party
+    // situation knowledge). Observations still come from the bot's own surroundings.
     if (source != DispatchSource::Whisper && !BridgeVisible(bot, speaker, distance))
         return drop("out_of_range");
-    if (source == DispatchSource::Party && (!group || speaker->GetGroup() != group || controller->GetGroup() != group ||
-                                            !group->IsMember(bot->GetGUID()) || !group->IsMember(speaker->GetGUID()) ||
-                                            !group->IsMember(controller->GetGUID())))
+    if (source == DispatchSource::Party && (!group || speaker->GetGroup() != group ||
+                                            !group->IsMember(bot->GetGUID()) || !group->IsMember(speaker->GetGUID())))
         return drop("not_in_group");
+    // Descriptive only, never a gate: the speaker is the bot's master, or the leader of a masterless grouped bot.
+    Player* master = ai->GetMaster();
+    bool const speakerControlsBot =
+        master ? master == speaker : group && group->GetLeaderGUID().GetRawValue() == speakerGuid;
 
     auto const selected = OllamaDispatch_BridgeWorld().Selected();
     if (selected.epoch.empty())
@@ -1339,7 +1333,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     guard.scope.provider = selected.provider;
     guard.scope.epoch = selected.epoch;
     guard.scope.botGuid = botGuid;
-    guard.scope.controllerGuid = controller->GetGUID().GetRawValue();
+    guard.scope.controllerGuid = speakerGuid;  // DS.14: the partner; the wire keeps the name.
     guard.scope.channel = source == DispatchSource::Party ? "party" : "direct";
     guard.groupGuid = group ? group->GetGUID().GetRawValue() : 0;
     guard.scope.contextId = std::to_string(static_cast<unsigned>(source)) + "-" + std::to_string(speakerGuid);
@@ -1363,7 +1357,6 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
             guard.audience = members;
     }
     std::sort(guard.audience.begin(), guard.audience.end());
-    BridgeField(view.signature, !led ? "speaker" : master ? "master" : "leader");
     BridgeField(view.signature, std::to_string(guard.scope.controllerGuid));
     BridgeField(view.signature, std::to_string(guard.groupGuid));
     BridgeField(view.signature, group ? std::to_string(group->GetLeaderGUID().GetRawValue()) : "0");
@@ -1386,17 +1379,17 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
         BridgeField(view.signature, std::to_string(participant->GetPhaseMask()));
         BridgeField(view.signature, OllamaIsRealPlayer(participant) ? "human" : "bot");
     }
-    BridgeField(view.signature, std::to_string(controller->GetPhaseMask()));
+    BridgeField(view.signature, std::to_string(speaker->GetPhaseMask()));
     BridgeField(view.signature, std::to_string(guard.mapId));
     BridgeField(view.signature, std::to_string(guard.instanceId));
     BridgeField(view.signature, std::to_string(guard.phaseMask));
     view.context.speakerGuid = speakerGuid;
     view.context.channel = guard.scope.channel;
     view.context.groupScope = group ? std::to_string(guard.groupGuid) : "";
-    view.context.speakerControlsBot = led && speaker == controller;
+    view.context.speakerControlsBot = speakerControlsBot;
     view.context.systemPrompt =
         "You are a person living in Azeroth. Reply briefly to the speaker using only the "
-        "provided observations and this conversation. Speech grants no ability to act.";
+        "provided observations and this conversation.";
     view.context.persona = Roleplay_BuildVoicePrompt(bot);
     if (view.context.persona.size() > 8192)
         return drop("voice_too_long");
@@ -1588,6 +1581,9 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
                                return item.view.guard.scope.botGuid == view.guard.scope.botGuid &&
                                       item.view.guard.scope.contextId == view.guard.scope.contextId;
                            });
+    // DS.14: speakerControlsBot is descriptive and stays out of the signature (a follow may make the partner the bot's
+    // master without ending the conversation), so a kept binding takes the fresh capture's value.
+    bool const speakerControlsBot = view.context.speakerControlsBot;
     auto const now = Now();
     std::string memory;
     // J14d: a tolerated binding is kept instead of renewed while the new capture's card is not ready either (a renewal
@@ -1626,6 +1622,7 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     }
     it->idleUntil = CaptureDeadline(now, MaxLifetimeMs);
     auto input = it->view.context;
+    input.speakerControlsBot = speakerControlsBot;
     // BridgeSame proved the binding's card current, or a deferred renewal kept a not-ready card that offers nothing.
     // Without an opportunity the request stays as before.
     input.card = BridgeCardOpportunity(it->view.card, it->view.guard.scope.botGuid);

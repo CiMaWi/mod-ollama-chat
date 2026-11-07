@@ -4,8 +4,6 @@
 #include "Group.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
-#include "PlayerbotAI.h"
-#include "PlayerbotMgr.h"
 #include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_config.h"
 #include "mod-ollama-chat_dispatch.h"
@@ -15,7 +13,7 @@
 // GUID, keeps no pointer, phase or callback past the call and hands one typed order to the playerbots boundary,
 // which calls authorize once immediately before its single mutation. Lasting verbs (J12) also go through the plan
 // ledger: admission and the bot's state before the change first, the ledger record after the attempt, and the world
-// tick restores that state on expiry, group or controller change and retirement.
+// tick restores that state on expiry, a group change, the partner's loss and retirement.
 namespace OllamaBridge
 {
 namespace
@@ -49,8 +47,8 @@ public:
     }
 
     // World tick, post-map-join: expiry, then each bot with live plans (logged out: dropped unrestored; another group,
-    // or its plans' controller no longer holds bridge authority: restore-pending), then every due restore. Nothing
-    // is read or allocated while the ledger is empty.
+    // its plans' partner offline, or out of the bot's group for a plan that needed it there: restore-pending), then
+    // every due restore. Nothing is read or allocated while the ledger is empty.
     static void UpdatePlans(EffectPhase const& phase, int64_t nowMs)
     {
         BridgePlans& plans = Plans();
@@ -66,7 +64,8 @@ public:
                 continue;
             }
             uint64_t const group = GroupGuid(bot);
-            plans.Observe(live.botGuid, group, ControllerHolds(bot, group, live.owner.controllerGuid));
+            Player* partner = ObjectAccessor::FindConnectedPlayer(ObjectGuid(live.owner.controllerGuid));
+            plans.Observe(live.botGuid, group, partner != nullptr, PartnerInGroup(partner, group));
         }
         for (PlanRestore<PlayerbotBridge::Baseline> const& restore : plans.Pending(nowMs))
         {
@@ -101,18 +100,13 @@ private:
         return group ? group->GetGUID().GetRawValue() : 0;
     }
 
-    // The bridge controller authority BridgeCapture and playerbots' admission use, not mere group membership: the
-    // connected controller is in the bot's group and is the bot's master, or the leader of a masterless bot.
-    static bool ControllerHolds(Player* bot, uint64_t groupGuid, uint64_t controllerGuid)
+    // DS.14: whether the partner is in the bot's group (groupGuid, the bot's current one; never for an ungrouped bot).
+    // A plan holds while its partner is online and the bot's group is unchanged; only a plan whose admission needed
+    // the partner in the group (follow, formation, save_mana) also ends when the partner leaves it, so a stay or a
+    // focus heal from a partner outside the group holds. Never a master or leader rule.
+    static bool PartnerInGroup(Player* partner, uint64_t groupGuid)
     {
-        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-        Player* controller = ObjectAccessor::FindConnectedPlayer(ObjectGuid(controllerGuid));
-        if (!ai || !controller || !groupGuid || GroupGuid(controller) != groupGuid)
-            return false;
-        if (Player* master = ai->GetMaster())
-            return master == controller;
-        Group* group = bot->GetGroup();
-        return group && group->GetLeaderGUID().GetRawValue() == controllerGuid;
+        return partner && groupGuid && GroupGuid(partner) == groupGuid;
     }
 
     static PlayerbotBridge::FormationShape Shape(std::optional<ChannelShape> shape)
@@ -131,6 +125,38 @@ private:
         return PlayerbotBridge::FormationShape::None;  // Playerbots refuses a formation without a shape.
     }
 
+    // DS.14: playerbots' reason for a Rejected order, in the bot's own words. None (no reason given) is worded
+    // cannot_now by the channel.
+    static CommandRefusal OrderRefusal(PlayerbotBridge::Refusal reason)
+    {
+        switch (reason)
+        {
+            case PlayerbotBridge::Refusal::Dead:
+                return CommandRefusal::Dead;
+            case PlayerbotBridge::Refusal::Battleground:
+                return CommandRefusal::Battleground;
+            case PlayerbotBridge::Refusal::Travelling:
+                return CommandRefusal::Travelling;
+            case PlayerbotBridge::Refusal::NotWithYou:
+                return CommandRefusal::NotWithYou;
+            case PlayerbotBridge::Refusal::TooFar:
+                return CommandRefusal::TooFar;
+            case PlayerbotBridge::Refusal::NotInGroup:
+                return CommandRefusal::NotInGroup;
+            case PlayerbotBridge::Refusal::Unreachable:
+                return CommandRefusal::Unreachable;
+            case PlayerbotBridge::Refusal::TargetNotVisible:
+                return CommandRefusal::TargetNotVisible;
+            case PlayerbotBridge::Refusal::NoTarget:
+                return CommandRefusal::NoTarget;
+            case PlayerbotBridge::Refusal::CannotNow:
+                return CommandRefusal::CannotNow;
+            case PlayerbotBridge::Refusal::None:
+                break;
+        }
+        return CommandRefusal::None;
+    }
+
     // J5e: `why` receives the reason of every refusal; the channel words a Rejected without one as cannot_now.
     static EffectResult Effect(EffectPhase const& phase, WorldTicket const& ticket, DispatchGuard const& guard,
                                ChannelCommand const& command, std::function<bool()> const& authorize,
@@ -142,10 +168,11 @@ private:
             why = EffectSupported(command.intent) ? CommandRefusal::Unavailable : CommandRefusal::NotSupported;
             return EffectResult::Rejected;
         }
-        // Bot and controller come from the registered scope, never from the wire; Receive matched the issuer.
+        // Bot and partner come from the registered scope, never from the wire; Receive matched the issuer. DS.14: the
+        // partner needs only to be online here; playerbots checks what each verb needs of it (follow: the bot's map).
         Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.botGuid));
-        Player* controller = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.controllerGuid));
-        if (!bot || !bot->IsInWorld() || !controller || !controller->IsInWorld())
+        Player* partner = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.controllerGuid));
+        if (!bot || !bot->IsInWorld() || !partner)
         {
             why = CommandRefusal::Unavailable;
             return EffectResult::Rejected;
@@ -156,13 +183,13 @@ private:
         facts.controllerGuid = ticket.scope.controllerGuid;
         facts.botGuid = ticket.scope.botGuid;
         facts.expectedGroupGuid = guard.groupGuid;
-        facts.controllerGroupGuid = GroupGuid(controller);
+        facts.controllerGroupGuid = GroupGuid(partner);
         facts.botGroupGuid = GroupGuid(bot);
         if (command.intent == ChannelIntent::AttackOwnTarget)
             facts.ownTargetGuid = bot->GetTarget().GetRawValue();
-        // A position becomes a fact only where playerbots finds a short complete path near the bot and the controller
-        // (one read-only path query). MapIntent then requires the wire position to equal it exactly, and playerbots
-        // checks it again after authorization.
+        // A position becomes a fact only where playerbots finds a short complete path from the bot to a spot near it
+        // (one read-only path query; the partner plays no part). MapIntent then requires the wire position to equal it
+        // exactly, and playerbots checks it again after authorization.
         if (auto const* candidate =
                 command.intent == ChannelIntent::Position ? std::get_if<ChannelPosition>(&command.params) : nullptr)
         {
@@ -181,7 +208,8 @@ private:
         if (uint64_t const candidate = EffectTargetGuid(command, facts.ownTargetGuid))
         {
             Unit* unit = ObjectAccessor::GetUnit(*bot, ObjectGuid(candidate));
-            if (VisibleUnit(bot, unit, distance) && VisibleUnit(controller, unit, distance))
+            // DS.14: the bot acts on its own perception; the partner need not see the target.
+            if (VisibleUnit(bot, unit, distance))
                 facts.eligibleVisibleTargetGuid = candidate;
         }
         auto const effect = BuildEffectOrder(command, facts, &why);
@@ -239,7 +267,8 @@ private:
         // admission or no capture, no mutation. One clock reading serves admission and record.
         auto const kind = PlanKindFor(effect->intent);
         PlanKey const key{effect->botGuid, kind.value_or(PlanKind::Count)};
-        PlanOwner const owner{effect->groupGuid, effect->controllerGuid, ticket.generation};
+        PlanOwner const owner{effect->groupGuid, effect->controllerGuid, ticket.generation,
+                              IntentNeedsPartnerInGroup(effect->intent)};
         int64_t const nowMs = Now().steadyMs;
         PlayerbotBridge::Baseline before;
         if (kind && Plans().Admit(key, owner, nowMs) == PlanAdmission::Refused)
@@ -253,7 +282,8 @@ private:
             why = CommandRefusal::CannotNow;
             return EffectResult::Rejected;
         }
-        auto const outcome = PlayerbotBridge::Execute(phase.join, order, authorize);
+        PlayerbotBridge::Refusal refusal = PlayerbotBridge::Refusal::None;
+        auto const outcome = PlayerbotBridge::Execute(phase.join, order, authorize, &refusal);
         // After every attempt that may have written (Applied, or Failed after partial writes), the state now is what
         // the bridge set; Rejected and Unavailable promise no mutation and record nothing. An attempt left unrecorded
         // (the bot left the world inside the call, or the ledger refused; neither can happen today) has no restore,
@@ -274,6 +304,7 @@ private:
         switch (outcome)
         {
             case PlayerbotBridge::Result::Rejected:
+                why = OrderRefusal(refusal);
                 return EffectResult::Rejected;
             case PlayerbotBridge::Result::Unavailable:
                 return EffectResult::Unavailable;

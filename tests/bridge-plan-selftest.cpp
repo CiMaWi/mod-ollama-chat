@@ -43,7 +43,7 @@ PlanOwner Owner(uint64_t generation = Generation) { return {Group, Controller, g
 bool SameOwner(PlanOwner const& left, PlanOwner const& right)
 {
     return left.groupGuid == right.groupGuid && left.controllerGuid == right.controllerGuid &&
-           left.generation == right.generation;
+           left.generation == right.generation && left.partnerInGroup == right.partnerInGroup;
 }
 
 bool Apply(Ledger& ledger, PlanKey const& key, int before, int applied, int64_t now, PlanOwner const& owner = Owner())
@@ -78,8 +78,8 @@ void Refusal()
     Check(ledger.Admit(Key(static_cast<PlanKind>(200)), Owner(), Start) == PlanAdmission::Refused,
           "out-of-range kind refused");
     Check(ledger.Admit(Key(PlanKind::Formation, 0), Owner(), Start) == PlanAdmission::Refused, "zero bot refused");
-    Check(ledger.Admit(Key(PlanKind::Formation), {0, Controller, Generation}, Start) == PlanAdmission::Refused,
-          "zero group refused");
+    Check(ledger.Admit(Key(PlanKind::Formation), {0, Controller, Generation}, Start) == PlanAdmission::Capture,
+          "DS.14: zero group (an ungrouped bot's own plan) admitted");
     Check(ledger.Admit(Key(PlanKind::Formation), {Group, 0, Generation}, Start) == PlanAdmission::Refused,
           "zero controller refused");
     Check(ledger.Admit(Key(PlanKind::Formation), Owner(0), Start) == PlanAdmission::Refused, "zero generation refused");
@@ -121,7 +121,7 @@ void GroupChanges()
     Check(Apply(ledger, Key(PlanKind::Formation), 1, 2, Start), "apply formation");
     Check(Apply(ledger, Key(PlanKind::Movement), 3, 4, Start), "apply movement");
     Check(Apply(ledger, Key(PlanKind::SaveMana, OtherBot), 5, 6, Start, otherOwner), "apply other bot");
-    Check(ledger.Observe(Bot, Group, true) == 0, "same group and controller keeps plans");
+    Check(ledger.Observe(Bot, Group, true, true) == 0, "same group and controller keeps plans");
     Check(ledger.Pending(Start).empty(), "nothing pending while unchanged");
     auto const live = ledger.LiveBots();
     Check(live.size() == 2, "two live bots, listed once each");
@@ -130,10 +130,10 @@ void GroupChanges()
     Check(ledger.LiveApplied(Key(PlanKind::Movement)) == Snapshot{4}, "live entry exposes what the bridge set");
     Check(!ledger.LiveApplied(Key(PlanKind::SaveMana)), "no live value for a kind the bot has no plan of");
 
-    Check(ledger.Observe(Bot, 0, true) == 2, "bot left its group");
+    Check(ledger.Observe(Bot, 0, true, false) == 2, "bot left its group");
     Check(ledger.Pending(Start).size() == 2 && ledger.Counters().regrouped == 2, "both of the bot's plans pending");
     Check(!ledger.LiveApplied(Key(PlanKind::Movement)), "a pending entry has no live value");
-    Check(ledger.Observe(Bot, 0, true) == 0 && ledger.Counters().regrouped == 2, "pending entries move once");
+    Check(ledger.Observe(Bot, 0, true, false) == 0 && ledger.Counters().regrouped == 2, "pending entries move once");
     Check(ledger.LiveBots().size() == 1 && ledger.LiveBots()[0].botGuid == OtherBot,
           "pending bot leaves the live list");
     Check(ledger.Admit(Key(PlanKind::SaveMana), Owner(), Start) == PlanAdmission::Refused,
@@ -144,15 +144,15 @@ void GroupChanges()
     Ledger controllerLost;
     controllerLost.Open(Generation);
     Check(Apply(controllerLost, Key(PlanKind::FocusHealing), 1, 2, Start), "apply focus healing");
-    Check(controllerLost.Observe(Bot, Group, false) == 1, "controller left the group");
+    Check(controllerLost.Observe(Bot, Group, false, false) == 1, "the partner logged out");
     Check(controllerLost.Pending(Start).size() == 1, "controller loss makes the plan pending");
 
     Ledger regroup;
     regroup.Open(Generation);
     Check(Apply(regroup, Key(PlanKind::Movement), 1, 2, Start), "apply movement");
-    Check(regroup.Observe(Bot, OtherGroup, true) == 1, "group id changed");
+    Check(regroup.Observe(Bot, OtherGroup, true, true) == 1, "group id changed");
     Check(regroup.Pending(Start).size() == 1 && regroup.Counters().regrouped == 1, "new group makes the plan pending");
-    Check(regroup.Observe(OtherBot, 0, false) == 0, "unknown bot changes nothing");
+    Check(regroup.Observe(OtherBot, 0, false, false) == 0, "unknown bot changes nothing");
 
     // J5e: the live `group none` round counted regrouped 0 because its plans had lapsed by lifetime first. A plan one
     // millisecond short of its lifetime still moves on a group change or a controller loss; at the deadline it
@@ -160,21 +160,73 @@ void GroupChanges()
     Ledger young;
     young.Open(Generation);
     Check(Apply(young, Key(PlanKind::Movement), 1, 2, Start), "apply young movement");
-    Check(young.Expire(Start + PlanLifetimeMs - 1) == 0 && young.Observe(Bot, 0, true) == 1 &&
+    Check(young.Expire(Start + PlanLifetimeMs - 1) == 0 && young.Observe(Bot, 0, true, false) == 1 &&
               young.Counters().regrouped == 1 && young.Counters().expired == 0,
           "a plan younger than its lifetime counts regrouped on a group change");
     Ledger youngLost;
     youngLost.Open(Generation);
     Check(Apply(youngLost, Key(PlanKind::Formation), 1, 2, Start), "apply young formation");
-    Check(youngLost.Expire(Start + PlanLifetimeMs - 1) == 0 && youngLost.Observe(Bot, Group, false) == 1 &&
+    Check(youngLost.Expire(Start + PlanLifetimeMs - 1) == 0 && youngLost.Observe(Bot, Group, false, false) == 1 &&
               youngLost.Counters().regrouped == 1,
           "a plan younger than its lifetime counts regrouped on a controller loss");
     Ledger lapsed;
     lapsed.Open(Generation);
     Check(Apply(lapsed, Key(PlanKind::Movement), 1, 2, Start), "apply lapsing movement");
-    Check(lapsed.Expire(Start + PlanLifetimeMs) == 1 && lapsed.Observe(Bot, 0, true) == 0 &&
+    Check(lapsed.Expire(Start + PlanLifetimeMs) == 1 && lapsed.Observe(Bot, 0, true, false) == 0 &&
               lapsed.Counters().regrouped == 0 && lapsed.Counters().expired == 1,
           "a lapsed plan counts expired, and the later group change counts nothing");
+
+    // DS.14: an ungrouped bot's plan (owner group 0) holds while the bot stays ungrouped and its partner is online;
+    // the partner's loss or the bot joining a group makes it pending.
+    PlanOwner const alone{0, Controller, Generation};
+    Ledger ungrouped;
+    ungrouped.Open(Generation);
+    Check(Apply(ungrouped, Key(PlanKind::Movement), 1, 2, Start, alone), "apply an ungrouped bot's stay");
+    Check(ungrouped.LiveBots().size() == 1 && SameOwner(ungrouped.LiveBots()[0].owner, alone),
+          "the ungrouped plan is live with owner group 0");
+    Check(ungrouped.Observe(Bot, 0, true, false) == 0 && ungrouped.Pending(Start).empty(),
+          "still ungrouped with the partner online keeps the plan");
+    Check(ungrouped.Admit(Key(PlanKind::Movement), alone, Start) == PlanAdmission::Renew,
+          "the partner renews an ungrouped plan");
+    Check(ungrouped.Observe(Bot, 0, false, false) == 1 && ungrouped.Pending(Start).size() == 1,
+          "the partner's loss makes an ungrouped plan pending");
+    Ledger joined;
+    joined.Open(Generation);
+    Check(Apply(joined, Key(PlanKind::Movement), 1, 2, Start, alone), "apply another ungrouped stay");
+    Check(joined.Observe(Bot, Group, true, true) == 1 && joined.Pending(Start).size() == 1,
+          "an ungrouped bot joining a group makes its plan pending");
+
+    // Review J6e-a B1: the partner leaving the bot's group ends only plans whose admission needed the partner in it
+    // (PlanOwner::partnerInGroup: follow, formation, save_mana); a stay or a focus heal holds on the bot's group.
+    PlanOwner const together{Group, Controller, Generation, true};
+    Ledger partnerRule;
+    partnerRule.Open(Generation);
+    Check(Apply(partnerRule, Key(PlanKind::Movement), 1, 2, Start) &&
+              Apply(partnerRule, Key(PlanKind::SaveMana), 3, 4, Start, together),
+          "a stay and a save_mana plan from one partner");
+    Check(partnerRule.Observe(Bot, Group, true, true) == 0, "the partner in the bot's group keeps both");
+    Check(partnerRule.Observe(Bot, Group, true, false) == 1 && partnerRule.Pending(Start).size() == 1 &&
+              partnerRule.Pending(Start)[0].key.kind == PlanKind::SaveMana &&
+              partnerRule.LiveApplied(Key(PlanKind::Movement)) == Snapshot{2},
+          "the partner leaving the bot's group ends the save_mana plan and keeps the stay");
+    Check(partnerRule.Observe(Bot, Group, true, false) == 0, "the stay keeps holding without the partner in the group");
+    Check(partnerRule.Observe(Bot, Group, false, false) == 1 && !partnerRule.LiveApplied(Key(PlanKind::Movement)),
+          "the partner logging out ends the stay too");
+    Ledger followThenStay;
+    followThenStay.Open(Generation);
+    Check(Apply(followThenStay, Key(PlanKind::Movement), 1, 2, Start, together) &&
+              Apply(followThenStay, Key(PlanKind::Movement), 2, 3, Start + 1),
+          "a follow renewed by a stay");
+    Check(followThenStay.Observe(Bot, Group, true, false) == 0 &&
+              followThenStay.LiveApplied(Key(PlanKind::Movement)) == Snapshot{3},
+          "a renewal takes the new order's partner rule: the stay holds without the partner in the group");
+    Ledger stayThenFollow;
+    stayThenFollow.Open(Generation);
+    Check(Apply(stayThenFollow, Key(PlanKind::Movement), 1, 2, Start) &&
+              Apply(stayThenFollow, Key(PlanKind::Movement), 2, 3, Start + 1, together),
+          "a stay renewed by a follow");
+    Check(stayThenFollow.Observe(Bot, Group, true, false) == 1,
+          "a stay renewed by a follow ends when the partner leaves the bot's group");
 }
 
 void StaleEpochs()

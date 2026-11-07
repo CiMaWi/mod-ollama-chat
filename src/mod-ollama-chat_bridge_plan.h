@@ -12,8 +12,8 @@
 
 // J12 lasting-plan ledger: pure bookkeeping, no game, playerbots, clock or transport types. It records, per bot and
 // plan kind, the restore target (the state before the bridge's first change, or a person's later change), the value
-// the bridge set last, the owner (group, controller, bridge generation) and the expiry, and turns expiry, group or
-// controller change and retirement into restore-pending entries the world tick restores. Value is the game side's
+// the bridge set last, the owner (group, partner, generation) and the expiry, and turns expiry, group or
+// partner change and retirement into restore-pending entries the world tick restores. Value is the game side's
 // state type for one plan kind; its operator== compares that kind's state. World-thread only; the steady clock in
 // milliseconds is passed in. Memory only: a restart forgets it. While Empty(), every per-tick call is O(1) and
 // allocates nothing; otherwise LiveBots() is O(entries x bots) and Pending() allocates, both bounded by
@@ -72,17 +72,20 @@ inline bool operator==(PlanKey const& left, PlanKey const& right)
 struct PlanOwner
 {
     uint64_t groupGuid = 0;
-    uint64_t controllerGuid = 0;
+    uint64_t controllerGuid = 0;  // DS.14: the conversation partner.
     uint64_t generation = 0;
+    // DS.14: the plan's admission needed the partner in the bot's group (follow, formation, save_mana), so
+    // it ends when the partner leaves that group; other plans (a stay, a focus heal) hold on the bot's group
+    // and the partner being online. Per plan, not per owner: Admit ignores it, a renewal takes the new rule.
+    bool partnerInGroup = false;
 };
 
 // Unknown kinds and zero guids fail closed.
 inline bool ValidPlanKey(PlanKey const& key) { return key.botGuid && key.kind < PlanKind::Count; }
 
-inline bool ValidPlanOwner(PlanOwner const& owner)
-{
-    return owner.groupGuid && owner.controllerGuid && owner.generation;
-}
+// DS.14: group 0 is an ungrouped bot's plan (a stay); it ends when its partner logs out, the bot joins a group, or at
+// expiry.
+inline bool ValidPlanOwner(PlanOwner const& owner) { return owner.controllerGuid && owner.generation; }
 
 enum class PlanAdmission : uint8_t
 {
@@ -97,7 +100,7 @@ struct PlanCounters
     uint64_t applied = 0;     // New entries, baseline captured.
     uint64_t renewed = 0;     // Repeats of a live entry.
     uint64_t expired = 0;     // Live -> restore-pending at the deadline (or on a clock rollback).
-    uint64_t regrouped = 0;   // Live -> restore-pending on a group or controller change.
+    uint64_t regrouped = 0;   // Live -> restore-pending on a group change or the partner's loss.
     uint64_t retired = 0;     // Live -> restore-pending on retirement or a generation change.
     uint64_t restored = 0;    // Pending entries the game side restored (or found superseded by a later change).
     uint64_t departed = 0;    // Entries dropped unrestored because the bot logged out.
@@ -195,6 +198,8 @@ public:
                         entry.applied = applied;
                         entry.appliedMs = nowMs;
                         entry.deadlineMs = nowMs + PlanLifetimeMs;
+                        // A follow renewed by a stay holds as a stay, and the other way round.
+                        entry.owner.partnerInGroup = owner.partnerInGroup;
                         ++_counters.renewed;
                         return true;
                     }
@@ -221,15 +226,17 @@ public:
         return moved;
     }
 
-    // The bot's current group (0 when ungrouped) and whether its plan controller is still in that group. A changed
-    // group or a lost controller makes the bot's live entries restore-pending.
-    std::size_t Observe(uint64_t botGuid, uint64_t groupGuid, bool controllerPresent)
+    // The bot's current group (0 when ungrouped), whether its plans' partner is online and whether the partner is in
+    // that group. A changed group or an offline partner makes the bot's live entries restore-pending; a partner
+    // outside the group does so only for entries whose admission needed the partner in it (PlanOwner).
+    std::size_t Observe(uint64_t botGuid, uint64_t groupGuid, bool partnerOnline, bool partnerInGroup)
     {
         std::size_t moved = 0;
         for (Entry& entry : _entries)
         {
             if (!entry.pending && entry.key.botGuid == botGuid &&
-                (entry.owner.groupGuid != groupGuid || !controllerPresent))
+                (entry.owner.groupGuid != groupGuid || !partnerOnline ||
+                 (entry.owner.partnerInGroup && !partnerInGroup)))
             {
                 entry.pending = true;
                 ++moved;

@@ -307,7 +307,15 @@ void EffectOrders()
     Check(!BuildEffectOrder(attack, moved) && !BuildEffectOrder(mark, moved), "a changed group builds no order");
     IntentContext ungrouped = facts;
     ungrouped.expectedGroupGuid = ungrouped.controllerGroupGuid = ungrouped.botGroupGuid = 0;
-    Check(!BuildEffectOrder(attack, ungrouped), "no captured group builds no order");
+    auto const alone = BuildEffectOrder(attack, ungrouped);
+    Check(alone && alone->groupGuid == 0 && alone->targetGuid == 44,
+          "DS.14: an ungrouped bot attacks its own target with no group");
+    Check(!BuildEffectOrder(mark, ungrouped), "DS.14: an ungrouped bot sets no group mark");
+    IntentContext outside = facts;
+    outside.controllerGroupGuid = 0;
+    auto const markedOutside = BuildEffectOrder(mark, outside);
+    Check(markedOutside && markedOutside->groupGuid == 33,
+          "DS.14: a partner outside the bot's group may still ask for a mark in the bot's group");
     ChannelCommand foreign = attack;
     foreign.issuerGuid = 23;
     Check(!BuildEffectOrder(foreign, facts), "another issuer builds no order");
@@ -331,8 +339,13 @@ void EffectOrders()
         auto const retargetedOrder = BuildEffectOrder(oneShot, retargeted);
         Check(unseenOrder && !unseenOrder->targetGuid && retargetedOrder && !retargetedOrder->targetGuid,
               "own or eligible target facts never enter a target-less order");
-        Check(!BuildEffectOrder(oneShot, moved) && !BuildEffectOrder(oneShot, ungrouped),
-              "a one-shot needs the captured group");
+        Check(!BuildEffectOrder(oneShot, moved), "a one-shot needs the bot's group unchanged since the capture");
+        auto const lone = BuildEffectOrder(oneShot, ungrouped);
+        Check(intent == ChannelIntent::Follow ? !lone : lone && lone->groupGuid == 0,
+              "DS.14: an ungrouped bot stays or flees on its own; it follows nobody");
+        auto const away = BuildEffectOrder(oneShot, outside);
+        Check(intent == ChannelIntent::Follow ? !away : away && away->groupGuid == 33,
+              "DS.14: a partner outside the bot's group gets a stay or a flee, not a follow");
         ChannelCommand other = oneShot;
         other.issuerGuid = 23;
         Check(!BuildEffectOrder(other, facts), "another issuer builds no one-shot");
@@ -373,8 +386,10 @@ void EffectOrders()
     pathableMoved.botGroupGuid = 34;
     IntentContext pathableUngrouped = pathable;
     pathableUngrouped.expectedGroupGuid = pathableUngrouped.controllerGroupGuid = pathableUngrouped.botGroupGuid = 0;
-    Check(!BuildEffectOrder(position, pathableMoved) && !BuildEffectOrder(position, pathableUngrouped),
-          "a position needs the captured group");
+    auto const movingAlone = BuildEffectOrder(position, pathableUngrouped);
+    Check(!BuildEffectOrder(position, pathableMoved) && movingAlone && movingAlone->groupGuid == 0 &&
+              movingAlone->position == spot,
+          "a position needs the bot's group unchanged; an ungrouped bot moves with no group");
     ChannelCommand stray = position;
     stray.issuerGuid = 23;
     Check(!BuildEffectOrder(stray, pathable), "another issuer builds no position");
