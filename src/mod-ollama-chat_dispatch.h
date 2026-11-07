@@ -149,6 +149,9 @@ void OllamaDispatch_Stop();
 // Explicit world-thread lifecycle notifications. Never called by native/CLI selection or queued callbacks.
 // Every publication retires old Bridge work, including bearer-only reloads. Legacy queues are untouched.
 void OllamaDispatch_BridgeConfigured(bool channelEnabled = false);
+// J5d, world thread on every config load: starts, keeps or stops the 127.0.0.1 channel listener. It runs only while
+// the channel is enabled for valid selected Bridge settings, and restarts only when the port or the token changed.
+void OllamaDispatch_BridgeListen(bool channelEnabled, uint32_t port);
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld();
 
 // Shared native-adapter boundary; every I/O operation authenticates the local game-link bearer.

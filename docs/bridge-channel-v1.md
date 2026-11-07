@@ -3,7 +3,9 @@
 `src/mod-ollama-chat_bridge_channel.{h,cpp}` is a production plain-value/state helper. It does not create a
 listener, acknowledge game activation, read game objects, queue work, execute commands or integrate native tools.
 The shared runtime installs bounded physical mailboxes, filtered query assembly and current-mark event production.
-J6 owns execution; J9C/X owns live proof. Native socket/tool adapters remain J11C/X work.
+J6 owns execution; J9C/X owns live proof. The transport is J5d's `src/mod-ollama-chat_bridge_listener.{h,cpp}`: a
+127.0.0.1 HTTP listener (`OllamaChat.Bridge.ChannelPort`) that authenticates the link token before reading a body,
+bounds bytes and hands each envelope to `Receive`/`Take` (wire: HUB `bridge/game/README.md`). J11C/X owns the tools.
 
 The semantic source is HUB `bridge/game/README.md`, `boundary.js` and `examples.json` (frozen J2 v1).
 `Receive` authenticates the local game-link bearer before checking body size or parsing JSON. Subscription
@@ -125,3 +127,7 @@ extracts the actual handler adapter, refresh and dispatcher channel bodies verba
 stand-ins. It covers the runtime query/event joins and final publication checks offline. It does not prove a full
 module build or live game delivery. The full J5 parent remains open pending independent review; native J11C/X
 adapters, J6 effects and live J9C/X delivery remain later work.
+
+`tests/bridge-listener-selftest.cpp` (J5d) links the real listener and its cpp-httplib against a counting fake mailbox
+and against the production `WorldChannel`, with the test thread playing the world tick: token, bind address,
+malformed and oversize input, thread handoff, deadline, shutdown and configuration. Live calls are J9C/X work.

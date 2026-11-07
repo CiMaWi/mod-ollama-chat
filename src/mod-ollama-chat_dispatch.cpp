@@ -1,5 +1,6 @@
 #include "mod-ollama-chat_dispatch.h"
 #include "mod-ollama-chat_api.h"
+#include "mod-ollama-chat_bridge_listener.h"
 #include "mod-ollama-chat_config.h"
 #include "mod-ollama-chat_expression.h"
 #include "mod-ollama-chat_governor.h"
@@ -688,6 +689,28 @@ OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, u
     return g_bridgeChannel.Take(bearer, receipt, packet);
 }
 
+namespace
+{
+// J5d transport on 127.0.0.1: its threads call only the I/O-safe Receive/Take above (C3). Defined after the
+// channel, so static destruction stops it first.
+OllamaBridge::ChannelListener g_bridgeListener(OllamaDispatch_ChannelReceive, OllamaDispatch_ChannelTake,
+                                               [](bool warning, std::string const& line)
+                                               {
+                                                   if (warning)
+                                                       LOG_WARN("module.ollamachat", "{}", line);
+                                                   else
+                                                       LOG_INFO("module.ollamachat", "{}", line);
+                                               });
+}  // namespace
+
+void OllamaDispatch_BridgeListen(bool channelEnabled, uint32_t port)
+{
+    OllamaEndpointSettings const settings = OllamaConfig_Snapshot();
+    bool const wanted = channelEnabled && g_Enable && settings.provider == OllamaProvider::Bridge &&
+                        OllamaBridge::ValidSettings(settings.bridge);
+    g_bridgeListener.Configure(wanted, port, wanted ? settings.bridge.token : std::string());
+}
+
 void OllamaDispatch_SetBridgeObserver(OllamaBridgeObserver observer)
 {
     // Rebinding cannot make work captured by a previous adapter eligible.
@@ -773,6 +796,7 @@ void OllamaDispatch_Stop()
 {
     // Revoke before the existing terminal legacy-pool join. Reload/tick never joins workers.
     g_bridgeGeneration = 0;
+    g_bridgeListener.Stop();  // Bounded join of the 127.0.0.1 listener before the channel it feeds is revoked.
     g_bridgeChannel.Configure(false);
     OllamaChat_BridgeReset();
     OllamaBridge_SetActivation({});

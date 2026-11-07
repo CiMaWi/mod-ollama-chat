@@ -6,6 +6,7 @@
 #include "Config.h"
 #include "Log.h"
 #include "mod-ollama-chat_api.h"
+#include "mod-ollama-chat_bridge_listener.h"
 #include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_dispatch.h"
 #include "mod-ollama-chat_memory.h"
@@ -944,7 +945,11 @@ void LoadOllamaChatConfig()
     OllamaPersona::WorldStore().Configure(g_Enable && personaCardsEnabled);
     // Explicit world-thread load/reload notification also retires work when the module is disabled.
     // The random-chatter update hook may return before dispatcher Update in that state.
-    OllamaDispatch_BridgeConfigured(sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ChannelEnabled", false));
+    bool const channelEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ChannelEnabled", false);
+    OllamaDispatch_BridgeConfigured(channelEnabled);
+    // J5d: the mailbox's 127.0.0.1 transport; a reload restarts it only when the port or the token changed.
+    OllamaDispatch_BridgeListen(channelEnabled, sConfigMgr->GetOption<uint32_t>("OllamaChat.Bridge.ChannelPort",
+                                                                                OllamaBridge::DefaultListenerPort));
 
     LoadPersonalityTemplatesFromDB();
 

@@ -136,11 +136,25 @@ OllamaChat.Bridge.Token =
 #                  Up to 64 physical packets and 8 world-thread dequeues per tick. Reload revokes old
 #                  work immediately; a replacement epoch waits for actual payload disposal and drain.
 #                  The shared runtime installs filtered queries and current-mark event production.
-#                  Native socket/tool adapters remain J11C/X work; typed commands remain rejected (J6).
+#                  While on, the module listens on 127.0.0.1:ChannelPort for the bridge (J5d, below);
+#                  typed commands remain rejected (J6).
 #                  Live delivery awaits J9C/X proof.
 #                  No raw commands, inference fallback, or model text execution is permitted.
 #     Default:     0 (existing generation behavior; reverse mailbox unavailable)
 OllamaChat.Bridge.ChannelEnabled = 0
+
+# OllamaChat.Bridge.ChannelPort
+#     Description: TCP port of the bridge channel listener (J5d). While ChannelEnabled is on and the
+#                  Bridge settings above are valid, the module listens on literal 127.0.0.1 only (never
+#                  another address). The local bridge posts one query or command envelope to
+#                  POST /v1/channel/{route} with "Authorization: Bearer <Bridge.Token>" and gets the
+#                  world thread's filtered result in the reply (wire: hub bridge/game/README.md).
+#                  Other peers, wrong tokens and bodies over 65536 bytes are refused before the body
+#                  is read; nothing from a request is logged. Valid ports are 1024-65535; another value
+#                  or a busy port logs one warning and leaves the listener closed. A reload restarts
+#                  it only when the port or the token changed. Give the bridge the same port.
+#     Default:     18732
+OllamaChat.Bridge.ChannelPort = 18732
 
 # OllamaChat.Bridge.PersonaCardsEnabled
 #     Description: Use durable persona cards in the native bridge for eligible bot/controller pairs.
