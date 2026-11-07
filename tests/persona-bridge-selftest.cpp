@@ -150,6 +150,49 @@ bool Invalid(OllamaBridge::Result const& result)
 void BuildChecks()
 {
     using namespace OllamaBridge;
+    // C6: personality keys become in-world manner words; no key, mechanism word or vulgarity reaches the prompt.
+    Check(CardTraitWord("GRUMPY_VETERAN") == "gruff" && CardTraitWord("PVP_HARDCORE") == "fierce" &&
+              CardTraitWord("FLIRT") == "charming" && CardTraitWord("POET") == "poetic",
+          "known personality keys give short in-world manner words");
+    bool tidy = true;
+    for (char const* key : {"GAMER", "NPC_IMPERSONATOR", "GLITCHED_AI", "STONER", "default", "gruff_veteran", ""})
+        tidy = tidy && CardTraitWord(key).empty();
+    Check(tidy, "keys without an in-world meaning, unknown keys and the default give no word");
+    for (char const* key : {"ROLEPLAYER",
+                            "LOOTGOBLIN",
+                            "PVP_HARDCORE",
+                            "RAIDER",
+                            "CASUAL",
+                            "TRADER",
+                            "GRUMPY_VETERAN",
+                            "HEROIC_LEADER",
+                            "TRICKSTER",
+                            "LONE_WOLF",
+                            "FOOL",
+                            "ANCIENT_WISE_ONE",
+                            "BARD",
+                            "CONSPIRACY_THEORIST",
+                            "EDGE_LORD",
+                            "FANATIC",
+                            "HYPE_MAN",
+                            "PARANOID",
+                            "FLIRT",
+                            "RAGER",
+                            "YOUNG_APPRENTICE",
+                            "MENTOR",
+                            "SCHOLAR",
+                            "WANNABE_VILLAIN",
+                            "JOLLY_BEER_LOVER",
+                            "GOBLIN_MERCHANT",
+                            "PIRATE",
+                            "CHEF"})
+    {
+        std::string const word = CardTraitWord(key);
+        bool lower = !word.empty() && word.size() <= 16;
+        for (char c : word)
+            lower = lower && ((c >= 'a' && c <= 'z') || c == '-');
+        Check(lower, "a shipped key maps to one short lowercase word, never the key itself");
+    }
     auto const settings = Settings();
     std::string body;
     auto plain = Request();

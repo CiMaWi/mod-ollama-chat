@@ -139,6 +139,43 @@ nlohmann::json CardContextJson(CardFacts const& facts)
 }
 }  // namespace
 
+std::string CardTraitWord(std::string const& personalityKey)
+{
+    static std::map<std::string, std::string> const words = {
+        {"ROLEPLAYER", "dramatic"},
+        {"LOOTGOBLIN", "greedy"},
+        {"PVP_HARDCORE", "fierce"},
+        {"RAIDER", "battle-hardened"},
+        {"CASUAL", "easygoing"},
+        {"TRADER", "shrewd"},
+        {"GRUMPY_VETERAN", "gruff"},
+        {"HEROIC_LEADER", "commanding"},
+        {"TRICKSTER", "mischievous"},
+        {"LONE_WOLF", "aloof"},
+        {"FOOL", "silly"},
+        {"ANCIENT_WISE_ONE", "wise"},
+        {"BARD", "theatrical"},
+        {"CONSPIRACY_THEORIST", "suspicious"},
+        {"EDGE_LORD", "brooding"},
+        {"FANATIC", "zealous"},
+        {"HYPE_MAN", "boisterous"},
+        {"PARANOID", "wary"},
+        {"FLIRT", "charming"},
+        {"RAGER", "hot-tempered"},
+        {"YOUNG_APPRENTICE", "eager"},
+        {"MENTOR", "patient"},
+        {"SCHOLAR", "bookish"},
+        {"WANNABE_VILLAIN", "scheming"},
+        {"JOLLY_BEER_LOVER", "jolly"},
+        {"GOBLIN_MERCHANT", "shrewd"},
+        {"PIRATE", "roguish"},
+        {"CHEF", "hearty"},
+        {"POET", "poetic"},
+    };
+    auto const it = words.find(personalityKey);
+    return it == words.end() ? std::string() : it->second;
+}
+
 bool Identity::operator==(Identity const& other) const
 {
     return instance == other.instance && provider == other.provider && endpoint == other.endpoint &&

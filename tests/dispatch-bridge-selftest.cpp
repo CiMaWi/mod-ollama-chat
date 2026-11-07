@@ -1289,6 +1289,31 @@ void CardTests()
           "card H: three offers per bot and generation, facts gathered only for an offer");
     g_queue.clear();
 
+    // I (J14e notes): a submit the dispatcher refuses sent no offer and does not use up the bot's offers.
+    CardFixture();
+    Check(CardSubmit("Morning."), "card I: first message admitted");
+    cardPort.Complete();
+    OllamaChat_BridgeRefresh();
+    Check(CardDeliver(), "card I: the first reply is delivered");
+    {
+        std::vector<OllamaBridge::DispatchSlot> held;
+        while (auto slot = OllamaBridge::DispatchSlot::Acquire())
+            held.push_back(std::move(slot));
+        for (int i = 0; i < 5; ++i)
+            Check(!CardSubmit("Refused " + std::to_string(i)), "card I: a full dispatcher refuses");
+    }
+    unsigned countedOffers = 0;
+    for (unsigned i = 0; i < OllamaPersona::MaxCardOffers + 2; ++i)
+    {
+        Check(CardSubmit("Back again " + std::to_string(i)), "card I: message admitted");
+        if (g_queue.back().request.bridgeTicket.request.input.card.offered)
+            ++countedOffers;
+        Check(CardDeliver(), "card I: reply delivered");
+    }
+    Check(countedOffers == OllamaPersona::MaxCardOffers,
+          "card I: refused submits did not use up the three offers per bot and generation");
+    g_queue.clear();
+
     // J6d -> J14e: a stranger's whisper reads the bot's own card too (DS.12: the player never sees it).
     CardFixture();
     gameAI.master = nullptr;

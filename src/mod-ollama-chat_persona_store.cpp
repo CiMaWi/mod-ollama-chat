@@ -225,6 +225,14 @@ void Store::Finish(StoreCompletion completion, StoreTime now)
         BackOff(completion.botGuid, entry, now);
 }
 
+bool Store::CanOffer(uint64_t generation, uint64_t botGuid) const
+{
+    if (!IsCurrent(generation) || !botGuid)
+        return false;
+    auto const it = _offers.find(botGuid);
+    return it == _offers.end() || it->second < MaxCardOffers;
+}
+
 bool Store::TakeOffer(uint64_t generation, uint64_t botGuid)
 {
     if (!IsCurrent(generation) || !botGuid)

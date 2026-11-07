@@ -70,6 +70,10 @@ struct CardFacts
     std::string traits;
 };
 
+// DS.12/C6: a personality template key (GRUMPY_VETERAN) as a short in-world manner word ("gruff"). Keys with no
+// in-world, non-vulgar meaning (GLITCHED_AI, STONER, GAMER ...) and unknown keys give an empty string.
+std::string CardTraitWord(std::string const& personalityKey);
+
 // Optional persona card opportunity, set on world only for a ready card store. With an accepted card in the persona
 // text it says so; for a bot without a card it carries the facts (bounded per bot and generation), and the bridge
 // may return one card for exactly this revision, which the module applies itself. The stamp names the store

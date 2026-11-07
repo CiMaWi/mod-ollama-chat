@@ -1117,7 +1117,7 @@ void BridgeCardFacts(Player* bot, OllamaBridge::CardFacts& facts)
     // Only an existing assignment: GetBotPersonality may assign one with a synchronous query.
     auto const personality = g_BotPersonalityList.find(bot->GetGUID().GetRawValue());
     if (g_EnableRPPersonalities && personality != g_BotPersonalityList.end() && personality->second != "default")
-        facts.traits = personality->second;
+        facts.traits = OllamaBridge::CardTraitWord(personality->second);
 }
 
 // BEGIN BRIDGE WORLD ADAPTER -- extracted verbatim by the offline game-adapter checks.
@@ -1254,7 +1254,8 @@ void BridgeCard(BridgeView& view)
 
 // The generation's card opportunity (Loading and Unready have no stamp and offer nothing). An accepted card in the
 // persona text is reported as accepted. A bot without a card is offered a generation, at most MaxCardOffers times
-// per bridge generation. An accepted card left out as too long offers nothing: a provider never replaces a card.
+// per bridge generation; the offer is only checked here and counted once the request is queued (BridgeSubmit). An
+// accepted card left out as too long offers nothing: a provider never replaces a card.
 OllamaBridge::CardOpportunity BridgeCardOpportunity(OllamaPersona::CardContext const& card, uint64_t botGuid)
 {
     using OllamaPersona::CardStatus;
@@ -1262,7 +1263,7 @@ OllamaBridge::CardOpportunity BridgeCardOpportunity(OllamaPersona::CardContext c
     bool const accepted = card.status == CardStatus::Accepted && card.included;
     bool const wanted = card.status == CardStatus::Missing || card.status == CardStatus::NoCard;
     if (!accepted &&
-        (!wanted || !OllamaPersona::WorldStore().TakeOffer(OllamaDispatch_BridgeWorld().Generation(), botGuid)))
+        (!wanted || !OllamaPersona::WorldStore().CanOffer(OllamaDispatch_BridgeWorld().Generation(), botGuid)))
         return opportunity;
     opportunity.offered = true;
     opportunity.revision = card.revision;
@@ -1629,6 +1630,7 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
         LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge card offer for bot {} (revision {})",
                  it->view.guard.scope.botGuid, input.card.revision);
     }
+    bool const offerCard = input.card.offered && !input.card.accepted;
     input.text = text;
     input.directAddress = addressed;
     input.memory = it->memory;
@@ -1639,8 +1641,13 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     request.source = source;
     request.scopeKey = scopeKey;
     request.directAddress = addressed;
-    return OllamaDispatch_SubmitBridge(std::move(request), it->view.guard.scope, std::move(input), it->view.guard,
-                                       30000);
+    auto const botGuid = it->view.guard.scope.botGuid;
+    bool const queued =
+        OllamaDispatch_SubmitBridge(std::move(request), it->view.guard.scope, std::move(input), it->view.guard, 30000);
+    // A refused submit (queue, circuit, bound) sent no offer, so it does not use up the bot's offers.
+    if (queued && offerCard)
+        OllamaPersona::WorldStore().TakeOffer(OllamaDispatch_BridgeWorld().Generation(), botGuid);
+    return queued;
 }
 }  // namespace
 

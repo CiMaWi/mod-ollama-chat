@@ -154,6 +154,8 @@ int main()
         Check(view.card.status == CardStatus::Missing && view.context.persona == Voice && offer.offered &&
                   offer.revision == 0 && offer.stamp != 0 && offer.stamp == view.card.stamp && !offer.accepted,
               "a bot without a card is offered a card on any channel and speaker");
+        Check(BridgeCardOpportunity(view.card, BotGuid).offered, "the opportunity check does not count an offer");
+        Check(store.TakeOffer(1, BotGuid), "the submit counts the offer");
     }
     view = Capture(From::Yell);
     Check(view.card.status == CardStatus::Missing && !BridgeCardOpportunity(view.card, BotGuid).offered,

@@ -96,6 +96,8 @@ public:
     StoreView Observe(uint64_t generation, uint64_t botGuid) const;
     // True means queued. Persisted state is available only through a subsequent confirmed observation.
     bool SubmitUpdate(uint64_t generation, uint64_t stamp, Update const& update);
+    // True while the bot has card opportunities left in the current generation (does not count one).
+    bool CanOffer(uint64_t generation, uint64_t botGuid) const;
     // Counts one card opportunity of the current generation; false once MaxCardOffers are used. The count is
     // reset by a new generation or reconfiguration and erased by Forget, not by a cache eviction.
     bool TakeOffer(uint64_t generation, uint64_t botGuid);

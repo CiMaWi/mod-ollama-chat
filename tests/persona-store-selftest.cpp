@@ -388,7 +388,11 @@ void CheckOffers()
     Enable(store, port);
     Check(!store.TakeOffer(2, Bot) && !store.TakeOffer(1, 0), "another generation or no bot is offered nothing");
     for (uint32_t i = 0; i < MaxCardOffers; ++i)
+    {
+        Check(store.CanOffer(1, Bot) && store.CanOffer(1, Bot), "checking an offer does not use it up");
         Check(store.TakeOffer(1, Bot), "an offer within the bound");
+    }
+    Check(!store.CanOffer(1, Bot) && !store.CanOffer(2, Bot) && !store.CanOffer(1, 0), "no offer left to check");
     Check(!store.TakeOffer(1, Bot), "the fourth offer in a generation is refused");
     Check(store.TakeOffer(1, OtherBot), "the bound is per bot");
     store.Forget(Bot);
