@@ -12,16 +12,18 @@
 
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "TestPlayer.h"
 
 bool OllamaIsBotPlayer(Player* player)
 {
     if (!player)
         return false;
 
-    // Correct from session construction, unlike the AI lookup below.
+    // Correct from session construction, unlike the AI lookup below. mod-playerbots' headless test player stands
+    // in for a real player's client, so it is judged like one.
     if (WorldSession* session = player->GetSession())
     {
-        if (session->IsHeadless())
+        if (session->IsHeadless() && !TestPlayerMgr::Instance().IsTestPlayer(player))
             return true;
     }
 

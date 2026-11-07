@@ -41,7 +41,8 @@ class Player;
 //
 // WorldSession::IsHeadless() is fixed in the session constructor (bot sessions
 // have no socket), so it is correct from the first moment the Player exists.
-// mod-playerbots' own login hook uses it for exactly this reason.
+// mod-playerbots' own login hook uses it for exactly this reason. The one headless
+// exception is mod-playerbots' test player, a stand-in for a real player's client.
 // The AI lookup is kept as a fallback so a bot driven by some other mechanism still reads as a bot.
 bool OllamaIsBotPlayer(Player* player);
 
