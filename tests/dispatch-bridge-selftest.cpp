@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_persona_db.h"
@@ -374,7 +375,7 @@ void Reset()
     config.bridge = {"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-bearer-only"};
     config.systemPrompt = "owned-system";
     g_bridgeWorld.Configured(true, config.bridge, "epoch-1");
-    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::GenerationOnlyNoCaptures), "selected");
+    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures), "selected");
     g_bridgeGeneration = g_bridgeWorld.Generation();
     gameGuard = {};
     gameGuard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "party", "visible", "c1", "m1", "p1"};
@@ -713,7 +714,7 @@ void DrainTest()
     g_bridgeWorld.Configured(true, config.bridge, "epoch-2");
     g_bridgeGeneration = 0;
     bool const waits =
-        !g_bridgeWorld.ObserveDrain(g_bridgeInFlight == 0, OllamaBridge::RetirementProof::GenerationOnlyNoCaptures);
+        !g_bridgeWorld.ObserveDrain(g_bridgeInFlight == 0, OllamaBridge::RetirementProof::NoLiveCaptures);
     {
         std::lock_guard lock(g_queueMutex);
         g_running = false;
@@ -728,7 +729,7 @@ void DrainTest()
     Check(entered && counted && waits, "cancellation is not actual worker drain");
     Check(!g_bridgeInFlight && !OllamaBridge::DispatchSlot::Used() && g_done.empty(),
           "stale worker disposes actual payload before drain");
-    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::GenerationOnlyNoCaptures),
+    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures),
           "actual drain permits selection");
 }
 
@@ -951,7 +952,7 @@ void AdapterTests()
         else
         {
             g_bridgeWorld.Configured(true, config.bridge, "new-epoch");
-            Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures), "reload selected");
+            Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::NoLiveCaptures), "reload selected");
             g_bridgeGeneration = g_bridgeWorld.Generation();
         }
         OllamaChat_BridgeRefresh();

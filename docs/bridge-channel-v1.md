@@ -43,9 +43,20 @@ pull/focus_healing `{targetGuid}`; mark `{targetGuid,icon}`; assign_role `{role:
 save_mana `{enabled:boolean}`; formation `{shape:close|spread|line}`; position `{x,y,z,mapId}` (finite numbers,
 uint32 map id); dungeon_clear `{mode:on|off|pause}`. Parsing emits enums and variant values only. No literal command
 syntax is built. A staged proposal reserves its effect id before any possible later attempt, including failure.
-`Receive` is NEVER an execution grant: until J6, consumers must reject unsupported execution and cannot report an
-applied effect. J6 must re-resolve GUIDs, actual current controller/group, target observation/eligibility,
-map/phase/pathability/rate and activation/deadline at the actual execution seam. Proposed text must not enter order parsing.
+`Receive` is NEVER an execution grant. The world executor re-resolves GUIDs, actual current controller/group, target
+observation/eligibility, map/phase/pathability/rate and activation/deadline at the actual execution seam. Proposed text
+must not enter order parsing. Executed verbs: attack_own_target, mark, flee and position are one-time moves;
+follow, stay, formation, save_mana and focus_healing are lasting plans (J12): the bot's state of that part is captured
+before every attempt, and the world tick restores it on expiry (10 minutes after the latest repeat), a group change,
+loss of the controller's authority (master, or leader of a masterless bot), or bridge retirement (a reload or
+switch, also one that sets `OllamaChat.Enable = 0`: the disabled tick still runs these restores). Any later change of
+that part wins and is left alone, whoever makes it: another person, the controller's own playerbots command, or
+playerbots itself; a change that leaves the part as the bridge set it (the same stay again) does not count. A
+logged-out bot's plan is dropped unrestored, and playerbots' own logout save can keep the bridge-set state in its
+database for the next login, as it does for its own commands. An attempt that may have changed the bot but left no
+plan (unreachable today) is counted as `unrecorded` in the "Bridge plans:" log line. regroup, pull, assign_role
+and dungeon_clear have no safe playerbots effect and stay a fixed refusal (DS.9).
+Retirement selects no new epoch until every retired plan is restored or dropped.
 
 The single world owner calls `Bind` only AFTER the existing activation owner has selected a fresh epoch and proved
 actual old-work drain and strategy restoration. Bind itself proves neither. Every bind retires the prior helper

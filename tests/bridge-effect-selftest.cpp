@@ -2,14 +2,18 @@
 // runner into bridge-effect-executor.inc (its private section made public so Effect can be called directly) and
 // compiled against game and playerbots doubles that count every read and every call. The playerbots Intent, Result
 // and Order types are extracted from mod-playerbots' BridgeIntentEffect.h. MapIntent and BuildEffectOrder are the
-// real headers. No game, no playerbots, no server.
+// real headers. J12: the executor's plan ledger (the real PlanLedger) with Capture/Restore doubles that model each
+// bot's lasting parts; the world tick's expiry, group, controller and logout checks and restores. No game, no
+// playerbots, no server.
 #include <functional>
 #include <iostream>
 #include <map>
+#include <new>
 #include <stdexcept>
 #include <string>
 
 #include "bridge-effect-playerbots.inc"
+#include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_world.h"
 
 // ---- game doubles -------------------------------------------------------------------------------------------------
@@ -51,7 +55,17 @@ struct Unit
 struct Group
 {
     uint64_t guid = 0;
+    uint64_t leader = 0;
     ObjectGuid GetGUID() const { return ObjectGuid(guid); }
+    ObjectGuid GetLeaderGUID() const { return ObjectGuid(leader); }
+};
+
+struct Player;
+// The bot's playerbots AI: only its master matters to the plan tick's controller check.
+struct PlayerbotAI
+{
+    Player* master = nullptr;
+    Player* GetMaster() const { return master; }
 };
 
 struct Counters
@@ -69,6 +83,7 @@ struct Player : Unit
 {
     Group* group = nullptr;
     uint64_t target = 0;
+    PlayerbotAI* ai = nullptr;
     bool IsInMap(Unit const*) const { return sight.inMap; }
     bool InSamePhase(Unit const*) const { return sight.samePhase; }
     bool IsWithinDistInMap(Unit const*, float distance) const
@@ -116,8 +131,22 @@ struct ObjectAccessor
     }
 };
 
+struct PlayerbotsMgr
+{
+    static PlayerbotsMgr& instance()
+    {
+        static PlayerbotsMgr manager;
+        return manager;
+    }
+    PlayerbotAI* GetPlayerbotAI(Player* player) const { return player ? player->ai : nullptr; }
+};
+
 namespace OllamaBridge
 {
+// The steady clock the executor reads once per order (bridge.cpp is not linked).
+int64_t testNowMs = 1000;
+Clock Now() { return {0, testNowMs}; }
+
 struct EffectPhase
 {
     PlayerbotBridge::PostMapJoin join;
@@ -125,6 +154,7 @@ struct EffectPhase
 
 namespace
 {
+using BridgePlans = PlanLedger<PlayerbotBridge::Baseline>;  // As in bridge_effect.cpp.
 #include "bridge-effect-executor.inc"
 }  // namespace
 }  // namespace OllamaBridge
@@ -145,11 +175,24 @@ constexpr uint64_t kController = 22;
 constexpr uint64_t kGroup = 33;
 constexpr uint64_t kTarget = 44;
 constexpr uint64_t kOther = 55;
+constexpr uint64_t kStranger = 66;
+constexpr uint64_t kGeneration = 7;
+using PlayerbotBridge::Part;
+
+// The executor's one ledger, fresh (its capacity is const, so rebuilt in place).
+void ResetPlans()
+{
+    BridgePlans& plans = BridgeCommandExecutor::Plans();
+    plans.~BridgePlans();
+    new (&plans) BridgePlans();
+}
 
 struct Env
 {
     Player bot;
     Player controller;
+    Player stranger;
+    PlayerbotAI botAI;
     Group botGroup;
     Group controllerGroup;
     Unit target;
@@ -167,14 +210,22 @@ struct Env
         ownMarkNotes = 0;
         ownMarkBot = 0;
         botGroup.guid = controllerGroup.guid = kGroup;
+        botGroup.leader = controllerGroup.leader = kController;
         bot.group = &botGroup;
         controller.group = &controllerGroup;
         bot.target = kTarget;
-        ObjectAccessor::Players() = {{kBot, &bot}, {kController, &controller}};
+        bot.ai = &botAI;
+        botAI.master = &controller;
+        ObjectAccessor::Players() = {{kBot, &bot}, {kController, &controller}, {kStranger, &stranger}};
         ObjectAccessor::Units() = {{kTarget, &target}, {kOther, &other}};
         ticket.scope.botGuid = kBot;
         ticket.scope.controllerGuid = kController;
+        ticket.generation = kGeneration;
         guard.groupGuid = kGroup;
+        testNowMs = 1000;
+        PlayerbotBridge::pb.clock = &testNowMs;
+        ResetPlans();
+        BridgeCommandExecutor::Plans().Open(kGeneration);
     }
 
     std::function<bool()> Authorize()
@@ -240,7 +291,10 @@ Verb const kVerbs[] = {{ChannelIntent::AttackOwnTarget, PlayerbotBridge::Intent:
                        {ChannelIntent::Follow, PlayerbotBridge::Intent::Follow, "follow"},
                        {ChannelIntent::Stay, PlayerbotBridge::Intent::Stay, "stay"},
                        {ChannelIntent::Flee, PlayerbotBridge::Intent::Flee, "flee"},
-                       {ChannelIntent::Position, PlayerbotBridge::Intent::Position, "position"}};
+                       {ChannelIntent::Position, PlayerbotBridge::Intent::Position, "position"},
+                       {ChannelIntent::Formation, PlayerbotBridge::Intent::Formation, "formation"},
+                       {ChannelIntent::SaveMana, PlayerbotBridge::Intent::SaveMana, "save_mana"},
+                       {ChannelIntent::FocusHealing, PlayerbotBridge::Intent::FocusHealing, "focus_healing"}};
 
 // Nothing reached playerbots and no game read happened.
 bool Untouched()
@@ -268,9 +322,14 @@ void VerbSwitch()
         Check(pb.phase == &env.phase.join, "the joined phase is forwarded");
         Check(env.authorizeCalls == 1 && pb.authorizeCalled == 1 && pb.authorizeResult,
               "authorize passes through and the executor adds none");
-        bool const targeted = verb.intent == ChannelIntent::AttackOwnTarget || verb.intent == ChannelIntent::Mark;
-        Check(pb.order.Target == (targeted ? kTarget : 0), "target only for attack and mark");
+        bool const targeted = verb.intent == ChannelIntent::AttackOwnTarget || verb.intent == ChannelIntent::Mark ||
+                              verb.intent == ChannelIntent::FocusHealing;
+        Check(pb.order.Target == (targeted ? kTarget : 0), "target only for attack, mark and focus heal");
         Check(pb.order.Icon == (verb.intent == ChannelIntent::Mark ? 3 : 0), "icon only for mark");
+        Check(pb.order.Shape == (verb.intent == ChannelIntent::Formation ? PlayerbotBridge::FormationShape::Close
+                                                                         : PlayerbotBridge::FormationShape::None),
+              "shape only for formation");
+        Check(pb.order.Enabled == (verb.intent == ChannelIntent::SaveMana), "enable flag only for save_mana");
         bool const position = verb.intent == ChannelIntent::Position;
         Check(pb.order.MapId == (position ? 1u : 0u) && pb.order.X == (position ? 100.5 : 0.0) &&
                   pb.order.Y == (position ? 200.25 : 0.0) && pb.order.Z == (position ? 300.125 : 0.0),
@@ -278,7 +337,7 @@ void VerbSwitch()
         Check(pb.reaches == (position ? 1u : 0u), "reachability query only for position");
         Check(game.targetReads == (verb.intent == ChannelIntent::AttackOwnTarget ? 1u : 0u),
               "own target read only for attack");
-        Check(game.unitLookups == (targeted ? 1u : 0u), "target unit resolved only for attack and mark");
+        Check(game.unitLookups == (targeted ? 1u : 0u), "target unit resolved only for attack, mark and focus heal");
         Check(game.playerLookups == 2, "bot and controller resolved by guid");
     }
 }
@@ -473,6 +532,289 @@ void Facts()
     }
 }
 
+// J12: the wire's shape and flag reach playerbots as its own values; a focus heal target must be seen.
+void LastingOrders()
+{
+    struct Pair
+    {
+        ChannelShape wire;
+        PlayerbotBridge::FormationShape playerbots;
+    };
+    Pair const pairs[] = {{ChannelShape::Close, PlayerbotBridge::FormationShape::Close},
+                          {ChannelShape::Spread, PlayerbotBridge::FormationShape::Spread},
+                          {ChannelShape::Line, PlayerbotBridge::FormationShape::Line}};
+    for (Pair const& pair : pairs)
+    {
+        Env env;
+        Check(env.Run(Cmd(ChannelIntent::Formation, pair.wire)) == EffectResult::Applied &&
+                  PlayerbotBridge::pb.order.Shape == pair.playerbots,
+              "each wire shape maps to its playerbots shape");
+    }
+    {
+        Env env;
+        Check(env.Run(Cmd(ChannelIntent::SaveMana, false)) == EffectResult::Applied &&
+                  PlayerbotBridge::pb.executes == 1 && !PlayerbotBridge::pb.order.Enabled,
+              "save_mana off carries false");
+    }
+    {
+        Env env;
+        env.target.inWorld = false;
+        Check(env.Run(ValidCmd(ChannelIntent::FocusHealing)) == EffectResult::Rejected &&
+                  PlayerbotBridge::pb.executes == 0 && env.authorizeCalls == 0,
+              "a focus heal target nobody sees is refused before playerbots");
+    }
+}
+
+PlanKey MovementKey() { return {kBot, PlanKind::Movement}; }
+uint16_t Movement() { return PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies; }
+
+// A stay plan over a person's earlier movement state 4.
+void ApplyStay(Env& env)
+{
+    PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 4;
+    Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied, "stay plan applied");
+}
+
+// J12 executor flow: admission and capture before every attempt, record after every attempt that may have written.
+void PlanFlow()
+{
+    auto const& pb = PlayerbotBridge::pb;
+    BridgePlans& plans = BridgeCommandExecutor::Plans();
+    {
+        Env env;
+        ApplyStay(env);
+        Check(pb.capturesAtExecute == 1 && pb.captures == 2, "the state is captured before the attempt and after it");
+        Check(plans.Size() == 1 && plans.Counters().applied == 1 && plans.Counters().unrecorded == 0,
+              "one plan recorded");
+        auto const applied = plans.LiveApplied(MovementKey());
+        Check(applied && applied->Strategies == 2 && applied->Held == Part::Movement && applied->Bot == kBot,
+              "the ledger keeps what the bridge set, for this bot and part");
+    }
+    {
+        Env env;
+        env.ticket.generation = kGeneration + 1;
+        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Rejected && pb.captures == 0 &&
+                  pb.executes == 0 && env.authorizeCalls == 0 && plans.Empty(),
+              "a plan the ledger refuses (stale generation) reads and changes nothing");
+    }
+    {
+        Env env;
+        PlayerbotBridge::pb.captureFails = true;
+        Check(env.Run(ValidCmd(ChannelIntent::Formation)) == EffectResult::Rejected && pb.captures == 1 &&
+                  pb.executes == 0 && env.authorizeCalls == 0 && plans.Empty(),
+              "no baseline, no mutation");
+    }
+    for (auto const result : {PlayerbotBridge::Result::Rejected, PlayerbotBridge::Result::Unavailable})
+    {
+        Env env;
+        PlayerbotBridge::pb.result = result;
+        env.Run(ValidCmd(ChannelIntent::SaveMana));
+        Check(pb.executes == 1 && pb.captures == 1 && plans.Empty() && plans.Counters().unrecorded == 0,
+              "an attempt that promises no mutation records none");
+    }
+    // Review J12 NOTE B: unreachable today, but an attempt that may have written and left no entry is counted.
+    for (auto const result : {PlayerbotBridge::Result::Applied, PlayerbotBridge::Result::Failed})
+    {
+        Env env;
+        PlayerbotBridge::pb.result = result;
+        PlayerbotBridge::pb.captureFailsAfterExecute = true;
+        env.Run(ValidCmd(ChannelIntent::Formation));
+        Check(pb.executes == 1 && pb.captures == 2 && plans.Empty() && plans.Counters().applied == 0 &&
+                  plans.Counters().unrecorded == 1,
+              "an attempt whose state cannot be read afterwards is counted as unrecorded");
+    }
+    {
+        Env env;
+        PlayerbotBridge::pb.duringExecute = [] { BridgeCommandExecutor::Plans().RetireAll(); };
+        Check(env.Run(ValidCmd(ChannelIntent::SaveMana)) == EffectResult::Applied && pb.captures == 2 &&
+                  plans.Empty() && plans.Counters().unrecorded == 1,
+              "an attempt whose record the ledger refuses is counted as unrecorded");
+    }
+    {
+        Env env;
+        PlayerbotBridge::pb.result = PlayerbotBridge::Result::Failed;
+        Check(
+            env.Run(ValidCmd(ChannelIntent::SaveMana)) == EffectResult::Failed && pb.captures == 2 && plans.Size() == 1,
+            "a failed attempt may have written: recorded");
+    }
+    {
+        Env env;
+        PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 4;
+        Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Applied, "follow plan");
+        testNowMs += 1000;
+        PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 9;  // A person's own command in between.
+        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied && pb.captures == 4 &&
+                  pb.capturesAtExecute == 3,
+              "a repeat captures the state again before its attempt");
+        Check(plans.Size() == 1 && plans.Counters().applied == 1 && plans.Counters().renewed == 1,
+              "follow then stay renew the one movement plan");
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
+        Check(pb.restores == 1 && pb.restoreBefore.Strategies == 9 && pb.restoreApplied.Strategies == 2 &&
+                  Movement() == 9,
+              "the person's state captured before the repeat is the restore target");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        testNowMs += 1000;
+        PlayerbotBridge::pb.captureFails = true;
+        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Rejected && pb.executes == 1,
+              "a repeat whose capture fails does not execute");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        testNowMs += PlanLifetimeMs - 1;
+        PlayerbotBridge::pb.executeAdvanceMs = 5;
+        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied && plans.Counters().renewed == 1 &&
+                  plans.LiveApplied(MovementKey()),
+              "admission and record use one clock reading, so a slow renewal is still recorded");
+    }
+    for (auto const intent : {ChannelIntent::Flee, ChannelIntent::Mark, ChannelIntent::AttackOwnTarget})
+    {
+        Env env;
+        Check(env.Run(ValidCmd(intent)) == EffectResult::Applied && pb.captures == 0 && plans.Empty() &&
+                  plans.Counters().unrecorded == 0,
+              "one-shot verbs have no plan");
+    }
+}
+
+// J12 world tick through the executor: apply -> expire -> restore, group and controller changes, logout, retries,
+// a later command, retirement, and one part per kind.
+void PlanTick()
+{
+    auto const& pb = PlayerbotBridge::pb;
+    BridgePlans& plans = BridgeCommandExecutor::Plans();
+    {
+        Env env;
+        unsigned const lookups = game.playerLookups;
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs);
+        Check(game.playerLookups == lookups && pb.restores == 0, "an empty ledger reads nothing");
+    }
+    {
+        Env env;
+        int64_t const start = testNowMs;
+        ApplyStay(env);
+        BridgeCommandExecutor::UpdatePlans(env.phase, start + PlanLifetimeMs - 1);
+        Check(pb.restores == 0 && plans.Size() == 1 && Movement() == 2, "a live plan is not restored early");
+        BridgeCommandExecutor::UpdatePlans(env.phase, start + PlanLifetimeMs);
+        Check(pb.restores == 1 && pb.restoredBot == kBot && pb.restoreBefore.Strategies == 4 &&
+                  pb.restoreApplied.Strategies == 2,
+              "expiry restores the captured state");
+        Check(Movement() == 4 && plans.Empty() && plans.Counters().expired == 1 && plans.Counters().restored == 1,
+              "the baseline is back and the ledger is empty");
+        BridgeCommandExecutor::UpdatePlans(env.phase, start + PlanLifetimeMs + 1);
+        Check(pb.restores == 1, "restored once");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        env.phase.join.current = false;
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
+        Check(pb.restores == 0 && plans.Size() == 1 && !plans.Empty(), "no tick work outside the post-map-join phase");
+    }
+    for (int which = 0; which < 7; ++which)
+    {
+        Env env;
+        ApplyStay(env);
+        if (which == 0)
+            env.botGroup.guid = 99;  // The bot's group changed.
+        else if (which == 1)
+            env.bot.group = nullptr;  // The bot left its group.
+        else if (which == 2)
+            env.botAI.master = &env.stranger;  // Another master.
+        else if (which == 3)
+            ObjectAccessor::Players().erase(kController);  // The controller logged out.
+        else if (which == 4)
+            env.controllerGroup.guid = 77;  // The controller is in another group.
+        else if (which == 5)
+        {
+            env.botAI.master = nullptr;  // Masterless, and someone else leads.
+            env.botGroup.leader = kStranger;
+        }
+        else
+            env.bot.ai = nullptr;  // No longer a bot.
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
+        Check(pb.restores == 1 && Movement() == 4 && plans.Empty() && plans.Counters().regrouped == 1,
+              "a group change or lost controller authority restores at once");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        env.botAI.master = nullptr;
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
+        Check(pb.restores == 0 && plans.Size() == 1, "the controller leading a masterless bot keeps its plan");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
+        Check(pb.restores == 0 && plans.Size() == 1 && Movement() == 2, "unchanged group and master keep the plan");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        ObjectAccessor::Players().erase(kBot);
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
+        Check(pb.restores == 0 && plans.Empty() && plans.Counters().departed == 1,
+              "a logged-out bot's plan is dropped unrestored");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        PlayerbotBridge::pb.restoreResult = PlayerbotBridge::RestoreResult::Gone;
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
+        Check(pb.restores == 1 && plans.Empty() && plans.Counters().departed == 1 && plans.Counters().abandoned == 0,
+              "a restore that finds the bot gone drops the plan");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        int64_t const due = testNowMs + PlanLifetimeMs;
+        PlayerbotBridge::pb.restoreResult = PlayerbotBridge::RestoreResult::Failed;
+        BridgeCommandExecutor::UpdatePlans(env.phase, due);
+        Check(pb.restores == 1 && plans.Size() == 1, "a failed restore stays pending");
+        BridgeCommandExecutor::UpdatePlans(env.phase, due + PlanRestoreRetryMs - 1);
+        Check(pb.restores == 1, "retried only after the retry interval");
+        BridgeCommandExecutor::UpdatePlans(env.phase, due + PlanRestoreRetryMs);
+        Check(pb.restores == 2 && plans.Size() == 1, "second attempt");
+        BridgeCommandExecutor::UpdatePlans(env.phase, due + 2 * PlanRestoreRetryMs);
+        Check(pb.restores == 3 && plans.Empty() && plans.Counters().abandoned == 1, "dropped after the last attempt");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 1;  // A person's follow since.
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
+        Check(pb.restores == 1 && Movement() == 1 && plans.Empty() && plans.Counters().restored == 1,
+              "a later command wins: superseded, left as it is");
+    }
+    {
+        Env env;
+        ApplyStay(env);
+        plans.RetireAll();  // What RetireBridgeWork's hook does.
+        Check(plans.Size() == 1 && !plans.Empty() && Movement() == 2, "retirement leaves the plan restore-pending");
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
+        Check(pb.restores == 1 && Movement() == 4 && plans.Empty() && plans.Counters().retired == 1,
+              "the next tick restores a retired plan");
+    }
+    {
+        Env env;
+        PlayerbotBridge::pb.state[kBot][Part::Formation].Formation = "chaos";
+        PlayerbotBridge::pb.state[kBot][Part::ManaSave].ManaSaveLevel = 1.0;
+        Check(env.Run(ValidCmd(ChannelIntent::Formation)) == EffectResult::Applied &&
+                  env.Run(ValidCmd(ChannelIntent::SaveMana)) == EffectResult::Applied && plans.Size() == 2,
+              "formation and save_mana are two plans");
+        Check(pb.state.at(kBot).at(Part::Formation).Formation != "chaos" &&
+                  pb.state.at(kBot).at(Part::ManaSave).ManaSaveLevel == 0.5,
+              "both applied");
+        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
+        Check(pb.restores == 2 && pb.state.at(kBot).at(Part::Formation).Formation == "chaos" &&
+                  pb.state.at(kBot).at(Part::ManaSave).ManaSaveLevel == 1.0 && Movement() == 0 && plans.Empty(),
+              "each kind restores its own part only");
+    }
+}
+
 void ResultMapping()
 {
     struct Pair
@@ -510,6 +852,9 @@ int main()
         Gates();
         Facts();
         ResultMapping();
+        LastingOrders();
+        PlanFlow();
+        PlanTick();
     }
     catch (std::exception const& error)
     {

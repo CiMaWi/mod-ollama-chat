@@ -501,7 +501,7 @@ void WorldPolicy::Shutdown() { Configured(false, {}, {}); }
 
 bool WorldPolicy::ObserveDrain(bool drained, RetirementProof proof)
 {
-    if (!_retiring || !drained || proof != RetirementProof::GenerationOnlyNoCaptures)
+    if (!_retiring || !drained || proof != RetirementProof::NoLiveCaptures)
         return false;
     _retiring = false;
     if (_enabled)

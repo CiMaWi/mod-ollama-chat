@@ -39,17 +39,17 @@ void Select(WorldPolicy& policy, std::string epoch)
 {
     policy.Configured(true, Config(), std::move(epoch));
     Check(policy.Selected().epoch.empty(), "publication does not select before drain");
-    Check(policy.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures), "select after drain");
+    Check(policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "select after drain");
 }
 
 void Lifecycle()
 {
     WorldPolicy policy;
     policy.Configured(true, Config(), "world-epoch-1");
-    Check(!policy.ObserveDrain(false, RetirementProof::GenerationOnlyNoCaptures), "old worker still draining");
+    Check(!policy.ObserveDrain(false, RetirementProof::NoLiveCaptures), "old worker still draining");
     Check(!policy.ObserveDrain(true, RetirementProof::Unknown), "unknown restoration fails closed");
     Check(policy.Selected().epoch.empty(), "no provisional activation");
-    Check(policy.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures), "drain selects module circuit");
+    Check(policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "drain selects module circuit");
     auto scope = Scope(policy);
     Check(policy.ObserveScope(scope, now), "complete trusted scope accepted");
     auto old = policy.Reserve(scope, Input(), now, 1000);
@@ -61,8 +61,8 @@ void Lifecycle()
     Check(policy.Generation() == generation + 1, "token-only reload advances generation");
     Check(policy.Pending() == 0 && policy.Selected().epoch.empty(), "retire clears reservations and selection");
     Check(!policy.Complete(old, WorldOutcome::Success, now), "late outcome cannot cross reload");
-    Check(!policy.ObserveDrain(false, RetirementProof::GenerationOnlyNoCaptures), "reload waits asynchronously");
-    Check(policy.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures), "real drain permits new selection");
+    Check(!policy.ObserveDrain(false, RetirementProof::NoLiveCaptures), "reload waits asynchronously");
+    Check(policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "real drain permits new selection");
     Check(policy.Snapshot().token == changed.token, "owned new token snapshot");
     Check(!policy.ObserveScope(scope, now), "old epoch scope rejected");
     scope = Scope(policy);
@@ -71,7 +71,7 @@ void Lifecycle()
     Check(fresh.request.requestId != old.request.requestId, "ids differ across reload");
     policy.Configured(false, changed, "unused");
     Check(policy.Selected().epoch.empty() && !policy.Current(fresh, now), "disable invalidates without update");
-    Check(!policy.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures), "disabled stays unselected");
+    Check(!policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "disabled stays unselected");
     Select(policy, "world-epoch-restart");
     Check(policy.ObserveScope(Scope(policy), now), "restart fresh scope");
     auto restarted = policy.Reserve(Scope(policy), Input(), now, 1000);
@@ -81,7 +81,7 @@ void Lifecycle()
     auto invalid = Config();
     invalid.token.clear();
     policy.Configured(true, invalid, "world-epoch-invalid");
-    Check(!policy.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures), "invalid config fails closed");
+    Check(!policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "invalid config fails closed");
 }
 
 void OutcomesAndScopes()

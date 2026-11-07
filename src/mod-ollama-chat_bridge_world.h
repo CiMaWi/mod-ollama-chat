@@ -45,7 +45,9 @@ enum class WorldOutcome : uint8_t
 enum class RetirementProof : uint8_t
 {
     Unknown,
-    GenerationOnlyNoCaptures
+    // Generation intents and one-shot effects are synchronous; lasting plans (J12) are the only other obligation,
+    // so the dispatcher passes this only while the plan ledger holds no live and no restore-pending plan.
+    NoLiveCaptures
 };
 
 enum class DispatchSource : uint8_t

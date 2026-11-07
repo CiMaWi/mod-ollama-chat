@@ -248,7 +248,7 @@ struct Fixture
         enemy.name = "Visible enemy";
         ai.master = &players[1];
         g_bridgeWorld.Configured(true, settings, "epoch-" + std::to_string(++fixtureSerial));
-        Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures), "select epoch");
+        Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::NoLiveCaptures), "select epoch");
         g_bridgeChannel.Configure(true);
         Check(g_bridgeChannel.Activate(), "activate production dispatcher mailbox");
         BridgeView view;

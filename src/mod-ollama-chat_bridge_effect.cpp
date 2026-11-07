@@ -4,17 +4,24 @@
 #include "Group.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
+#include "PlayerbotAI.h"
+#include "PlayerbotMgr.h"
+#include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_config.h"
 #include "mod-ollama-chat_dispatch.h"
 
 // World-only production typed effect adapter. WorldChannel::Update calls it synchronously with the post-map-join
 // phase, after the channel's epoch, route, deadline, rate and replay joins. It resolves every game fact afresh by
 // GUID, keeps no pointer, phase or callback past the call and hands one typed order to the playerbots boundary,
-// which calls authorize once immediately before its single mutation.
+// which calls authorize once immediately before its single mutation. Lasting verbs (J12) also go through the plan
+// ledger: admission and the bot's state before the change first, the ledger record after the attempt, and the world
+// tick restores that state on expiry, group or controller change and retirement.
 namespace OllamaBridge
 {
 namespace
 {
+using BridgePlans = PlanLedger<PlayerbotBridge::Baseline>;
+
 class BridgeCommandExecutor final : public CommandExecutor
 {
 public:
@@ -26,6 +33,51 @@ public:
             return EffectResult::Rejected;
         else
             return Effect(phase, ticket, guard, command, authorize);
+    }
+
+    // World thread only; memory only (a restart forgets it). One ledger for the one executor.
+    static BridgePlans& Plans()
+    {
+        static BridgePlans plans;
+        return plans;
+    }
+
+    // World tick, post-map-join: expiry, then each bot with live plans (logged out: dropped unrestored; another group,
+    // or its plans' controller no longer holds bridge authority: restore-pending), then every due restore. Nothing
+    // is read or allocated while the ledger is empty.
+    static void UpdatePlans(EffectPhase const& phase, int64_t nowMs)
+    {
+        BridgePlans& plans = Plans();
+        if (plans.Empty() || !phase.join.Current())
+            return;
+        plans.Expire(nowMs);
+        for (PlanLiveBot const& live : plans.LiveBots())
+        {
+            Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(live.botGuid));
+            if (!bot)
+            {
+                plans.Departed(live.botGuid);
+                continue;
+            }
+            uint64_t const group = GroupGuid(bot);
+            plans.Observe(live.botGuid, group, ControllerHolds(bot, group, live.owner.controllerGuid));
+        }
+        for (PlanRestore<PlayerbotBridge::Baseline> const& restore : plans.Pending(nowMs))
+        {
+            switch (PlayerbotBridge::Restore(phase.join, restore.key.botGuid, restore.baseline, restore.applied))
+            {
+                case PlayerbotBridge::RestoreResult::Restored:
+                case PlayerbotBridge::RestoreResult::Superseded:  // A later command won; left as it is.
+                    plans.Restored(restore.key);
+                    break;
+                case PlayerbotBridge::RestoreResult::Gone:  // Logged out: nothing to write.
+                    plans.Departed(restore.key.botGuid);
+                    break;
+                default:  // Failed (a teleport) or Rejected: retried a bounded number of times, then dropped.
+                    plans.RestoreFailed(restore.key, nowMs);
+                    break;
+            }
+        }
     }
 
 private:
@@ -41,6 +93,36 @@ private:
     {
         Group* group = player->GetGroup();
         return group ? group->GetGUID().GetRawValue() : 0;
+    }
+
+    // The bridge controller authority BridgeCapture and playerbots' admission use, not mere group membership: the
+    // connected controller is in the bot's group and is the bot's master, or the leader of a masterless bot.
+    static bool ControllerHolds(Player* bot, uint64_t groupGuid, uint64_t controllerGuid)
+    {
+        PlayerbotAI* ai = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
+        Player* controller = ObjectAccessor::FindConnectedPlayer(ObjectGuid(controllerGuid));
+        if (!ai || !controller || !groupGuid || GroupGuid(controller) != groupGuid)
+            return false;
+        if (Player* master = ai->GetMaster())
+            return master == controller;
+        Group* group = bot->GetGroup();
+        return group && group->GetLeaderGUID().GetRawValue() == controllerGuid;
+    }
+
+    static PlayerbotBridge::FormationShape Shape(std::optional<ChannelShape> shape)
+    {
+        if (!shape)
+            return PlayerbotBridge::FormationShape::None;
+        switch (*shape)
+        {
+            case ChannelShape::Close:
+                return PlayerbotBridge::FormationShape::Close;
+            case ChannelShape::Spread:
+                return PlayerbotBridge::FormationShape::Spread;
+            case ChannelShape::Line:
+                return PlayerbotBridge::FormationShape::Line;
+        }
+        return PlayerbotBridge::FormationShape::None;  // Playerbots refuses a formation without a shape.
     }
 
     static EffectResult Effect(EffectPhase const& phase, WorldTicket const& ticket, DispatchGuard const& guard,
@@ -113,6 +195,17 @@ private:
             case ChannelIntent::Position:
                 order.Operation = PlayerbotBridge::Intent::Position;
                 break;
+            case ChannelIntent::Formation:
+                order.Operation = PlayerbotBridge::Intent::Formation;
+                order.Shape = Shape(effect->shape);
+                break;
+            case ChannelIntent::SaveMana:
+                order.Operation = PlayerbotBridge::Intent::SaveMana;
+                order.Enabled = effect->enabled;
+                break;
+            case ChannelIntent::FocusHealing:
+                order.Operation = PlayerbotBridge::Intent::FocusHealing;
+                break;
             default:
                 return EffectResult::Rejected;  // An unmapped verb never reaches playerbots.
         }
@@ -126,7 +219,30 @@ private:
         order.X = effect->position.x;
         order.Y = effect->position.y;
         order.Z = effect->position.z;
+        // J12: a lasting verb needs the ledger's admission and the bot's current state of that part before every
+        // attempt, a repeat too (the ledger compares it with its last applied value to see a person's change); no
+        // admission or no capture, no mutation. One clock reading serves admission and record.
+        auto const kind = PlanKindFor(effect->intent);
+        PlanKey const key{effect->botGuid, kind.value_or(PlanKind::Count)};
+        PlanOwner const owner{effect->groupGuid, effect->controllerGuid, ticket.generation};
+        int64_t const nowMs = Now().steadyMs;
+        PlayerbotBridge::Baseline before;
+        if (kind && (Plans().Admit(key, owner, nowMs) == PlanAdmission::Refused ||
+                     !PlayerbotBridge::Capture(phase.join, effect->botGuid,
+                                               PlayerbotBridge::LastingPart(order.Operation), before)))
+            return EffectResult::Rejected;
         auto const outcome = PlayerbotBridge::Execute(phase.join, order, authorize);
+        // After every attempt that may have written (Applied, or Failed after partial writes), the state now is what
+        // the bridge set; Rejected and Unavailable promise no mutation and record nothing. An attempt left unrecorded
+        // (the bot left the world inside the call, or the ledger refused; neither can happen today) has no restore,
+        // so it is counted for the watchlist line.
+        if (kind && (outcome == PlayerbotBridge::Result::Applied || outcome == PlayerbotBridge::Result::Failed))
+        {
+            PlayerbotBridge::Baseline applied;
+            if (!PlayerbotBridge::Capture(phase.join, effect->botGuid, before.Held, applied) ||
+                !Plans().Record(key, owner, before, applied, nowMs))
+                Plans().NoteUnrecorded();
+        }
         // DS.10: a mark that applied or may have applied re-baselines only this bot's stored marks, so the bot does
         // not react to its own mark change; other bots in the group still observe it. Rejected and Unavailable
         // promise no mutation.
@@ -154,4 +270,20 @@ OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
 {
     static OllamaBridge::BridgeCommandExecutor executor;
     return executor;
+}
+
+void OllamaChat_BridgePlansOpen(uint64_t generation) { OllamaBridge::BridgeCommandExecutor::Plans().Open(generation); }
+
+void OllamaChat_BridgePlansRetire() { OllamaBridge::BridgeCommandExecutor::Plans().RetireAll(); }
+
+void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const& phase)
+{
+    OllamaBridge::BridgeCommandExecutor::UpdatePlans(phase, OllamaBridge::Now().steadyMs);
+}
+
+bool OllamaChat_BridgePlansEmpty() { return OllamaBridge::BridgeCommandExecutor::Plans().Empty(); }
+
+OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters()
+{
+    return OllamaBridge::BridgeCommandExecutor::Plans().Counters();
 }

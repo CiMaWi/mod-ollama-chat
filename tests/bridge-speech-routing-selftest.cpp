@@ -330,7 +330,7 @@ void Reset()
     config.provider = OllamaProvider::Bridge;
     config.bridge = {"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-bearer-only"};
     g_bridgeWorld.Configured(true, config.bridge, "epoch-1");
-    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::GenerationOnlyNoCaptures), "selected");
+    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures), "selected");
     g_bridgeGeneration = g_bridgeWorld.Generation();
     gameGuard = {};
     gameGuard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "party", "visible", "c1", "m1", "p1"};

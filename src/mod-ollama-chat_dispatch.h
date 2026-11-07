@@ -3,6 +3,7 @@
 
 #include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_handler.h"
+#include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_api.h"
@@ -116,6 +117,15 @@ bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBri
 OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource();
 // World-only typed effect adapter (bridge_effect.cpp).
 OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor();
+// J12 lasting plans of that executor, world thread only: Open after each activation with its generation; Retire
+// makes every live plan restore-pending and closes admission (no game access, so RetireBridgeWork may call it);
+// Update (post-map-join) expires, checks group, controller and logout, and restores; Empty is the retirement proof's
+// half: no live and no restore-pending plan.
+void OllamaChat_BridgePlansOpen(uint64_t generation);
+void OllamaChat_BridgePlansRetire();
+void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const& phase);
+bool OllamaChat_BridgePlansEmpty();
+OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters();
 void OllamaChat_BridgeRefresh();
 // World thread: re-baselines the stored marks of botGuid's own bindings after its mark order, publishing nothing.
 void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid);

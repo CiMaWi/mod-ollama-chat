@@ -8,8 +8,17 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
+#include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "observer-settings.inc"
+
+// The typed-effect phase the extracted lifecycle passes to the plan tick (opaque here).
+namespace OllamaBridge
+{
+struct EffectPhase
+{
+};
+}  // namespace OllamaBridge
 
 namespace
 {
@@ -148,7 +157,7 @@ void Wire()
 
     WorldPolicy policy;
     policy.Configured(true, settings, epoch);
-    Check(policy.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures), "policy selected after drain");
+    Check(policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "policy selected after drain");
     scope = Scope(epoch);
     Clock const now{100000, 200000};
     Check(policy.ObserveScope(scope, now), "scope world capture");
@@ -224,7 +233,7 @@ void Lane()
     Check(observer.BindEpoch(epoch, true, clock()), "world epoch bound after drain");
     WorldPolicy policy(&observer);
     policy.Configured(true, Config(), epoch);
-    Check(policy.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures) && policy.ObserveScope(scope, clock()),
+    Check(policy.ObserveDrain(true, RetirementProof::NoLiveCaptures) && policy.ObserveScope(scope, clock()),
           "world policy attached to observer invalidation");
     observer.Publish({scope}, true, clock());
     Until(
@@ -473,7 +482,40 @@ std::array<unsigned char, N> GetRandomBytes()
 bool g_channelEnabled = false;
 std::deque<EventPublication> g_eventPublications;
 WorldChannel g_bridgeChannel(g_bridgeWorld, [](WorldTicket const&, DispatchGuard&) { return false; });
+// J12 plan hooks over the real ledger (int state). The stand-in tick restores every due plan while restoreWorks.
+PlanLedger<int> plans;
+unsigned planOpens = 0;
+unsigned planRetires = 0;
+bool restoreWorks = true;
+int64_t planNowMs = 0;
+EffectPhase const phase{};
+void OllamaChat_BridgePlansOpen(uint64_t generation)
+{
+    ++planOpens;
+    plans.Open(generation);
+}
+void OllamaChat_BridgePlansRetire()
+{
+    ++planRetires;
+    plans.RetireAll();
+}
+bool OllamaChat_BridgePlansEmpty() { return plans.Empty(); }
+void OllamaChat_BridgePlansUpdate(EffectPhase const&)
+{
+    planNowMs += PlanRestoreRetryMs;
+    if (!restoreWorks)
+        return;  // The bot cannot be restored yet (e.g. a long loading screen): nothing counted.
+    for (auto const& restore : plans.Pending(planNowMs))
+        plans.Restored(restore.key);
+}
+void OllamaChat_BridgeRefresh() {}
 #include "observer-adapter.inc"
+
+// A live movement plan of the current generation.
+void LivePlan()
+{
+    Check(plans.Record({7, PlanKind::Movement}, {1, 2, g_bridgeGeneration}, 4, 2, planNowMs), "a live plan");
+}
 
 void Adapter()
 {
@@ -510,17 +552,72 @@ void Adapter()
             return !activated.epoch.empty();
         });
     Check(first != activated.epoch, "world creates fresh suffix on reopen");
+    // J12: a native retirement with a live plan neither selects nor retires again until the plan is restored.
+    Check(plans.Generation() == g_bridgeGeneration, "native activation opens the plan ledger");
+    LivePlan();
+    restoreWorks = false;
+    OllamaDispatch_BridgeConfigured(false);
+    auto const retires = planRetires;
+    Check(!plans.Empty() && activated.epoch.empty(), "native reload makes the plan restore-pending");
+    for (int i = 0; i < 200; ++i)
+    {
+        UpdateBridgeLifecycle(phase);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Check(activated.epoch.empty() && planRetires == retires && !plans.Empty(),
+          "native selection waits for the restore without retiring again");
+    restoreWorks = true;
+    Until(
+        [&]
+        {
+            UpdateBridgeLifecycle(phase);
+            return !activated.epoch.empty();
+        });
+    Check(plans.Empty() && plans.Generation() == g_bridgeGeneration && planRetires == retires,
+          "after the restore native selection opens the new generation");
     config.provider = OllamaProvider::Ollama;
     OllamaDispatch_BridgeConfigured(false);
     Check(!g_nativeSelected && activated.epoch.empty() && !g_nativeObserver.State().enabled, "provider switch revokes");
     config.provider = OllamaProvider::Bridge;
     config.bridge.observerEnabled = false;
     OllamaDispatch_BridgeConfigured(false);
-    Check(!g_nativeSelected && g_bridgeWorld.ObserveDrain(true, RetirementProof::GenerationOnlyNoCaptures),
+    Check(!g_nativeSelected && g_bridgeWorld.ObserveDrain(true, RetirementProof::NoLiveCaptures),
           "legacy selection unchanged");
+    // J12, generic path: the tick restores first, and a retired plan blocks selection until it is restored.
+    OllamaDispatch_BridgeConfigured(false);
+    auto const opens = planOpens;
+    UpdateBridgeLifecycle(phase);
+    Check(!activated.epoch.empty() && planOpens == opens + 1 && plans.Generation() == g_bridgeGeneration &&
+              g_bridgeGeneration != 0,
+          "generic selection opens the plan ledger with its generation");
+    LivePlan();
+    restoreWorks = false;
+    auto const genericRetires = planRetires;
+    OllamaDispatch_BridgeConfigured(false);
+    Check(planRetires == genericRetires + 1 && plans.Size() == 1 && !plans.Empty() && activated.epoch.empty() &&
+              g_bridgeGeneration == 0,
+          "reload makes the plan restore-pending");
+    Check(BridgeRetirementProof() == RetirementProof::Unknown, "no retirement proof while a plan waits");
+    UpdateBridgeLifecycle(phase);
+    Check(activated.epoch.empty() && g_bridgeGeneration == 0 && !plans.Empty(),
+          "no new generation while a retired plan waits for its restore");
+    restoreWorks = true;
+    UpdateBridgeLifecycle(phase);
+    Check(plans.Empty() && !activated.epoch.empty() && g_bridgeGeneration != 0 &&
+              plans.Generation() == g_bridgeGeneration && BridgeRetirementProof() == RetirementProof::NoLiveCaptures,
+          "the tick restores first, then the drained retirement selects in the same call and reopens the ledger");
+    // J12: a reload that disables the module retires a live plan, and the disabled tick still restores it.
+    LivePlan();
+    restoreWorks = true;
     g_Enable = false;
     OllamaDispatch_BridgeConfigured(false);
     Check(!g_nativeSelected && g_bridgeWorld.Selected().epoch.empty(), "module disabled inactive");
+    Check(!plans.Empty() && g_bridgeGeneration == 0, "disabling the module makes the plan restore-pending");
+    auto const restored = plans.Counters().restored;
+    UpdateBridgeLifecycle(phase);
+    Check(plans.Empty() && plans.Counters().restored == restored + 1 && activated.epoch.empty() &&
+              g_bridgeGeneration == 0,
+          "a disabled tick restores the retired plan and selects nothing");
     g_nativeObserver.Stop();
 }
 }  // namespace

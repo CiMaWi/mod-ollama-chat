@@ -15,8 +15,9 @@
 // the bridge set last, the owner (group, controller, bridge generation) and the expiry, and turns expiry, group or
 // controller change and retirement into restore-pending entries the world tick restores. Value is the game side's
 // state type for one plan kind; its operator== compares that kind's state. World-thread only; the steady clock in
-// milliseconds is passed in. Memory only: a restart forgets it. Every per-tick call is O(1) and allocates nothing
-// while Empty().
+// milliseconds is passed in. Memory only: a restart forgets it. While Empty(), every per-tick call is O(1) and
+// allocates nothing; otherwise LiveBots() is O(entries x bots) and Pending() allocates, both bounded by
+// MaxPlanEntries.
 namespace OllamaBridge
 {
 // One applied plan lasts ten minutes from its latest application (person-paced, never lingers across a dungeon); a
@@ -93,14 +94,17 @@ enum class PlanAdmission : uint8_t
 
 struct PlanCounters
 {
-    uint64_t applied = 0;    // New entries, baseline captured.
-    uint64_t renewed = 0;    // Repeats of a live entry.
-    uint64_t expired = 0;    // Live -> restore-pending at the deadline (or on a clock rollback).
-    uint64_t regrouped = 0;  // Live -> restore-pending on a group or controller change.
-    uint64_t retired = 0;    // Live -> restore-pending on retirement or a generation change.
-    uint64_t restored = 0;   // Pending entries the game side restored (or found superseded by a later change).
-    uint64_t departed = 0;   // Entries dropped unrestored because the bot logged out.
-    uint64_t abandoned = 0;  // Pending entries dropped after MaxPlanRestoreAttempts failed restores.
+    uint64_t applied = 0;     // New entries, baseline captured.
+    uint64_t renewed = 0;     // Repeats of a live entry.
+    uint64_t expired = 0;     // Live -> restore-pending at the deadline (or on a clock rollback).
+    uint64_t regrouped = 0;   // Live -> restore-pending on a group or controller change.
+    uint64_t retired = 0;     // Live -> restore-pending on retirement or a generation change.
+    uint64_t restored = 0;    // Pending entries the game side restored (or found superseded by a later change).
+    uint64_t departed = 0;    // Entries dropped unrestored because the bot logged out.
+    uint64_t abandoned = 0;   // Pending entries dropped after MaxPlanRestoreAttempts failed restores.
+    uint64_t unrecorded = 0;  // Attempts that may have written but left no entry (NoteUnrecorded): no restore.
+
+    bool operator==(PlanCounters const&) const = default;
 };
 
 // The owner of a bot's live plans (one owner per bot), for the tick's group, controller and logout checks.
@@ -305,6 +309,10 @@ public:
                 return entry.applied;
         return std::nullopt;
     }
+
+    // The caller attempted a mutation it could not record (the state after it unreadable, or Record refused): that
+    // effect has no restore. Counted only, so the watchlist line shows it.
+    void NoteUnrecorded() { ++_counters.unrecorded; }
 
     // No live and no pending entry: the only state in which the bridge holds no capture to restore.
     bool Empty() const { return _entries.empty(); }

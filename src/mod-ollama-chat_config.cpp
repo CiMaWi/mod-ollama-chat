@@ -944,7 +944,7 @@ void LoadOllamaChatConfig()
     OllamaPersona::DiscardStagedPersonaWrites();
     OllamaPersona::WorldStore().Configure(g_Enable && personaCardsEnabled);
     // Explicit world-thread load/reload notification also retires work when the module is disabled.
-    // The random-chatter update hook may return before dispatcher Update in that state.
+    // In that state the world tick still restores the retired lasting plans and does nothing else.
     bool const channelEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ChannelEnabled", false);
     OllamaDispatch_BridgeConfigured(channelEnabled);
     // J5d: the mailbox's 127.0.0.1 transport; a reload restarts it only when the port or the token changed.

@@ -105,7 +105,7 @@ struct Fixture
     {
         channel.Configure(true);
         world.Configured(true, settings, "epoch-1");
-        Check(world.ObserveDrain(channel.Drained(), RetirementProof::GenerationOnlyNoCaptures), "real selection");
+        Check(world.ObserveDrain(channel.Drained(), RetirementProof::NoLiveCaptures), "real selection");
         Check(channel.Activate(), "channel opt in");
         WorldScope scope{1, "fixture", "codex", "epoch-1", 11, 22, "context", "party", "visible", "c1", "m1", "p1"};
         Check(world.ObserveScope(scope, now), "trusted observed scope");
@@ -217,10 +217,12 @@ void PureSeam()
     unsigned supported = 0;
     for (int intent = 0; intent <= static_cast<int>(ChannelIntent::DungeonClear); ++intent)
         supported += EffectSupported(static_cast<ChannelIntent>(intent)) ? 1 : 0;
-    Check(supported == 6 && EffectSupported(ChannelIntent::AttackOwnTarget) && EffectSupported(ChannelIntent::Mark) &&
+    Check(supported == 9 && EffectSupported(ChannelIntent::AttackOwnTarget) && EffectSupported(ChannelIntent::Mark) &&
               EffectSupported(ChannelIntent::Follow) && EffectSupported(ChannelIntent::Stay) &&
-              EffectSupported(ChannelIntent::Flee) && EffectSupported(ChannelIntent::Position),
-          "only the six PB-backed verbs reach an executor");
+              EffectSupported(ChannelIntent::Flee) && EffectSupported(ChannelIntent::Position) &&
+              EffectSupported(ChannelIntent::Formation) && EffectSupported(ChannelIntent::SaveMana) &&
+              EffectSupported(ChannelIntent::FocusHealing),
+          "only the nine PB-backed verbs reach an executor (J12 adds the three lasting settings)");
     Check(EffectOutcome(EffectResult::Applied, true) == ChannelOutcome::Applied &&
               EffectOutcome(EffectResult::Failed, true) == ChannelOutcome::Failed &&
               EffectOutcome(EffectResult::Rejected, true) == ChannelOutcome::Rejected &&
@@ -478,12 +480,11 @@ void OutcomesNeverReplay()
 void FixedRefusals()
 {
     Fixture f;
+    // J12: focus_healing, save_mana and formation are lasting plans now; the four without a playerbots effect stay
+    // refused (DS.9).
     std::pair<char const*, Json> const others[] = {{"regroup", Json::object()},
                                                    {"pull", Json{{"targetGuid", "44"}}},
-                                                   {"focus_healing", Json{{"targetGuid", "22"}}},
                                                    {"assign_role", Json{{"role", "tank"}}},
-                                                   {"save_mana", Json{{"enabled", true}}},
-                                                   {"formation", Json{{"shape", "close"}}},
                                                    {"dungeon_clear", Json{{"mode", "on"}}}};
     unsigned refused = 0;
     for (auto const& [intent, params] : others)
@@ -491,10 +492,14 @@ void FixedRefusals()
         auto const id = "refused-" + std::to_string(refused++);
         Check(f.Result(f.Send(f.Command(id, intent, params)), id) == "rejected", "fixed refusal receipt");
     }
-    Check(refused == 7 && f.probe.calls == 0 && f.channel.Commands().refused == 7 && !f.channel.Commands().attempts,
-          "all seven other verbs refused with no executor call");
+    Check(refused == 4 && f.probe.calls == 0 && f.channel.Commands().refused == 4 && !f.channel.Commands().attempts,
+          "all four other verbs refused with no executor call");
     Check(f.Result(f.Send(f.Attack("after-refusals")), "after-refusals") == "applied" && f.probe.calls == 1,
           "refusals spend no rate interval");
+    Fixture lasting;
+    lasting.Send(lasting.Command("lasting", "formation", Json{{"shape", "close"}}));
+    Check(lasting.probe.calls == 1 && lasting.channel.Commands().attempts == 1,
+          "a lasting setting reaches the executor");
 
     Fixture closed({.executor = false});
     Check(closed.Result(closed.Send(closed.Attack("no-executor")), "no-executor") == "rejected" &&
@@ -550,9 +555,9 @@ void VerbMatrix()
                         {"position", spot, true},
                         {"pull", Json{{"targetGuid", "44"}}, false},
                         {"regroup", Json::object(), false},
-                        {"formation", Json{{"shape", "close"}}, false},
-                        {"save_mana", Json{{"enabled", true}}, false},
-                        {"focus_healing", Json{{"targetGuid", "22"}}, false},
+                        {"formation", Json{{"shape", "close"}}, true},
+                        {"save_mana", Json{{"enabled", true}}, true},
+                        {"focus_healing", Json{{"targetGuid", "44"}}, true},
                         {"assign_role", Json{{"role", "tank"}}, false},
                         {"dungeon_clear", Json{{"mode", "on"}}, false}};
     Check(std::size(rows) == static_cast<size_t>(ChannelIntent::DungeonClear) + 1, "the matrix names every wire verb");
@@ -585,7 +590,7 @@ void VerbMatrix()
                   "a fixed refusal spends no rate interval");
         }
     }
-    Check(delivered == 6 && refusals == 7, "six delivered verbs and seven fixed refusals");
+    Check(delivered == 9 && refusals == 4, "nine delivered verbs and four fixed refusals");
     // Standing follow and stay (a duration or a standing flag) have no wire shape: the exact parameter check refuses
     // the packet as invalid input before any command exists, so nothing is admitted, attempted or executed.
     for (char const* intent : {"follow", "stay"})
@@ -641,7 +646,7 @@ void RetirementBeforeTick()
     f.world.Configured(true, f.settings, "epoch-2");
     Check(f.channel.Update(&phase) == 0 && f.probe.calls == 0, "epoch switch before the tick: no world work");
     f.channel.Configure(true);
-    Check(f.channel.Drained() && f.world.ObserveDrain(f.channel.Drained(), RetirementProof::GenerationOnlyNoCaptures) &&
+    Check(f.channel.Drained() && f.world.ObserveDrain(f.channel.Drained(), RetirementProof::NoLiveCaptures) &&
               f.channel.Activate(),
           "retirement disposed the queued command; new epoch selected");
     Check(f.Result(id, "retired") == "absent", "no receipt from a retired epoch");

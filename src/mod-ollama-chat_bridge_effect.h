@@ -29,14 +29,16 @@ enum class EffectResult : uint8_t
     Failed  // Attempted after authorization; may follow partial writes and never grants a retry.
 };
 
-// DS.3: only verbs with an accepted typed game effect reach an executor. Every other verb gets the fixed refusal
-// here, before any game read; lasting-state verbs stay refused until J12. Follow, stay, flee and position are
-// one-time moves.
+// DS.3: only verbs with an accepted typed game effect reach an executor. Every other verb (regroup, pull,
+// assign_role, dungeon_clear: no safe playerbots effect, DS.9) gets the fixed refusal here, before any game read.
+// Attack, mark, flee and position are one-time; follow, stay, formation, save_mana and focus_healing are lasting
+// plans (J12): the executor captures the bot's state first and the plan ledger restores it later.
 inline bool EffectSupported(ChannelIntent intent)
 {
     return intent == ChannelIntent::AttackOwnTarget || intent == ChannelIntent::Mark ||
            intent == ChannelIntent::Follow || intent == ChannelIntent::Stay || intent == ChannelIntent::Flee ||
-           intent == ChannelIntent::Position;
+           intent == ChannelIntent::Position || intent == ChannelIntent::Formation ||
+           intent == ChannelIntent::SaveMana || intent == ChannelIntent::FocusHealing;
 }
 
 // Rejected and Unavailable promise no mutation. Only an attempt the channel authorized can be applied; any other
@@ -57,21 +59,29 @@ struct EffectOrder
     uint64_t groupGuid = 0;
     uint64_t targetGuid = 0;
     uint8_t icon = 0;
-    ChannelPosition position;  // Position only: the destination MapIntent matched against the pathable fact.
+    ChannelPosition position;           // Position only: the destination MapIntent matched against the pathable fact.
+    std::optional<ChannelShape> shape;  // Formation only.
+    bool enabled = false;               // SaveMana only.
 };
 
 // The one unit an executor resolves for visibility: the bot's current own target for an attack, the payload's
-// target for a mark. Zero resolves nothing, so the target fact stays closed.
+// target for a mark or a focus heal. Zero resolves nothing, so the target fact stays closed.
 inline uint64_t EffectTargetGuid(ChannelCommand const& command, uint64_t ownTargetGuid)
 {
     if (command.intent == ChannelIntent::AttackOwnTarget)
         return ownTargetGuid;
+    if (command.intent == ChannelIntent::FocusHealing)
+    {
+        auto const* target = std::get_if<ChannelTarget>(&command.params);
+        return target ? target->guid : 0;
+    }
     auto const* mark = command.intent == ChannelIntent::Mark ? std::get_if<ChannelMark>(&command.params) : nullptr;
     return mark ? mark->guid : 0;
 }
 
-// A supported verb mapped from freshly resolved facts with the captured group; otherwise none. An attack or a mark
-// needs a nonzero target, a target-less verb must carry none; a position carries its checked destination.
+// A supported verb mapped from freshly resolved facts with the captured group; otherwise none. An attack, a mark or a
+// focus heal needs a nonzero target, a target-less verb must carry none; a position carries its checked destination,
+// a formation its shape and save_mana its flag.
 inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command, IntentContext const& current)
 {
     if (!EffectSupported(command.intent))
@@ -93,7 +103,12 @@ inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command
     }
     else if (auto const* position = std::get_if<ChannelPosition>(&mapped->params))
         order.position = *position;
-    bool const targeted = order.intent == ChannelIntent::AttackOwnTarget || order.intent == ChannelIntent::Mark;
+    else if (auto const* shape = std::get_if<ChannelShape>(&mapped->params))
+        order.shape = *shape;
+    else if (auto const* enabled = std::get_if<bool>(&mapped->params))
+        order.enabled = *enabled;
+    bool const targeted = order.intent == ChannelIntent::AttackOwnTarget || order.intent == ChannelIntent::Mark ||
+                          order.intent == ChannelIntent::FocusHealing;
     if (!order.groupGuid || (targeted ? !order.targetGuid : order.targetGuid != 0))
         return std::nullopt;
     return order;

@@ -206,18 +206,20 @@ OllamaBotRandomChatter::OllamaBotRandomChatter() : WorldScript("OllamaBotRandomC
 
 void OllamaBotRandomChatter::OnUpdate(uint32 diff)
 {
-    if (!g_Enable)
-        return;
-
     // The module's world tick. These run before any feature toggle can return
     // early, because pending replies still have to be delivered even when
     // random chatter itself is switched off.
     // World::Update has joined MapMgr::Update's map workers before
     // ScriptMgr::OnWorldUpdate calls this hook, so this frame is the
     // post-map-join phase typed bridge effects need. Only this stack
-    // holds the token.
+    // holds the token. It runs even with the module disabled: the reload
+    // that disabled it retired the bridge, and only this tick restores the
+    // bots' retired lasting plans (J12); the dispatcher does nothing else then.
     PlayerbotBridge::PostMapJoin const join;
     OllamaDispatch_Update(diff, join);
+
+    if (!g_Enable)
+        return;
 
     static uint32 maintenanceTimer = 0;
     if (maintenanceTimer <= diff)
