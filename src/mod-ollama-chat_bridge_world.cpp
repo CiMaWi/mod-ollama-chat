@@ -632,6 +632,18 @@ bool WorldPolicy::Current(WorldTicket const& ticket, Clock now) const
            it->second.ticket.request.controllerGuid == ticket.request.controllerGuid;
 }
 
+bool WorldPolicy::PendingFor(WorldScope const& scope, Clock now) const
+{
+    return ScopeCurrent(scope, now) && std::any_of(_pending.begin(), _pending.end(),
+                                                   [&](auto const& entry)
+                                                   {
+                                                       auto const& ticket = entry.second.ticket;
+                                                       return ticket.generation == _generation &&
+                                                              ticket.scope == scope &&
+                                                              !Expired(ticket.request.deadline, now);
+                                                   });
+}
+
 bool WorldPolicy::MarkQueued(WorldTicket const& ticket, Clock now)
 {
     if (!Current(ticket, now))

@@ -1408,7 +1408,7 @@ bool BridgeSameVoice(BridgeBinding const& binding, BridgeView const& current)
 
 // DS.8, Refresh and Observe only: a binding captured without a ready card (Unready or Loading: voice only, nothing
 // offered, stamp 0) survives a card change, so a card loading after the message keeps the in-flight reply. Submit
-// stays strict (BridgeSame) and renews such a binding at the next message.
+// stays strict (BridgeSame) and renews such a binding at the next message, unless J14d keeps it.
 bool BridgeTolerates(BridgeBinding const& binding, BridgeView const& current)
 {
     return BridgeSame(binding, current) ||
@@ -1525,8 +1525,17 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
                                return item.view.guard.scope.botGuid == view.guard.scope.botGuid &&
                                       item.view.guard.scope.contextId == view.guard.scope.contextId;
                            });
+    auto const now = Now();
     std::string memory;
-    if (it != g_bridgeBindings.end() && !BridgeSame(*it, view))
+    // J14d: a tolerated binding is kept instead of renewed while the new capture's card is not ready either (a renewal
+    // would bring no card, only a new revision and a native context reset) or while one of its replies is in flight
+    // (a renewal invalidates the scope's pending tickets). The kept binding answers on its own voice-only view, as the
+    // in-flight reply does; the first message after those replies renews it with the card.
+    bool const renew =
+        it != g_bridgeBindings.end() && !BridgeSame(*it, view) &&
+        !(BridgeTolerates(*it, view) &&
+          (!BridgeCardReady(view.card.status) || OllamaDispatch_BridgeWorld().PendingFor(it->view.guard.scope, now)));
+    if (renew)
     {
         // DS.8: a binding the refresh tolerated is renewed with its current card and a new persona revision; its
         // one-exchange memory (same speaker, scope and voice) moves to the renewal.
@@ -1536,7 +1545,6 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
         BridgeErase(it);
         it = g_bridgeBindings.end();
     }
-    auto const now = Now();
     if (it == g_bridgeBindings.end())
     {
         if (g_bridgeBindings.size() >= MaxWorldScopes || g_bridgeRevision == UINT64_MAX)
@@ -1555,7 +1563,8 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     }
     it->idleUntil = CaptureDeadline(now, MaxLifetimeMs);
     auto input = it->view.context;
-    // BridgeSame just proved the binding's card current. Without an opportunity the request stays as before.
+    // BridgeSame proved the binding's card current, or a deferred renewal kept a not-ready card that offers nothing.
+    // Without an opportunity the request stays as before.
     input.card = BridgeCardOpportunity(it->view.card);
     input.text = text;
     input.directAddress = addressed;

@@ -1083,7 +1083,8 @@ bool CardDeliver()
 
 // J14c (DS.8): a card going from empty or loading to ready keeps the binding and its in-flight reply (Refresh and
 // Observe); Submit compares strictly and renews the binding with the card, keeping its one-exchange memory. A ready
-// card that changes under the same voice is churn: the binding is erased and counted.
+// card that changes under the same voice is churn: the binding is erased and counted. J14d: Submit keeps a tolerated
+// binding while the new card is not ready either or while one of its replies is in flight.
 void CardTests()
 {
     using namespace OllamaBridge;
@@ -1149,19 +1150,56 @@ void CardTests()
           "card D: the renewal carries the accepted card");
     g_queue.clear();
 
-    // E: a message while the card loads renews to a loading binding; that one tolerates loading -> ready too.
+    // E: a message while the card loads keeps the not-ready binding and its revision (J14d: the renewal would bring
+    // no card); that binding tolerates loading -> ready and the next message renews it.
     CardFixture();
     Check(CardSubmit("One."), "card E: first message admitted");
-    g_queue.clear();
-    OllamaChat_BridgeRefresh();
+    auto const one = g_queue.front().request.bridgeTicket;
+    Check(CardDeliver() && routeCalls == 1 && !g_bridgeWorld.PendingFor(one.scope, Now()),
+          "card E: the first reply is delivered while the card loads");
     Check(CardSubmit("Two."), "card E: message while loading admitted");
     auto const loading = g_queue.back().request.bridgeTicket;
-    Check(g_bridgeBindings.size() == 1 && g_bridgeBindings[0].view.card.status == OllamaPersona::CardStatus::Loading,
-          "card E: the renewal captured the loading card");
+    Check(g_bridgeBindings.size() == 1 && loading.scope == one.scope &&
+              g_bridgeBindings[0].view.card.status == OllamaPersona::CardStatus::Unready &&
+              !loading.request.input.card.offered,
+          "card E: a loading card keeps the binding and its revision");
     cardPort.Complete();
     OllamaChat_BridgeRefresh();
-    Check(g_bridgeBindings.size() == 1 && g_bridgeWorld.Current(loading, Now()) && CardDeliver() && routeCalls == 1,
+    Check(g_bridgeBindings.size() == 1 && g_bridgeWorld.Current(loading, Now()) && CardDeliver() && routeCalls == 2,
           "card E: loading -> missing keeps the request and delivers its reply");
+    Check(CardSubmit("Three.") && !(g_queue.back().request.bridgeTicket.scope == one.scope) &&
+              g_queue.back().request.bridgeTicket.request.input.card.offered &&
+              g_queue.back().request.bridgeTicket.request.input.memory.find("Two.") != std::string::npos,
+          "card E: the next message renews with the card and the exchange memory");
+    g_queue.clear();
+
+    // G (J14d): a quick second line on a first meeting, after the card loaded but before reply 1 arrived, keeps the
+    // tolerated binding while reply 1 is in flight. Both replies are delivered in order on the same voice-only view;
+    // the next message renews with the card and the latest exchange.
+    CardFixture();
+    Check(CardSubmit("Hi."), "card G: first message admitted");
+    auto const hi = g_queue.front().request.bridgeTicket;
+    cardPort.Complete();
+    OllamaChat_BridgeRefresh();
+    Check(CardSubmit("How are you?"), "card G: second line admitted while reply 1 is in flight");
+    auto const how = g_queue.back().request.bridgeTicket;
+    Check(g_queue.size() == 2 && how.scope == hi.scope && g_bridgeWorld.Current(hi, Now()) &&
+              g_bridgeWorld.Current(how, Now()) && g_bridgeBindings.size() == 1,
+          "card G: the in-flight reply keeps the binding and its ticket");
+    Check(!how.request.input.card.offered && how.request.input.persona == voice && how.request.input.memory.empty(),
+          "card G: the second line rides on the same voice-only view");
+    Check(CardDeliver() && routeCalls == 1 && g_bridgeBindings.size() == 1 &&
+              g_bridgeBindings[0].memory.find("Hi.") != std::string::npos,
+          "card G: reply 1 is delivered first");
+    Check(CardDeliver() && routeCalls == 2 && g_bridgeBindings.size() == 1 &&
+              g_bridgeBindings[0].memory.find("How are you?") != std::string::npos,
+          "card G: reply 2 is delivered next");
+    Check(CardSubmit("Glad to hear."), "card G: next message admitted");
+    auto const glad = g_queue.back().request.bridgeTicket;
+    Check(!(glad.scope == hi.scope) && glad.scope.personaRevision != hi.scope.personaRevision &&
+              glad.request.input.card.offered && glad.request.input.persona == voice &&
+              glad.request.input.memory.find("How are you?") != std::string::npos && g_bridgeCardChurn == churn + 1,
+          "card G: the next message renews with the card and the latest exchange");
     g_queue.clear();
 
     // F: the tolerance covers card fields only; a voice or audience change still erases a not-ready binding.

@@ -204,6 +204,8 @@ public:
     bool MarkQueued(WorldTicket const& ticket, Clock now);
     bool Complete(WorldTicket const& ticket, WorldOutcome outcome, Clock now);
     bool Current(WorldTicket const& ticket, Clock now) const;
+    // A current reservation of exactly this scope is still in flight (reserved, queued or completed, not delivered).
+    bool PendingFor(WorldScope const& scope, Clock now) const;
     // Claims once; retains current scope/deadline validation until the world caller calls Cancel on every exit.
     bool Consume(WorldTicket const& ticket, Clock now);
     void Cancel(WorldTicket const& ticket);
