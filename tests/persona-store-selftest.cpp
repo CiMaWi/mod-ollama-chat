@@ -109,23 +109,23 @@ void CheckLoads()
     port.Complete(first, LookupStatus::Missing);
     store.Pump(now);
     Check(store.Pending() == 1 && store.Observe(1, Bot).status == StoreStatus::Loading, "stale reply keeps newer pin");
-    port.Complete(second, LookupStatus::Found, State{OtherBot, 1, {}, "wrong guid", {}});
+    port.Complete(second, LookupStatus::Found, State{OtherBot, 1, {}});
     store.Pump(now);
     Check(store.Observe(1, Bot).status == StoreStatus::Unavailable, "same low counter cannot substitute full GUID");
 
     now += StoreRetryDelay;
     store.Prepare(1, Bot, now);
-    port.Complete(port.Take(), LookupStatus::Found, State{Bot, 0, {}, {}, {}});
+    port.Complete(port.Take(), LookupStatus::Found, State{Bot, 0, {}});
     store.Pump(now);
     Check(!store.Observe(1, Bot).state, "zero revision row cannot masquerade as confirmed missing");
     now += StoreRetryDelay;
     store.Prepare(1, Bot, now);
-    port.Complete(port.Take(), LookupStatus::Found, State{Bot, 1, Card{Source::Codex, ""}, {}, {}});
+    port.Complete(port.Take(), LookupStatus::Found, State{Bot, 1, Card{Source::Codex, ""}});
     store.Pump(now);
     Check(!store.Observe(1, Bot).state, "corrupt accepted slot is unavailable");
     now += StoreRetryDelay;
     store.Prepare(1, Bot, now);
-    port.Complete(port.Take(), LookupStatus::Missing, State{Bot, 1, {}, "unexpected row", {}});
+    port.Complete(port.Take(), LookupStatus::Missing, State{Bot, 1, {}});
     store.Pump(now);
     Check(!store.Observe(1, Bot).state, "missing outcome cannot carry a row");
 
@@ -133,19 +133,18 @@ void CheckLoads()
     LoadMissing(store, port, 1, Bot, now);
     auto missing = store.Observe(1, Bot);
     Check(missing.status == StoreStatus::Missing && missing.state && missing.stamp && missing.state->botGuid == Bot &&
-              !missing.state->revision && !missing.state->accepted && missing.state->claudeAlternative.empty() &&
-              missing.state->codexAlternative.empty(),
-          "confirmed missing carries exact key and empty slots");
+              !missing.state->revision && !missing.state->accepted,
+          "confirmed missing carries exact key and no card");
     port.Complete(second, LookupStatus::Missing);
     store.Pump(now);
     Check(store.Pending() == 0 && store.Observe(1, Bot).stamp == missing.stamp, "duplicate does not replace snapshot");
     store.Prepare(1, OtherBot, now);
-    port.Complete(port.Take(), LookupStatus::Found, State{OtherBot, 8, {}, {}, "draft only"});
+    port.Complete(port.Take(), LookupStatus::Found, State{OtherBot, 8, {}});
     store.Pump(now);
     auto loaded = store.Observe(1, OtherBot);
-    Check(loaded.status == StoreStatus::Loaded && loaded.state && !loaded.state->accepted &&
-              loaded.state->claudeAlternative.empty() && loaded.state->codexAlternative == "draft only",
-          "valid draft-only row preserves nullable slots");
+    Check(
+        loaded.status == StoreStatus::Loaded && loaded.state && !loaded.state->accepted && loaded.state->revision == 8,
+        "a row from before J14e that held only drafts loads as no card");
 }
 
 void CheckWrites()
@@ -155,27 +154,26 @@ void CheckWrites()
     Enable(store, port);
     LoadMissing(store, port, 1, Bot, Start);
     uint64_t const firstStamp = store.Observe(1, Bot).stamp;
-    Update proposal{UpdateKind::ProposeAlternative, Bot, 0, Source::Claude, "first draft"};
-    Check(!store.SubmitUpdate(1, firstStamp, false, proposal), "unacquainted update refused");
-    Check(!store.SubmitUpdate(2, firstStamp, true, proposal), "wrong generation refused");
-    Check(!store.SubmitUpdate(1, firstStamp + 1, true, proposal), "wrong snapshot refused");
+    Update proposal{UpdateKind::SetManual, Bot, 0, Source::Manual, "first card"};
+    Check(!store.SubmitUpdate(2, firstStamp, proposal), "wrong generation refused");
+    Check(!store.SubmitUpdate(1, firstStamp + 1, proposal), "wrong snapshot refused");
     proposal.expectedRevision = 1;
-    Check(!store.SubmitUpdate(1, firstStamp, true, proposal), "wrong expected revision refused");
+    Check(!store.SubmitUpdate(1, firstStamp, proposal), "wrong expected revision refused");
     proposal.expectedRevision = 0;
     Check(port.jobs.empty(), "refused writes queue no work");
 
     port.accepting = false;
-    Check(!store.SubmitUpdate(1, firstStamp, true, proposal) && store.Observe(1, Bot).stamp == firstStamp,
+    Check(!store.SubmitUpdate(1, firstStamp, proposal) && store.Observe(1, Bot).stamp == firstStamp,
           "port refusal preserves confirmed state");
     port.accepting = true;
-    Check(store.SubmitUpdate(1, firstStamp, true, proposal), "absent insert queued");
-    Check(!store.SubmitUpdate(1, firstStamp, true, proposal), "pending insert blocks second write");
+    Check(store.SubmitUpdate(1, firstStamp, proposal), "absent insert queued");
+    Check(!store.SubmitUpdate(1, firstStamp, proposal), "pending insert blocks second write");
     auto insert = port.Take();
     Check(insert.write && insert.write->priorRevision == 0 && insert.write->next.revision == 1,
           "first write requests absent insert");
     Check(store.Observe(1, Bot).status == StoreStatus::Loading && !store.Observe(1, Bot).state,
           "proposed row is hidden until confirmation");
-    State conflicting{Bot, 1, Card{Source::Manual, "operator card"}, {}, "competing draft"};
+    State conflicting{Bot, 1, Card{Source::Manual, "operator card"}};
     port.Complete(insert, LookupStatus::Found, conflicting, false);
     store.Pump(Start);
     Check(!store.Observe(1, Bot).state, "failed insert conflict does not publish a row");
@@ -188,7 +186,7 @@ void CheckWrites()
     Check(loaded.state && loaded.state->revision == 1 && loaded.state->accepted->source == Source::Manual,
           "ordinary reload may publish the conflicting persisted row");
     proposal.expectedRevision = 1;
-    Check(store.SubmitUpdate(1, loaded.stamp, true, proposal), "existing-row CAS queued");
+    Check(store.SubmitUpdate(1, loaded.stamp, proposal), "existing-row CAS queued");
     auto cas = port.Take();
     Check(cas.write && cas.write->priorRevision == 1 && cas.write->next.revision == 2,
           "CAS uses exact prior revision and next row");
@@ -196,14 +194,14 @@ void CheckWrites()
     store.Pump(now);
     Check(!store.Observe(1, Bot).state, "committed zero-row CAS with old readback stays unconfirmed");
 
-    State newer{Bot, 3, Card{Source::Manual, "operator card"}, "newer draft", "competing draft"};
+    State newer{Bot, 3, Card{Source::Manual, "operator card"}};
     now += StoreRetryDelay;
     store.Prepare(1, Bot, now);
     port.Complete(port.Take(), LookupStatus::Found, newer);
     store.Pump(now);
     loaded = store.Observe(1, Bot);
     proposal.expectedRevision = 3;
-    Check(store.SubmitUpdate(1, loaded.stamp, true, proposal), "write after reload uses newest persisted revision");
+    Check(store.SubmitUpdate(1, loaded.stamp, proposal), "write after reload uses newest persisted revision");
     auto failedReadback = port.Take();
     port.Complete(failedReadback, LookupStatus::Failed, {}, true);
     store.Pump(now);
@@ -213,7 +211,7 @@ void CheckWrites()
     store.Prepare(1, Bot, now);
     port.Complete(port.Take(), LookupStatus::Found, newer);
     store.Pump(now);
-    Check(store.SubmitUpdate(1, store.Observe(1, Bot).stamp, true, proposal), "candidate can be tried after reload");
+    Check(store.SubmitUpdate(1, store.Observe(1, Bot).stamp, proposal), "candidate can be tried after reload");
     auto mismatched = port.Take();
     State changedProvenance = mismatched.write->next;
     changedProvenance.accepted->source = Source::Claude;
@@ -225,7 +223,7 @@ void CheckWrites()
     store.Prepare(1, Bot, now);
     port.Complete(port.Take(), LookupStatus::Found, newer);
     store.Pump(now);
-    Check(store.SubmitUpdate(1, store.Observe(1, Bot).stamp, true, proposal), "newer-row race can queue");
+    Check(store.SubmitUpdate(1, store.Observe(1, Bot).stamp, proposal), "newer-row race can queue");
     auto lostRace = port.Take();
     State afterRace = lostRace.write->next;
     ++afterRace.revision;
@@ -237,15 +235,14 @@ void CheckWrites()
     store.Prepare(1, Bot, now);
     port.Complete(port.Take(), LookupStatus::Found, newer);
     store.Pump(now);
-    Check(store.SubmitUpdate(1, store.Observe(1, Bot).stamp, true, proposal), "exact-row race can queue");
+    Check(store.SubmitUpdate(1, store.Observe(1, Bot).stamp, proposal), "exact-row race can queue");
     auto exact = port.Take();
     port.Complete(exact, LookupStatus::Found, exact.write->next, true);
     store.Pump(now);
     auto confirmed = store.Observe(1, Bot);
-    Check(confirmed.state && confirmed.state->revision == 4 && confirmed.state->claudeAlternative == "first draft" &&
-              confirmed.state->codexAlternative == "competing draft" &&
-              confirmed.state->accepted->source == Source::Manual,
-          "exact concurrent candidate proves persisted state and preserves independent slots");
+    Check(confirmed.state && confirmed.state->revision == 4 && confirmed.state->accepted->source == Source::Manual &&
+              confirmed.state->accepted->body == "first card",
+          "exact concurrent candidate proves persisted state");
 }
 
 void CheckLifecycle()
@@ -258,10 +255,10 @@ void CheckLifecycle()
     store.Forget(Bot);
     LoadMissing(store, port, 1, Bot, Start);
     uint64_t const sameRevisionStamp = store.Observe(1, Bot).stamp;
-    Update proposal{UpdateKind::ProposeAlternative, Bot, 0, Source::Codex, "retiring draft"};
-    Check(oldStamp != sameRevisionStamp && !store.SubmitUpdate(1, oldStamp, true, proposal),
+    Update proposal{UpdateKind::ApplyGenerated, Bot, 0, Source::Codex, "A retiring smith."};
+    Check(oldStamp != sameRevisionStamp && !store.SubmitUpdate(1, oldStamp, proposal),
           "same-revision reload after logout invalidates old generation opportunity");
-    Check(store.SubmitUpdate(1, sameRevisionStamp, true, proposal), "write can use freshly loaded snapshot");
+    Check(store.SubmitUpdate(1, sameRevisionStamp, proposal), "write can use freshly loaded snapshot");
     auto retiredWrite = port.Take();
     store.Forget(Bot);
     store.Configure(false);
@@ -292,8 +289,8 @@ void CheckLifecycle()
               port.jobs.empty(),
           "a loaded row survives retirement and a new generation without a new read");
     Check(!store.Observe(2, Bot).state &&
-              !store.SubmitUpdate(2, store.Observe(3, Bot).stamp, true,
-                                  Update{UpdateKind::ProposeAlternative, Bot, 1, Source::Codex, "old ticket"}),
+              !store.SubmitUpdate(2, store.Observe(3, Bot).stamp,
+                                  Update{UpdateKind::SetManual, Bot, 1, Source::Manual, "old ticket"}),
           "an older generation's read and update stay refused");
     store.Forget(Bot);
     store.Prepare(3, Bot, Start);
@@ -319,10 +316,10 @@ void CheckReloadKeepsRows()
           "a same-enabled reload keeps the loaded row for the next generation without a read");
     store.Prepare(2, Bot, Start);
     Check(port.jobs.empty(), "a kept row needs no new read");
-    Check(!store.Observe(1, Bot).state &&
-              !store.SubmitUpdate(1, stamp, true,
-                                  Update{UpdateKind::ProposeAlternative, Bot, 0, Source::Codex, "old ticket"}),
-          "an old-generation read and update are refused");
+    Check(
+        !store.Observe(1, Bot).state &&
+            !store.SubmitUpdate(1, stamp, Update{UpdateKind::ApplyGenerated, Bot, 0, Source::Codex, "An old ticket."}),
+        "an old-generation read and update are refused");
     Check(store.Activate(3) && store.Observe(3, Bot).state && !store.Observe(2, Bot).state,
           "a newer generation keeps the row and refuses the previous one");
     store.Configure(false);
@@ -353,11 +350,14 @@ void CheckCapacity()
 
     for (uint64_t guid = MaxStoreOperations + 1; guid <= MaxStoreEntries; ++guid)
         LoadMissing(store, port, 1, guid, Start);
+    for (uint32_t i = 0; i < MaxCardOffers; ++i)
+        Check(store.TakeOffer(1, 2), "offers before an eviction");
     uint64_t const evictedStamp = store.Observe(1, 2).stamp;
     store.Prepare(1, 1, Start);
     store.Prepare(1, Bot, Start);
     auto pinned = port.Take();
     Check(store.Observe(1, 1).state && !store.Observe(1, 2).state, "capacity evicts the least recently used idle row");
+    Check(!store.TakeOffer(1, 2), "an eviction keeps the bot's card opportunity count");
     LoadMissing(store, port, 1, 2, Start);
     Check(store.Observe(1, 2).stamp != evictedStamp && store.Observe(1, Bot).status == StoreStatus::Loading,
           "eviction reload changes the stamp and keeps pending keys pinned");
@@ -379,115 +379,180 @@ void CheckCapacity()
     Check(store.Observe(2, Bot).state, "expired cooldown frees space for a new bot");
 }
 
+// J14e (DS.12): at most MaxCardOffers card opportunities per bot in one bridge generation.
+void CheckOffers()
+{
+    FakePort port;
+    Store store;
+    Check(!store.TakeOffer(1, Bot), "a disabled store offers nothing");
+    Enable(store, port);
+    Check(!store.TakeOffer(2, Bot) && !store.TakeOffer(1, 0), "another generation or no bot is offered nothing");
+    for (uint32_t i = 0; i < MaxCardOffers; ++i)
+        Check(store.TakeOffer(1, Bot), "an offer within the bound");
+    Check(!store.TakeOffer(1, Bot), "the fourth offer in a generation is refused");
+    Check(store.TakeOffer(1, OtherBot), "the bound is per bot");
+    store.Forget(Bot);
+    for (uint32_t i = 0; i < MaxCardOffers; ++i)
+        Check(store.TakeOffer(1, Bot), "forget erases the bot's count");
+    Check(!store.TakeOffer(1, Bot), "a forgotten bot gets the same bound again");
+    Check(store.Activate(2) && !store.TakeOffer(1, Bot), "a new generation refuses the old one");
+    for (uint32_t i = 0; i < MaxCardOffers; ++i)
+        Check(store.TakeOffer(2, Bot), "a new generation resets the count");
+    Check(!store.TakeOffer(2, Bot), "the bound holds in the new generation");
+    store.Configure(true);
+    Check(!store.TakeOffer(2, Bot) && store.Activate(3), "a reload unbinds the generation");
+    for (uint32_t i = 0; i < MaxCardOffers; ++i)
+        Check(store.TakeOffer(3, Bot), "a reload resets the count");
+    Check(!store.TakeOffer(3, Bot), "the bound holds after a reload");
+}
+
 void CheckCards()
 {
     Store store;
     FakePort port;
     std::string const voice = "A quiet traveler.";
     std::string persona = voice;
-    auto const read = [&](uint64_t generation, uint64_t guid, bool personal)
+    auto const read = [&](uint64_t generation, uint64_t guid)
     {
         persona = voice;
-        return ReadCard(store, generation, guid, personal, persona);
+        return ReadCard(store, generation, guid, persona);
     };
-    auto const propose =
-        [&](bool personal, std::string_view provider, uint64_t revision, uint64_t stamp, std::string body)
-    { return ProposeCard(store, 1, Bot, personal, provider, revision, stamp, std::move(body)); };
+    auto const propose = [&](std::string_view provider, uint64_t revision, uint64_t stamp, std::string body)
+    { return ProposeCard(store, 1, Bot, provider, revision, stamp, std::move(body)); };
 
-    CardContext card = read(1, Bot, true);
+    CardContext card = read(1, Bot);
     Check(card.status == CardStatus::Unready && persona == voice && CardToken(card).empty(),
           "closed gate leaves voice and signature unchanged");
-    Check(propose(true, "claude", 0, 1, "Draft") == ProposalStatus::Disabled, "closed gate refuses proposals");
+    Check(propose("claude", 0, 1, "A smith.") == ProposalStatus::Disabled, "closed gate refuses proposals");
     Enable(store, port);
-    card = read(1, Bot, true);
-    Check(card.status == CardStatus::Unready && card.personal && persona == voice && CardToken(card).empty(),
+    card = read(1, Bot);
+    Check(card.status == CardStatus::Unready && persona == voice && CardToken(card).empty(),
           "unobserved card stays voice only");
     store.Prepare(1, Bot, Start);
-    card = read(1, Bot, false);
-    Check(card.status == CardStatus::Unready && !card.personal && CardToken(card).empty(),
-          "ineligible pair never reads the store");
-    card = read(1, Bot, true);
+    card = read(1, Bot);
     Check(card.status == CardStatus::Loading && CardToken(card) == "card:loading:0:0", "loading is distinct");
     auto job = port.Take();
     port.Complete(job, LookupStatus::Missing);
     store.Pump(Start);
-    card = read(1, Bot, true);
+    card = read(1, Bot);
     Check(card.status == CardStatus::Missing && card.revision == 0 && card.stamp == job.id && persona == voice &&
               CardToken(card) == "card:missing:0:" + std::to_string(job.id),
           "confirmed missing row is revision zero and distinct");
-    Check(read(2, Bot, true).status == CardStatus::Unready, "another generation reads nothing");
+    Check(read(2, Bot).status == CardStatus::Unready, "another generation reads nothing");
 
     uint64_t const missingStamp = card.stamp;
     Check(ProviderSource("claude") == Source::Claude && ProviderSource("codex") == Source::Codex &&
               !ProviderSource("Claude") && !ProviderSource("manual") && !ProviderSource(""),
           "provenance maps only exact authenticated provider names");
-    Check(propose(true, "ollama", 0, missingStamp, "Draft") == ProposalStatus::Unauthenticated,
+    Check(propose("ollama", 0, missingStamp, "A smith.") == ProposalStatus::Unauthenticated,
           "unknown provider cannot propose");
-    Check(propose(false, "claude", 0, missingStamp, "Draft") == ProposalStatus::Ineligible,
-          "non-personal pair cannot propose");
-    Check(propose(true, "claude", 1, missingStamp, "Draft") == ProposalStatus::Stale &&
-              propose(true, "claude", 0, missingStamp + 1, "Draft") == ProposalStatus::Stale &&
-              ProposeCard(store, 2, Bot, true, "claude", 0, missingStamp, "Draft") == ProposalStatus::Stale,
+    Check(propose("claude", 1, missingStamp, "A smith.") == ProposalStatus::Stale &&
+              propose("claude", 0, missingStamp + 1, "A smith.") == ProposalStatus::Stale &&
+              ProposeCard(store, 2, Bot, "claude", 0, missingStamp, "A smith.") == ProposalStatus::Stale,
           "wrong revision, stamp or generation is stale");
-    Check(propose(true, "claude", 0, missingStamp, " ") == ProposalStatus::Rejected && port.jobs.empty(),
-          "invalid body is refused without I/O");
-    Check(propose(true, "codex", 0, missingStamp, "A smith from Goldshire.") == ProposalStatus::Queued,
-          "current proposal queues");
+    Check(propose("claude", 0, missingStamp, " ") == ProposalStatus::Invalid &&
+              propose("claude", 0, missingStamp, std::string("A\0smith", 7)) == ProposalStatus::Invalid &&
+              propose("claude", 0, missingStamp, "A \x1B[31msmith") == ProposalStatus::Invalid &&
+              propose("claude", 0, missingStamp, "A smith \xC3") == ProposalStatus::Invalid &&
+              propose("claude", 0, missingStamp, std::string(MaxGeneratedCardBytes + 1, 's')) ==
+                  ProposalStatus::Invalid &&
+              port.jobs.empty(),
+          "a card breaking the module's rules is refused without I/O");
+    port.accepting = false;
+    Check(propose("codex", 0, missingStamp, "A smith from Goldshire.") == ProposalStatus::Busy &&
+              store.Observe(1, Bot).stamp == missingStamp,
+          "a refused write slot is busy and keeps the confirmed row");
+    port.accepting = true;
+    std::string const longest(MaxGeneratedCardBytes, 's');
+    Check(PlanUpdate(*store.Observe(1, Bot).state, {UpdateKind::ApplyGenerated, Bot, 0, Source::Claude, longest})
+                  .status == UpdateStatus::Ready,
+          "a card of exactly the generated bound is valid");
+    Check(propose("codex", 0, missingStamp, "A smith from Goldshire.") == ProposalStatus::Queued,
+          "a valid generated card is applied without an acceptance step");
     auto write = port.Take();
-    Check(write.write && write.write->priorRevision == 0 && !write.write->next.accepted &&
-              write.write->next.codexAlternative == "A smith from Goldshire." &&
-              write.write->next.claudeAlternative.empty(),
-          "provider proposal fills only its own alternative");
-    Check(read(1, Bot, true).status == CardStatus::Loading &&
-              propose(true, "codex", 0, missingStamp, "Again") == ProposalStatus::Stale,
+    Check(write.write && write.write->priorRevision == 0 && write.write->next.revision == 1 &&
+              write.write->next.accepted && write.write->next.accepted->source == Source::Codex &&
+              write.write->next.accepted->body == "A smith from Goldshire.",
+          "the write is the accepted card at revision one with the provider's provenance");
+    Check(read(1, Bot).status == CardStatus::Loading &&
+              propose("codex", 0, missingStamp, "Again.") == ProposalStatus::Stale,
           "pending write reads as loading and its old snapshot is stale");
     port.Complete(write, LookupStatus::Found, write.write->next, true);
     store.Pump(Start);
-    card = read(1, Bot, true);
-    Check(card.status == CardStatus::DraftOnly && card.revision == 1 && card.stamp == write.id && persona == voice &&
-              CardToken(card) == "card:draft:1:" + std::to_string(write.id),
-          "draft-only row is distinct and never reaches the voice");
-
-    Check(store.SubmitUpdate(1, card.stamp, true, {UpdateKind::AcceptAlternative, Bot, 1, Source::Codex, ""}),
-          "trusted selection queues");
-    write = port.Take();
-    port.Complete(write, LookupStatus::Found, write.write->next, true);
-    store.Pump(Start);
-    card = read(1, Bot, true);
-    Check(card.status == CardStatus::Accepted && card.revision == 2 &&
+    card = read(1, Bot);
+    Check(card.status == CardStatus::Accepted && card.revision == 1 && card.stamp == write.id && card.included &&
               persona == voice + "\n\nA smith from Goldshire." &&
-              CardToken(card) == "card:accepted:2:" + std::to_string(write.id),
-          "accepted body follows the voice");
-    Check(read(1, Bot, false).status == CardStatus::Unready && persona == voice,
-          "accepted card stays out of a non-personal context");
+              CardToken(card) == "card:accepted:1:" + std::to_string(write.id),
+          "a confirmed card follows the voice from the next read");
+    Check(propose("claude", 1, card.stamp, "A different smith.") == ProposalStatus::HasCard &&
+              propose("codex", 1, card.stamp, "A smith from Goldshire.") == ProposalStatus::HasCard &&
+              port.jobs.empty(),
+          "a provider never replaces a card, a second apply is refused");
     std::string const acceptedToken = CardToken(card);
     store.Forget(Bot);
     store.Prepare(1, Bot, Start);
     auto reload = port.Take();
     port.Complete(reload, LookupStatus::Found, write.write->next);
     store.Pump(Start);
-    CardContext const reloaded = read(1, Bot, true);
-    Check(reloaded.revision == 2 && persona == voice + "\n\nA smith from Goldshire." &&
+    CardContext const reloaded = read(1, Bot);
+    Check(reloaded.revision == 1 && persona == voice + "\n\nA smith from Goldshire." &&
               CardToken(reloaded) != acceptedToken,
           "same-revision reload with unchanged text changes the signed token");
-    Check(propose(true, "codex", 2, card.stamp, "Old view") == ProposalStatus::Stale,
+    Check(propose("codex", 1, card.stamp, "Old view.") == ProposalStatus::Stale,
           "proposal on a replaced snapshot is stale");
+
+    Check(store.SubmitUpdate(1, reloaded.stamp, {UpdateKind::SetManual, Bot, 1, Source::Manual, "An owner's smith."}),
+          "the owner's edit may replace a generated card");
+    write = port.Take();
+    port.Complete(write, LookupStatus::Found, write.write->next, true);
+    store.Pump(Start);
+    card = read(1, Bot);
+    Check(card.status == CardStatus::Accepted && card.revision == 2 && persona == voice + "\n\nAn owner's smith.",
+          "the owner's card follows the voice");
+    Check(propose("claude", 2, card.stamp, "A smith.") == ProposalStatus::ManualProtected && port.jobs.empty(),
+          "a manual card is never replaced by a provider");
+
+    uint64_t const legacyBot = 0xD000000000000042;
+    store.Prepare(1, legacyBot, Start);
+    auto legacy = port.Take();
+    port.Complete(legacy, LookupStatus::Found, State{legacyBot, 4, {}});
+    store.Pump(Start);
+    persona = voice;
+    card = ReadCard(store, 1, legacyBot, persona);
+    Check(card.status == CardStatus::NoCard && card.revision == 4 && !card.included && persona == voice &&
+              CardToken(card) == "card:none:4:" + std::to_string(legacy.id),
+          "a row without a card reads as no card and adds nothing to the voice");
+    Check(ProposeCard(store, 1, legacyBot, "claude", 4, card.stamp, "A wary miner.") == ProposalStatus::Queued,
+          "a row without a card takes a generated card");
+    write = port.Take();
+    Check(write.write && write.write->priorRevision == 4 && write.write->next.revision == 5 &&
+              write.write->next.accepted->source == Source::Claude,
+          "the card is written by compare and swap at the next revision");
+    port.Complete(write, LookupStatus::Found, write.write->next, true);
+    store.Pump(Start);
+
+    Check(std::string_view(ProposalStatusName(ProposalStatus::Queued)) == "queued" &&
+              std::string_view(ProposalStatusName(ProposalStatus::Invalid)) == "invalid" &&
+              std::string_view(ProposalStatusName(ProposalStatus::HasCard)) == "has_card" &&
+              std::string_view(ProposalStatusName(ProposalStatus::ManualProtected)) == "manual_protected" &&
+              std::string_view(ProposalStatusName(ProposalStatus::Busy)) == "busy",
+          "refusal reasons have log names");
 
     std::string const multibyte =
         "Gr\xC3\xBC\xC3\x9F"
         "e aus Azeroth.";
     store.Prepare(1, OtherBot, Start);
     auto load = port.Take();
-    port.Complete(load, LookupStatus::Found, State{OtherBot, 1, Card{Source::Manual, multibyte}, "", ""});
+    port.Complete(load, LookupStatus::Found, State{OtherBot, 1, Card{Source::Manual, multibyte}});
     store.Pump(Start);
     std::string const exact(MaxCardBytes - CardSeparator.size() - multibyte.size(), 'v');
     persona = exact;
-    card = ReadCard(store, 1, OtherBot, true, persona);
+    card = ReadCard(store, 1, OtherBot, persona);
     Check(card.status == CardStatus::Accepted && card.included && persona.size() == MaxCardBytes &&
               persona.ends_with(multibyte),
           "voice and card fill the 8192-byte budget exactly");
     persona = exact + "v";
-    card = ReadCard(store, 1, OtherBot, true, persona);
+    card = ReadCard(store, 1, OtherBot, persona);
     Check(card.status == CardStatus::Accepted && !card.included && persona == exact + "v",
           "voice keeps priority and a card that does not fit is omitted whole, never cut");
 }
@@ -537,11 +602,18 @@ public:
     bool closedWithCommit = false;
 };
 
-PersonaDbRow MissingRow(uint64_t botGuid) { return {botGuid, {}, {}, {}, {}, {}, {}}; }
+PersonaDbRow MissingRow(uint64_t botGuid) { return {botGuid, {}, {}, {}, {}}; }
+
+PersonaDbRow NoCardRow(uint64_t botGuid, uint64_t revision) { return {botGuid, botGuid, revision, uint8_t{0}, {}}; }
+
+PersonaDbRow ManualRow(uint64_t botGuid, uint64_t revision, std::string_view body)
+{
+    return {botGuid, botGuid, revision, uint8_t{1}, body};
+}
 
 PersonaDbRow ClaudeRow(uint64_t botGuid, uint64_t revision, std::string_view body)
 {
-    return {botGuid, botGuid, revision, uint8_t{0}, {}, body, {}};
+    return {botGuid, botGuid, revision, uint8_t{2}, body};
 }
 
 void CheckPreparedDecode()
@@ -557,11 +629,10 @@ void CheckPreparedDecode()
     row.acceptedSource = uint8_t{0};
     Check(decode(row).lookup == LookupStatus::Failed, "partial nullable row is corrupt");
 
-    row = ClaudeRow(Bot, 0xF000000000000000, "Draft");
+    row = NoCardRow(Bot, 0xF000000000000000);
     auto const found = decode(row);
     Check(found.lookup == LookupStatus::Found && found.row && found.row->botGuid == Bot &&
-              found.row->revision == *row.revision && !found.row->accepted && found.row->claudeAlternative == "Draft" &&
-              found.row->codexAlternative.empty(),
+              found.row->revision == *row.revision && !found.row->accepted,
           "preserve full GUID, unsigned revision and absent accepted slot");
     row.botGuid = OtherBot;
     Check(decode(row).lookup == LookupStatus::Failed, "wrong joined GUID is corrupt");
@@ -574,17 +645,18 @@ void CheckPreparedDecode()
     row.acceptedSource = uint8_t{9};
     Check(decode(row).lookup == LookupStatus::Failed, "unknown provenance fails closed");
     row.acceptedSource = uint8_t{1};
-    row.codexAlternative = "Codex";
     auto const accepted = decode(row);
     Check(accepted.row && accepted.row->accepted && accepted.row->accepted->source == Source::Manual &&
-              accepted.row->accepted->body == "Manual" && accepted.row->codexAlternative == "Codex",
-          "distinct accepted and draft slots decode independently");
-    row.claudeAlternative = "";
-    Check(decode(row).lookup == LookupStatus::Failed, "nonnull empty alternative is corrupt");
-    row.claudeAlternative = std::string_view("x\0y", 3);
+              accepted.row->accepted->body == "Manual",
+          "accepted slot decodes with its provenance");
+    row.acceptedSource = uint8_t{3};
+    Check(decode(row).row && decode(row).row->accepted->source == Source::Codex, "a generated card decodes as such");
+    row.acceptedBody = "";
+    Check(decode(row).lookup == LookupStatus::Failed, "nonnull empty card is corrupt");
+    row.acceptedBody = std::string_view("x\0y", 3);
     Check(decode(row).lookup == LookupStatus::Failed, "embedded null is preserved for validation");
     std::string const large(MaxCardBytes + 1, 'x');
-    row.claudeAlternative = large;
+    row.acceptedBody = large;
     Check(decode(row).lookup == LookupStatus::Failed, "oversize result is rejected");
 }
 
@@ -604,12 +676,12 @@ void CheckPreparedWrites()
     };
     auto const propose = [&](uint64_t guid, uint64_t revision, std::string const& body)
     {
-        Check(store.SubmitUpdate(1, store.Observe(1, guid).stamp, true,
-                                 {UpdateKind::ProposeAlternative, guid, revision, Source::Claude, body}),
+        Check(store.SubmitUpdate(1, store.Observe(1, guid).stamp,
+                                 {UpdateKind::SetManual, guid, revision, Source::Manual, body}),
               "queue revision-bound proposal");
     };
     ready(Bot, MissingRow(Bot), Start);
-    ready(OtherBot, ClaudeRow(OtherBot, 7, "Old"), Start);
+    ready(OtherBot, ManualRow(OtherBot, 7, "Old"), Start);
     propose(Bot, 0, "New");
     propose(OtherBot, 7, "Update");
     Check(!io.commit && io.lookups.empty(), "staged writes do not issue before world pump");
@@ -620,11 +692,11 @@ void CheckPreparedWrites()
     Check(io.lookups.empty(), "readback waits for the transaction callback");
     io.FinishCommit(true);
     Check(io.lookups.size() == 2, "successful commit issues independent fresh lookups");
-    io.Read(OtherBot, ClaudeRow(OtherBot, 7, "Old"));
+    io.Read(OtherBot, ManualRow(OtherBot, 7, "Old"));
     store.Pump(Start);
     Check(!store.Observe(1, OtherBot).state && store.Observe(1, Bot).status == StoreStatus::Loading,
           "committed zero-row CAS is unavailable while its peer remains pinned");
-    io.Read(Bot, ClaudeRow(Bot, 1, "New"));
+    io.Read(Bot, ManualRow(Bot, 1, "New"));
     store.Pump(Start);
     Check(store.Observe(1, Bot).status == StoreStatus::Loaded && !store.Pending(),
           "exact persisted candidate publishes even if concurrent attribution is unknown");
@@ -640,14 +712,14 @@ void CheckPreparedWrites()
           "failed insert can roll back whole batch, requiring ordinary reload of both rows");
 
     auto const later = retry + StoreRetryDelay;
-    ready(Bot, ClaudeRow(Bot, 1, "New"), later);
-    ready(OtherBot, ClaudeRow(OtherBot, 10, "Actual"), later);
+    ready(Bot, ManualRow(Bot, 1, "New"), later);
+    ready(OtherBot, ManualRow(OtherBot, 10, "Actual"), later);
     propose(Bot, 1, "Planned");
     propose(OtherBot, 10, "Planned");
     port.Pump();
     io.FinishCommit(true);
     io.Read(Bot, {});
-    io.Read(OtherBot, ClaudeRow(OtherBot, 12, "Newer"));
+    io.Read(OtherBot, ManualRow(OtherBot, 12, "Newer"));
     store.Pump(later);
     Check(!store.Observe(1, Bot).state && !store.Observe(1, OtherBot).state,
           "failed readback and newer persisted row cannot publish");
@@ -658,7 +730,7 @@ void CheckPreparedLifecycle()
     FakePersonaDb io;
     PersonaDbPort port(io);
     auto const stage = [&](uint64_t guid, uint64_t id)
-    { return port.TrySubmit({guid, id, StoreWrite{0, State{guid, 1, {}, "Draft", ""}}}); };
+    { return port.TrySubmit({guid, id, StoreWrite{0, State{guid, 1, Card{Source::Claude, "Draft"}}}}); };
     Check(stage(Bot, 1) && stage(OtherBot, 2), "stage two distinct bots");
     port.DiscardStaged(Bot);
     Check(!stage(Bot, 3), "discarded write still pins its key through disposal");
@@ -702,9 +774,9 @@ void CheckPreparedCardLifecycle()
     };
     auto const stage = [&](uint64_t guid)
     {
-        Check(ProposeCard(store, 1, guid, true, "codex", 0, store.Observe(1, guid).stamp, "Staged draft") ==
+        Check(ProposeCard(store, 1, guid, "codex", 0, store.Observe(1, guid).stamp, "A staged smith.") ==
                   ProposalStatus::Queued,
-              "stage provider draft");
+              "stage a generated card");
     };
     ready(Bot);
     ready(OtherBot);
@@ -750,6 +822,7 @@ int main(int argc, char** argv)
         CheckLifecycle();
         CheckReloadKeepsRows();
         CheckCapacity();
+        CheckOffers();
         CheckCards();
     }
     else if (argc != 2 || std::string_view(argv[1]) != "--prepared-db")

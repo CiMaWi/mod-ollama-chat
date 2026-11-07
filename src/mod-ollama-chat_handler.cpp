@@ -1100,6 +1100,26 @@ std::string GenerateBotGameStateSnapshot(Player* bot)
     );
 }
 
+// DS.12: the in-world facts a card generation gets about the bot, read on world. Outside the extracted adapter so
+// the offline checks supply their own; the envelope bounds and sanitizes every string. No database access.
+void BridgeCardFacts(Player* bot, OllamaBridge::CardFacts& facts)
+{
+    facts.name = bot->GetName();
+    facts.race = FormatPlayerRace(bot->getRace());
+    facts.className = FormatPlayerClass(bot->getClass());
+    facts.gender = bot->getGender() == GENDER_FEMALE ? "female" : "male";
+    facts.level = bot->GetLevel();
+    facts.faction = bot->GetTeamId() == TEAM_ALLIANCE ? "Alliance" : "Horde";
+    facts.guild = bot->GetGuildName();
+    if (PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot))
+        if (AreaTableEntry const* zone = botAI->GetCurrentZone())
+            facts.zone = botAI->GetLocalizedAreaName(zone);
+    // Only an existing assignment: GetBotPersonality may assign one with a synchronous query.
+    auto const personality = g_BotPersonalityList.find(bot->GetGUID().GetRawValue());
+    if (g_EnableRPPersonalities && personality != g_BotPersonalityList.end() && personality->second != "default")
+        facts.traits = personality->second;
+}
+
 // BEGIN BRIDGE WORLD ADAPTER -- extracted verbatim by the offline game-adapter checks.
 namespace
 {
@@ -1220,42 +1240,34 @@ public:
 };
 
 // BEGIN BRIDGE PERSONA CARD -- extracted verbatim by the offline persona adapter check.
-// Personal: the controlling speaker outside party scope, with a current acquaintance row for this exact pair. One
-// map lookup on world; fails closed while acquaintance is disabled or not loaded, and retries at a later exchange.
-bool BridgeCardPersonal(Player* bot, Player* speaker, Player* controller, OllamaBridge::DispatchSource source)
-{
-    if (speaker != controller || source == OllamaBridge::DispatchSource::Party ||
-        !sPlayerbotAIConfig.AcquaintanceEnable || !AcquaintanceMgr::Instance().IsLoaded())
-        return false;
-    // The 32-bit counters belong only to this playerbots API; the card key stays the full raw GUID.
-    return AcquaintanceMgr::Instance().Find(speaker->GetGUID().GetCounter(), bot->GetGUID().GetCounter()) != nullptr;
-}
-
-// Cache-only card read for one capture, no I/O. A closed gate, an ineligible pair or no current observation keeps
-// the view, its persona text and signature voice only. The caller signs the card token after the persona text.
-void BridgeCard(Player* bot, Player* speaker, Player* controller, BridgeView& view)
+// Cache-only card read for one capture, no I/O. DS.12: the card is the bot's own data, read for every speaker and
+// channel. A closed gate or no current observation keeps the view, its persona text and signature voice only. The
+// caller signs the card token after the persona text.
+void BridgeCard(BridgeView& view)
 {
     auto const& store = OllamaPersona::WorldStore();
     if (!store.Enabled())
         return;
-    view.card =
-        OllamaPersona::ReadCard(store, OllamaDispatch_BridgeWorld().Generation(), view.guard.scope.botGuid,
-                                BridgeCardPersonal(bot, speaker, controller, view.guard.source), view.context.persona);
+    view.card = OllamaPersona::ReadCard(store, OllamaDispatch_BridgeWorld().Generation(), view.guard.scope.botGuid,
+                                        view.context.persona);
 }
 
-// The generation's card opportunity: only a personal pair whose store is ready (Loading and Unready have no stamp).
-// Accepted only when the persona text really ends with the accepted card, never for one left out as too long.
-OllamaBridge::CardOpportunity BridgeCardOpportunity(OllamaPersona::CardContext const& card)
+// The generation's card opportunity (Loading and Unready have no stamp and offer nothing). An accepted card in the
+// persona text is reported as accepted. A bot without a card is offered a generation, at most MaxCardOffers times
+// per bridge generation. An accepted card left out as too long offers nothing: a provider never replaces a card.
+OllamaBridge::CardOpportunity BridgeCardOpportunity(OllamaPersona::CardContext const& card, uint64_t botGuid)
 {
+    using OllamaPersona::CardStatus;
     OllamaBridge::CardOpportunity opportunity;
-    if (!card.personal ||
-        (card.status != OllamaPersona::CardStatus::Missing && card.status != OllamaPersona::CardStatus::DraftOnly &&
-         card.status != OllamaPersona::CardStatus::Accepted))
+    bool const accepted = card.status == CardStatus::Accepted && card.included;
+    bool const wanted = card.status == CardStatus::Missing || card.status == CardStatus::NoCard;
+    if (!accepted &&
+        (!wanted || !OllamaPersona::WorldStore().TakeOffer(OllamaDispatch_BridgeWorld().Generation(), botGuid)))
         return opportunity;
     opportunity.offered = true;
     opportunity.revision = card.revision;
     opportunity.stamp = card.stamp;
-    opportunity.accepted = card.status == OllamaPersona::CardStatus::Accepted && card.included;
+    opportunity.accepted = accepted;
     return opportunity;
 }
 // END BRIDGE PERSONA CARD
@@ -1383,7 +1395,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     if (view.context.persona.size() > 8192)
         return drop("voice_too_long");
     std::size_t const voiceSize = view.context.persona.size();
-    BridgeCard(bot, speaker, led ? controller : nullptr, view);
+    BridgeCard(view);
     view.context.observations = {"Your name is " + bot->GetName() + ".", "The speaker is " + speaker->GetName() + "."};
     // Piggyback on this existing bounded observation; never add a world/group scan or tick hook.
     if (group)
@@ -1415,7 +1427,7 @@ bool BridgeSame(BridgeBinding const& binding, BridgeView const& current)
 
 bool BridgeCardReady(OllamaPersona::CardStatus status)
 {
-    return status == OllamaPersona::CardStatus::Missing || status == OllamaPersona::CardStatus::DraftOnly ||
+    return status == OllamaPersona::CardStatus::Missing || status == OllamaPersona::CardStatus::NoCard ||
            status == OllamaPersona::CardStatus::Accepted;
 }
 
@@ -1543,9 +1555,9 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
                  reason);
         return false;
     }
-    // The one load request: a qualified current encounter of a personal pair. Captures elsewhere only read.
-    if (view.card.personal)
-        cards.Prepare(generation, view.guard.scope.botGuid, std::chrono::steady_clock::now());
+    // The one load request: a qualified current encounter (DS.12: any speaker and channel; the card is the bot's own
+    // data). Captures elsewhere only read. A closed gate does no I/O.
+    cards.Prepare(generation, view.guard.scope.botGuid, std::chrono::steady_clock::now());
     auto const bridgeSettings = OllamaDispatch_BridgeWorld().Snapshot();
     if (bridgeSettings.provider == "codex" && bridgeSettings.observerEnabled)
     {
@@ -1610,7 +1622,13 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     auto input = it->view.context;
     // BridgeSame proved the binding's card current, or a deferred renewal kept a not-ready card that offers nothing.
     // Without an opportunity the request stays as before.
-    input.card = BridgeCardOpportunity(it->view.card);
+    input.card = BridgeCardOpportunity(it->view.card, it->view.guard.scope.botGuid);
+    if (input.card.offered && !input.card.accepted)
+    {
+        BridgeCardFacts(bot, input.card.facts);
+        LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge card offer for bot {} (revision {})",
+                 it->view.guard.scope.botGuid, input.card.revision);
+    }
     input.text = text;
     input.directAddress = addressed;
     input.memory = it->memory;
@@ -1717,10 +1735,9 @@ OllamaPersona::ProposalStatus OllamaChat_BridgeProposeCard(OllamaBridge::WorldTi
     auto const it = BridgeObserveFresh(ticket, current);
     if (it == g_bridgeBindings.end())
         return OllamaPersona::ProposalStatus::Stale;
-    // The fresh capture re-checked gate, acquaintance, controlling speaker and the signed card token.
+    // The fresh capture re-checked the gate, the binding and the signed card token.
     return OllamaPersona::ProposeCard(OllamaPersona::WorldStore(), it->generation, ticket.scope.botGuid,
-                                      current.card.personal, ticket.scope.provider, expectedRevision, stamp,
-                                      std::move(body));
+                                      ticket.scope.provider, expectedRevision, stamp, std::move(body));
 }
 
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply)

@@ -65,11 +65,32 @@ OllamaBridge::Request Request()
     return request;
 }
 
+OllamaBridge::CardFacts Facts()
+{
+    OllamaBridge::CardFacts facts;
+    facts.name = "Fixture";
+    facts.race = "Dwarf";
+    facts.className = "Warrior";
+    facts.gender = "female";
+    facts.level = 42;
+    facts.zone = "Dun Morogh";
+    facts.faction = "Alliance";
+    facts.traits = "Gruff";
+    return facts;
+}
+
+// DS.12: a bot without a card is offered with its facts; an accepted card is only reported.
 OllamaBridge::Request Offered(uint64_t revision = 5, bool accepted = true)
 {
     auto request = Request();
-    request.input.card = {true, revision, 77, accepted};
+    request.input.card = {true, revision, 77, accepted, accepted ? OllamaBridge::CardFacts{} : Facts()};
     return request;
+}
+
+nlohmann::json FactsJson()
+{
+    return {{"name", "Fixture"}, {"race", "Dwarf"},      {"class", "Warrior"},    {"gender", "female"},
+            {"level", 42},       {"zone", "Dun Morogh"}, {"faction", "Alliance"}, {"traits", "Gruff"}};
 }
 
 // Today's generation envelope, built independently of the production code.
@@ -140,14 +161,40 @@ void BuildChecks()
     Check(Build(settings, offered, Clock, body), "offered request builds");
     auto expected = Envelope(settings, offered);
     expected["input"]["personaCard"] = {{"revision", "5"}, {"accepted", true}};
-    Check(body == expected.dump(), "opportunity: exact personaCard {revision, accepted}");
+    Check(body == expected.dump(), "accepted card: exact personaCard {revision, accepted}, no context");
+    offered.input.card.facts = Facts();
+    Check(Build(settings, offered, Clock, body) && body == expected.dump(),
+          "accepted card: facts never go on the wire");
     Check(body.find("\"stamp\"") == std::string::npos, "opportunity: the store stamp never goes on the wire");
 
     auto missing = Offered(0, false);
     Check(Build(settings, missing, Clock, body), "missing row builds");
     expected = Envelope(settings, missing);
-    expected["input"]["personaCard"] = {{"revision", "0"}, {"accepted", false}};
-    Check(body == expected.dump(), "missing row: revision 0, not accepted");
+    expected["input"]["personaCard"] = {{"revision", "0"}, {"accepted", false}, {"context", FactsJson()}};
+    Check(body == expected.dump(), "missing row: revision 0, not accepted, the bot's facts as context");
+    auto sparse = Offered(3, false);
+    sparse.input.card.facts = {};
+    sparse.input.card.facts.race = "Gnome";
+    Check(Build(settings, sparse, Clock, body) &&
+              nlohmann::json::parse(body)["input"]["personaCard"]["context"] == nlohmann::json{{"race", "Gnome"}},
+          "absent facts, blank strings and level 0 are left out");
+    sparse.input.card.facts.className = " \t ";
+    sparse.input.card.facts.zone = "Elwynn\x01 Forest\x7F\n";
+    sparse.input.card.facts.guild = "Bad\xFF";
+    sparse.input.card.facts.name = std::string(70, 'n');
+    // 63 ASCII bytes and a two-byte character across the 64-byte cut: the whole character is dropped.
+    sparse.input.card.facts.traits = std::string(63, 't') + "\xC3\xA9" + "x";
+    Check(Build(settings, sparse, Clock, body), "dirty facts still build");
+    auto const context = nlohmann::json::parse(body)["input"]["personaCard"]["context"];
+    Check(context.size() == 4 && context["race"] == "Gnome" && context["zone"] == "Elwynn Forest" &&
+              context["name"] == std::string(MaxCardFactBytes, 'n') && context["traits"] == std::string(63, 't') &&
+              !context.contains("class") && !context.contains("guild"),
+          "facts drop control bytes, cut at 64 bytes on a character boundary, and drop invalid UTF-8");
+    sparse.input.card.facts.traits = std::string(62, 't') + "\xC3\xA9" + "x";
+    Check(Build(settings, sparse, Clock, body) &&
+              nlohmann::json::parse(body)["input"]["personaCard"]["context"]["traits"] ==
+                  std::string(62, 't') + "\xC3\xA9",
+          "a character ending exactly at the cut is kept");
     auto large = Offered(std::numeric_limits<uint64_t>::max(), false);
     Check(
         Build(settings, large, Clock, body) && body.find("\"revision\":\"18446744073709551615\"") != std::string::npos,
@@ -178,7 +225,7 @@ void BuildChecks()
     Check(pad <= 8192, "padding fits the persona bound");
     big.input.persona = std::string(pad, 'a');
     Check(Build(settings, big, Clock, body) && body.size() == MaxRequestBytes - 20, "plain request 20 bytes under");
-    big.input.card = {true, 5, 77, true};
+    big.input.card = {true, 5, 77, true, {}};
     Check(!Build(settings, big, Clock, body) && body.empty(), "the opportunity pushes it over MaxRequestBytes");
 }
 
@@ -187,7 +234,8 @@ void ParseChecks()
     using namespace OllamaBridge;
     auto const settings = Settings();
     auto const plain = Request();
-    auto const offered = Offered();
+    auto const offered = Offered(5, false);
+    auto const accepted = Offered();
 
     auto result = ParseJson(plain, Reply(settings, plain));
     Check(result.ok && result.text == "Of course I do." && !result.personaProposal, "text-only, no opportunity");
@@ -211,6 +259,17 @@ void ParseChecks()
     reply = Reply(settings, plain);
     reply["personaProposal"] = Proposal("5", "Unasked.");
     Check(Invalid(ParseJson(plain, reply)), "proposal without an opportunity refused");
+    reply = Reply(settings, accepted);
+    reply["personaProposal"] = Proposal("5", "A replacement.");
+    Check(Invalid(ParseJson(accepted, reply)), "proposal for a bot with an accepted card refused");
+    result = ParseJson(accepted, Reply(settings, accepted));
+    Check(result.ok && !result.personaProposal, "text-only with an accepted card");
+    reply = Reply(settings, offered);
+    reply["personaProposal"] = Proposal("5", std::string(OllamaPersona::MaxGeneratedCardBytes + 1, 'b'));
+    result = ParseJson(offered, reply);
+    Check(result.ok && result.text == "Of course I do." && result.personaProposal &&
+              result.personaProposal->size() == OllamaPersona::MaxGeneratedCardBytes + 1,
+          "an over-long card keeps the chat line; the module's card rules refuse it later");
 
     for (auto const& revision : {nlohmann::json("6"), nlohmann::json("05"), nlohmann::json("+5"), nlohmann::json(" 5"),
                                  nlohmann::json("5 "), nlohmann::json(""), nlohmann::json(5), nlohmann::json(5.0),
@@ -437,7 +496,7 @@ void DeliveryChecks()
     Check(recorder.heldAtPropose && recorder.held == 0, "proposal staged while the consumed claim still authorizes");
     Check(recorder.revision == 9 && recorder.stamp == 77 && recorder.body == "A careful healer.",
           "proposal uses the request's captured revision and stamp");
-    Check(recorder.logs == 1, "debug log records the fixed status only");
+    Check(recorder.logs == 1, "the log records the fixed status only");
 
     Reset();
     DeliverBridge(c, world);
@@ -471,15 +530,24 @@ void DeliveryChecks()
     DeliverBridge(Generation(31, WorldOutcome::Success, false, true), world);
     Check(recorder.events == Events{"current", "consume", "line", "cancel"}, "not offered: never staged");
 
-    for (auto const status : {OllamaPersona::ProposalStatus::Stale, OllamaPersona::ProposalStatus::Rejected,
-                              OllamaPersona::ProposalStatus::Ineligible, OllamaPersona::ProposalStatus::Disabled,
+    Reset();
+    auto withCard = Generation(32, WorldOutcome::Success, true, true);
+    withCard.request.bridgeTicket.request.input.card.accepted = true;
+    DeliverBridge(withCard, world);
+    Check(recorder.events == Events{"current", "consume", "line", "cancel"} && !recorder.logs,
+          "a bot with an accepted card: never staged");
+
+    for (auto const status : {OllamaPersona::ProposalStatus::Stale, OllamaPersona::ProposalStatus::Invalid,
+                              OllamaPersona::ProposalStatus::HasCard, OllamaPersona::ProposalStatus::ManualProtected,
+                              OllamaPersona::ProposalStatus::Busy, OllamaPersona::ProposalStatus::Disabled,
                               OllamaPersona::ProposalStatus::Unauthenticated})
     {
         Reset();
         recorder.status = status;
         DeliverBridge(Generation(++ticket, WorldOutcome::Success, true, true), world);
-        Check(recorder.events == Events{"current", "consume", "line", "propose", "cancel"} && recorder.held == 0,
-              "a refused proposal follows the line and still disposes the claim");
+        Check(recorder.events == Events{"current", "consume", "line", "propose", "cancel"} && recorder.held == 0 &&
+                  recorder.logs == 1,
+              "a refused proposal follows the line, logs its reason and still disposes the claim");
     }
 }
 }  // namespace

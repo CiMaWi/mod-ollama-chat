@@ -508,18 +508,19 @@ bool PrepareBridge(Completion& c)
     }
 
     // BEGIN BRIDGE CARD DELIVERY -- extracted verbatim by the offline persona bridge check.
-    // Stages the provider's card proposal of a successful generation that was offered one, against the revision and
-    // stamp the request was built from. The handler re-captures the binding; staging is not persistence.
+    // DS.12: applies the provider's card of a successful generation that was offered one (no accepted card), against
+    // the revision and stamp the request was built from. The handler re-captures the binding; a queued write is not
+    // yet persistence.
     void ProposeBridgeCard(Completion const& c)
     {
         auto const& card = c.request.bridgeTicket.request.input.card;
-        if (c.bridgeOutcome != OllamaBridge::WorldOutcome::Success || !c.personaProposal || !card.offered)
+        if (c.bridgeOutcome != OllamaBridge::WorldOutcome::Success || !c.personaProposal || !card.offered ||
+            card.accepted)
             return;
         auto const status =
             OllamaChat_BridgeProposeCard(c.request.bridgeTicket, card.revision, card.stamp, *c.personaProposal);
-        if (g_DebugEnabled)
-            LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge card proposal for bot {}: status {}", c.request.botGuid,
-                     static_cast<int>(status));
+        LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge card for bot {}: {}", c.request.botGuid,
+                 OllamaPersona::ProposalStatusName(status));
     }
 
     void DeliverBridge(Completion const& c, OllamaWorldSnapshot const& world)

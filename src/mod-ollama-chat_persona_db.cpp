@@ -36,18 +36,18 @@ private:
         m_stmts.resize(PersonaStatementCount);
         PrepareStatement(SelectPersona,
                          "SELECT seed.requested_guid, p.bot_guid, p.revision, p.accepted_source, "
-                         "p.accepted_body, p.claude_alternative, p.codex_alternative "
+                         "p.accepted_body "
                          "FROM (SELECT CAST(? AS UNSIGNED) AS requested_guid) AS seed "
                          "LEFT JOIN mod_ollama_chat_persona_cards AS p ON p.bot_guid = seed.requested_guid",
                          CONNECTION_ASYNC);
         PrepareStatement(InsertPersona,
                          "INSERT INTO mod_ollama_chat_persona_cards "
                          "(bot_guid, revision, accepted_source, accepted_body, claude_alternative, codex_alternative) "
-                         "VALUES (?, ?, ?, ?, ?, ?)",
+                         "VALUES (?, ?, ?, ?, NULL, NULL)",
                          CONNECTION_ASYNC);
         PrepareStatement(UpdatePersona,
                          "UPDATE mod_ollama_chat_persona_cards SET revision = ?, accepted_source = ?, "
-                         "accepted_body = ?, claude_alternative = ?, codex_alternative = ? "
+                         "accepted_body = ?, claude_alternative = NULL, codex_alternative = NULL "
                          "WHERE bot_guid = ? AND revision = ?",
                          CONNECTION_ASYNC);
     }
@@ -101,18 +101,13 @@ std::optional<T> Nullable(Field const& field)
 
 std::optional<PersonaDbRow> ReadPersonaRow(PreparedQueryResult const& result)
 {
-    if (!result || result->GetRowCount() != 1 || result->GetFieldCount() != 7)
+    if (!result || result->GetRowCount() != 1 || result->GetFieldCount() != 5)
         return std::nullopt;
     Field const* fields = result->Fetch();
     if (fields[0].IsNull())
         return std::nullopt;
-    return PersonaDbRow{fields[0].Get<uint64>(),
-                        Nullable<uint64>(fields[1]),
-                        Nullable<uint64>(fields[2]),
-                        Nullable<uint8>(fields[3]),
-                        Nullable<std::string_view>(fields[4]),
-                        Nullable<std::string_view>(fields[5]),
-                        Nullable<std::string_view>(fields[6])};
+    return PersonaDbRow{fields[0].Get<uint64>(), Nullable<uint64>(fields[1]), Nullable<uint64>(fields[2]),
+                        Nullable<uint8>(fields[3]), Nullable<std::string_view>(fields[4])};
 }
 
 void BindBody(PersonaPreparedStatement& statement, uint8 index, std::string_view body)
@@ -171,8 +166,6 @@ public:
             statement->SetData(index++, static_cast<uint64>(next.revision));
             statement->SetData(index++, next.accepted ? static_cast<uint8>(next.accepted->source) : uint8{0});
             BindBody(*statement, index++, next.accepted ? std::string_view(next.accepted->body) : std::string_view{});
-            BindBody(*statement, index++, next.claudeAlternative);
-            BindBody(*statement, index++, next.codexAlternative);
             if (!insert)
             {
                 statement->SetData(index++, static_cast<uint64>(next.botGuid));

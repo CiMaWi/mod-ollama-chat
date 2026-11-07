@@ -1,6 +1,7 @@
 // The handler's persona card adapter block (BEGIN/END BRIDGE PERSONA CARD) is extracted verbatim into
 // persona-adapter.inc by the hub runner (scratchpad/bridge-shared/J14b3-check/run.cjs) and compiled against the
-// production persona store. Players, acquaintance and the bridge world are controlled stand-ins; no live-game proof.
+// production persona store. The bridge world is a controlled stand-in; no live-game proof. J14e (DS.12): the card is
+// read for every speaker and channel, and a bot without a card is offered at most MaxCardOffers times a generation.
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -12,7 +13,6 @@ namespace
 using namespace OllamaPersona;
 
 constexpr uint64_t BotGuid = 0x0000000000000042;
-constexpr uint64_t MasterGuid = 0x0000000000000007;
 constexpr uint64_t OtherGuid = 0x0000000000000009;
 std::size_t checks = 0;
 
@@ -25,49 +25,6 @@ void Check(bool condition, char const* label)
         std::exit(1);
     }
 }
-
-struct ObjectGuid
-{
-    uint64_t raw;
-    uint32_t GetCounter() const { return static_cast<uint32_t>(raw); }
-};
-
-struct Player
-{
-    uint64_t guid;
-    ObjectGuid GetGUID() const { return {guid}; }
-};
-
-struct Acquaintance
-{
-};
-
-struct AcquaintanceMgr
-{
-    static AcquaintanceMgr& Instance()
-    {
-        static AcquaintanceMgr manager;
-        return manager;
-    }
-    bool IsLoaded() const { return loaded; }
-    Acquaintance const* Find(uint32_t player, uint32_t bot) const
-    {
-        ++finds;
-        return loaded && player == rowPlayer && bot == rowBot ? &row : nullptr;
-    }
-
-    bool loaded = true;
-    uint32_t rowPlayer = static_cast<uint32_t>(MasterGuid);
-    uint32_t rowBot = static_cast<uint32_t>(BotGuid);
-    Acquaintance row;
-    mutable unsigned finds = 0;
-};
-
-struct PlayerbotAIConfig
-{
-    bool AcquaintanceEnable = true;
-} playerbotConfig;
-#define sPlayerbotAIConfig playerbotConfig
 
 struct WorldPolicy
 {
@@ -142,97 +99,109 @@ public:
 std::string const Voice = "A quiet traveler.";
 std::string const Body = "A smith from Goldshire.";
 
-BridgeView Capture(Player* bot, Player* speaker, Player* controller, OllamaBridge::DispatchSource source)
+BridgeView Capture(OllamaBridge::DispatchSource source)
 {
     BridgeView view;
     view.guard.source = source;
     view.context.persona = Voice;
-    BridgeCard(bot, speaker, controller, view);
+    BridgeCard(view);
     return view;
+}
+
+void Load(Store& store, FakePort& port, uint64_t generation, StoreCompletion completion)
+{
+    store.Prepare(generation, BotGuid, {});
+    Check(port.job && port.job->botGuid == BotGuid, "load request uses the full GUID");
+    completion.id = port.job->id;
+    port.job.reset();
+    port.ready = std::move(completion);
+    store.Pump({});
 }
 }  // namespace
 
 int main()
 {
     using From = OllamaBridge::DispatchSource;
-    Player bot{BotGuid};
-    Player master{MasterGuid};
-    Player other{OtherGuid};
-    auto& acquaintance = AcquaintanceMgr::Instance();
 
-    BridgeView view = Capture(&bot, &master, &master, From::Whisper);
-    Check(view.card.status == CardStatus::Unready && !view.card.personal && view.context.persona == Voice &&
-              acquaintance.finds == 0,
-          "closed gate: no acquaintance read, voice only");
+    BridgeView view = Capture(From::Whisper);
+    Check(view.card.status == CardStatus::Unready && view.context.persona == Voice &&
+              !BridgeCardOpportunity(view.card, BotGuid).offered,
+          "closed gate: voice only, no opportunity");
 
     Store& store = WorldStore();
     FakePort port;
     Check(store.SetPort(&port), "attach port");
     store.Configure(true);
     Check(store.Activate(1), "activate generation");
-    view = Capture(&bot, &master, &master, From::Whisper);
-    Check(view.card.status == CardStatus::Unready && view.card.personal && view.context.persona == Voice &&
-              CardToken(view.card).empty() && !BridgeCardOpportunity(view.card).offered,
-          "personal pair without an observation stays voice only, with no opportunity");
-
-    Check(
-        BridgeCardPersonal(&bot, &master, &master, From::Say) && BridgeCardPersonal(&bot, &master, &master, From::Yell),
-        "addressed say and yell from the controller are personal");
-    Check(!BridgeCardPersonal(&bot, &other, &master, From::Whisper), "a non-controlling speaker is not personal");
-    Check(!BridgeCardPersonal(&bot, &master, &master, From::Party), "party scope is never personal");
-    playerbotConfig.AcquaintanceEnable = false;
-    Check(!BridgeCardPersonal(&bot, &master, &master, From::Whisper), "disabled acquaintance fails closed");
-    playerbotConfig.AcquaintanceEnable = true;
-    acquaintance.loaded = false;
-    Check(!BridgeCardPersonal(&bot, &master, &master, From::Whisper), "unloaded acquaintance fails closed");
-    acquaintance.loaded = true;
-    acquaintance.rowPlayer = static_cast<uint32_t>(OtherGuid);
-    Check(!BridgeCardPersonal(&bot, &master, &master, From::Whisper) &&
-              !BridgeCardPersonal(&bot, &other, &other, From::Party),
-          "another player's pair never qualifies");
-    Check(BridgeCardPersonal(&bot, &other, &other, From::Whisper), "the exact pair's row qualifies");
-    acquaintance.rowPlayer = static_cast<uint32_t>(MasterGuid);
+    view = Capture(From::Whisper);
+    Check(view.card.status == CardStatus::Unready && view.context.persona == Voice && CardToken(view.card).empty() &&
+              !BridgeCardOpportunity(view.card, BotGuid).offered,
+          "without an observation: voice only, no opportunity");
 
     store.Prepare(1, BotGuid, {});
-    Check(port.job && port.job->botGuid == BotGuid, "load request uses the full GUID");
-    view = Capture(&bot, &master, &master, From::Whisper);
-    Check(view.card.status == CardStatus::Loading && !BridgeCardOpportunity(view.card).offered,
+    view = Capture(From::Whisper);
+    Check(view.card.status == CardStatus::Loading && !BridgeCardOpportunity(view.card, BotGuid).offered,
           "a loading card offers nothing");
-    port.ready = StoreCompletion{BotGuid, port.job->id, LookupStatus::Found,
-                                 State{BotGuid, 1, Card{Source::Manual, Body}, "", ""}};
+    Check(port.job && port.job->botGuid == BotGuid, "load request uses the full GUID");
+    port.ready = StoreCompletion{BotGuid, port.job->id, LookupStatus::Missing, std::nullopt};
+    port.job.reset();
     store.Pump({});
-    view = Capture(&bot, &master, &master, From::Whisper);
-    Check(view.card.status == CardStatus::Accepted && view.card.revision == 1 &&
-              view.context.persona == Voice + "\n\n" + Body,
-          "controller with acquaintance gets the accepted card");
-    BridgeView const party = Capture(&bot, &master, &master, From::Party);
-    BridgeView const bystander = Capture(&bot, &other, &master, From::Whisper);
-    Check(party.card.status == CardStatus::Unready && party.context.persona == Voice &&
-              bystander.card.status == CardStatus::Unready && bystander.context.persona == Voice &&
-              CardToken(party.card).empty() && CardToken(bystander.card).empty(),
-          "party scope and other speakers get no card text and no card token");
-    OllamaBridge::CardOpportunity offer = BridgeCardOpportunity(view.card);
-    Check(view.card.included && offer.offered && offer.revision == 1 && offer.stamp != 0 &&
-              offer.stamp == view.card.stamp && offer.accepted,
-          "an included accepted card is offered as accepted");
-    Check(!BridgeCardOpportunity(party.card).offered && !BridgeCardOpportunity(bystander.card).offered,
-          "party scope and other speakers get no opportunity");
+
+    for (From const source : {From::Whisper, From::Party, From::Say})
+    {
+        view = Capture(source);
+        OllamaBridge::CardOpportunity const offer = BridgeCardOpportunity(view.card, BotGuid);
+        Check(view.card.status == CardStatus::Missing && view.context.persona == Voice && offer.offered &&
+                  offer.revision == 0 && offer.stamp != 0 && offer.stamp == view.card.stamp && !offer.accepted,
+              "a bot without a card is offered a card on any channel and speaker");
+    }
+    view = Capture(From::Yell);
+    Check(view.card.status == CardStatus::Missing && !BridgeCardOpportunity(view.card, BotGuid).offered,
+          "the fourth opportunity in a generation is not offered");
+    Check(BridgeCardOpportunity(view.card, OtherGuid).offered, "the bound counts per bot");
+    world.generation = 2;
+    Check(store.Activate(2), "activate the next bridge generation");
+    view = Capture(From::Whisper);
+    Check(view.card.status == CardStatus::Missing && BridgeCardOpportunity(view.card, BotGuid).offered,
+          "a new bridge generation offers again");
+
+    store.Forget(BotGuid);
+    Load(store, port, 2,
+         StoreCompletion{BotGuid, 0, LookupStatus::Found, State{BotGuid, 1, Card{Source::Claude, Body}}});
+    for (int i = 0; i < 5; ++i)
+    {
+        view = Capture(i % 2 ? From::Party : From::Say);
+        OllamaBridge::CardOpportunity const offer = BridgeCardOpportunity(view.card, BotGuid);
+        Check(view.card.status == CardStatus::Accepted && view.card.included && view.card.revision == 1 &&
+                  view.context.persona == Voice + "\n\n" + Body && offer.offered && offer.accepted &&
+                  offer.revision == 1 && offer.stamp == view.card.stamp,
+              "an included accepted card is reported as accepted on any channel, without a bound");
+    }
     BridgeView crowded;
     crowded.guard.source = From::Whisper;
     crowded.context.persona = std::string(MaxCardBytes - CardSeparator.size() - Body.size() + 1, 'v');
     std::string const crowdedVoice = crowded.context.persona;
-    BridgeCard(&bot, &master, &master, crowded);
-    offer = BridgeCardOpportunity(crowded.card);
+    BridgeCard(crowded);
     Check(crowded.card.status == CardStatus::Accepted && !crowded.card.included &&
-              crowded.context.persona == crowdedVoice && offer.offered && offer.revision == 1 && !offer.accepted,
-          "an accepted card left out as too long is offered as not accepted");
-    world.generation = 2;
-    view = Capture(&bot, &master, &master, From::Whisper);
-    Check(view.card.status == CardStatus::Unready && view.context.persona == Voice,
-          "another bridge generation reads nothing");
+              crowded.context.persona == crowdedVoice && !BridgeCardOpportunity(crowded.card, BotGuid).offered,
+          "an accepted card left out as too long offers nothing: a provider never replaces a card");
+
+    store.Forget(BotGuid);
+    Load(store, port, 2, StoreCompletion{BotGuid, 0, LookupStatus::Found, State{BotGuid, 4, {}}});
+    view = Capture(From::Whisper);
+    OllamaBridge::CardOpportunity const legacy = BridgeCardOpportunity(view.card, BotGuid);
+    Check(view.card.status == CardStatus::NoCard && view.context.persona == Voice && legacy.offered &&
+              legacy.revision == 4 && !legacy.accepted,
+          "a row without a card (pre-J14e drafts) is offered a card at its revision");
+
+    world.generation = 3;
+    view = Capture(From::Whisper);
+    Check(view.card.status == CardStatus::Unready && view.context.persona == Voice &&
+              !BridgeCardOpportunity(view.card, BotGuid).offered,
+          "another bridge generation reads nothing and offers nothing");
     store.Configure(false);
-    world.generation = 1;
-    view = Capture(&bot, &master, &master, From::Whisper);
+    world.generation = 2;
+    view = Capture(From::Whisper);
     Check(view.card.status == CardStatus::Unready && view.context.persona == Voice, "disabled store is voice only");
     std::cout << "persona-adapter selftest: " << checks << " checks passed\n";
 }

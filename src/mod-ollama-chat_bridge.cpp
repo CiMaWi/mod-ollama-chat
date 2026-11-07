@@ -92,6 +92,51 @@ bool Blank(std::string const& value)
     return std::all_of(value.begin(), value.end(),
                        [](unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
 }
+
+// One card fact on the wire: control characters dropped, cut to MaxCardFactBytes on a character boundary, and left
+// out when blank or not valid UTF-8 (the envelope dump would throw).
+void PutCardFact(nlohmann::json& context, char const* key, std::string const& value)
+{
+    std::string fact;
+    for (unsigned char byte : value)
+        if (byte >= 0x20 && byte != 0x7F)
+            fact.push_back(static_cast<char>(byte));
+    if (fact.size() > MaxCardFactBytes)
+    {
+        std::size_t cut = MaxCardFactBytes;
+        while (cut && (static_cast<unsigned char>(fact[cut]) & 0xC0) == 0x80)
+            --cut;
+        fact.resize(cut);
+    }
+    if (Blank(fact))
+        return;
+    try
+    {
+        static_cast<void>(nlohmann::json(fact).dump());
+    }
+    catch (nlohmann::json::exception const&)
+    {
+        return;
+    }
+    context[key] = std::move(fact);
+}
+
+// DS.12 `input.personaCard.context`: a flat object of the bot's in-world facts; absent facts are left out.
+nlohmann::json CardContextJson(CardFacts const& facts)
+{
+    nlohmann::json context = nlohmann::json::object();
+    PutCardFact(context, "name", facts.name);
+    PutCardFact(context, "race", facts.race);
+    PutCardFact(context, "class", facts.className);
+    PutCardFact(context, "gender", facts.gender);
+    if (facts.level)
+        context["level"] = facts.level;
+    PutCardFact(context, "zone", facts.zone);
+    PutCardFact(context, "faction", facts.faction);
+    PutCardFact(context, "guild", facts.guild);
+    PutCardFact(context, "traits", facts.traits);
+    return context;
+}
 }  // namespace
 
 bool Identity::operator==(Identity const& other) const
@@ -224,8 +269,13 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
                                      {"speakerControlsBot", input.speakerControlsBot},
                                      {"party", std::move(party)}}}};
         if (input.card.offered)
-            envelope["input"]["personaCard"] = {{"revision", std::to_string(input.card.revision)},
-                                                {"accepted", input.card.accepted}};
+        {
+            nlohmann::json card = {{"revision", std::to_string(input.card.revision)},
+                                   {"accepted", input.card.accepted}};
+            if (!input.card.accepted)
+                card["context"] = CardContextJson(input.card.facts);
+            envelope["input"]["personaCard"] = std::move(card);
+        }
         if (settings.provider == "codex" && settings.observerEnabled)
         {
             if (!ValidObserverSettings(settings) || !ValidScope(request.scope, settings, request.epoch) ||
@@ -385,7 +435,9 @@ Result Parse(Settings const& settings, Request const& request, std::string const
             !MatchesString(parsed, "requestId", request.requestId) || !parsed.contains("deadlineUnixMs") ||
             !parsed["deadlineUnixMs"].is_number_integer() || parsed["deadlineUnixMs"] != request.deadline.unixMs)
             return result;
-        if (proposal && (!request.input.card.offered || !MatchesString(parsed, "type", "generation.result")))
+        // A card is wanted only where the request carried the context (offered without an accepted card).
+        if (proposal && (!request.input.card.offered || request.input.card.accepted ||
+                         !MatchesString(parsed, "type", "generation.result")))
             return result;
 
         if (MatchesString(parsed, "type", "failure"))

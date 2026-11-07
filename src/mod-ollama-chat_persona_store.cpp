@@ -10,7 +10,6 @@ namespace
 bool SameRow(State const& left, State const& right)
 {
     return left.botGuid == right.botGuid && left.revision == right.revision &&
-           left.claudeAlternative == right.claudeAlternative && left.codexAlternative == right.codexAlternative &&
            left.accepted.has_value() == right.accepted.has_value() &&
            (!left.accepted ||
             (left.accepted->source == right.accepted->source && left.accepted->body == right.accepted->body));
@@ -24,6 +23,7 @@ void Store::Configure(bool enabled)
         InvalidateAll();
     _enabled = enabled;
     _generation = 0;
+    _offers.clear();
 }
 
 bool Store::SetPort(StorePort* port)
@@ -49,6 +49,7 @@ bool Store::Activate(uint64_t generation)
     // the current generation, so an older ticket is refused.
     _lastGeneration = generation;
     _generation = generation;
+    _offers.clear();
     return true;
 }
 
@@ -61,6 +62,7 @@ void Store::Retire(uint64_t generation)
 
 void Store::Forget(uint64_t botGuid)
 {
+    _offers.erase(botGuid);
     auto it = _entries.find(botGuid);
     if (it != _entries.end())
         Invalidate(it);
@@ -100,10 +102,11 @@ bool Store::MakeRoom(StoreTime now)
 {
     if (_entries.size() < MaxStoreEntries)
         return true;
+    // An eviction keeps the card opportunity count: only Forget or a new generation resets it.
     if (!_cooling.empty() && _entries.at(_cooling.front()).retryAt <= now)
-        Forget(_cooling.front());
+        Invalidate(_entries.find(_cooling.front()));
     else if (!_ready.empty())
-        Forget(_ready.front());
+        Invalidate(_entries.find(_ready.front()));
     else
         return false;
     return true;
@@ -162,7 +165,7 @@ StoreView Store::Observe(uint64_t generation, uint64_t botGuid) const
     return {entry.state->revision ? StoreStatus::Loaded : StoreStatus::Missing, &*entry.state, entry.id};
 }
 
-bool Store::SubmitUpdate(uint64_t generation, uint64_t stamp, bool acquainted, Update const& update)
+bool Store::SubmitUpdate(uint64_t generation, uint64_t stamp, Update const& update)
 {
     if (!IsCurrent(generation) || !HasSlot())
         return false;
@@ -170,7 +173,7 @@ bool Store::SubmitUpdate(uint64_t generation, uint64_t stamp, bool acquainted, U
     if (it == _entries.end() || !it->second.state || stamp != it->second.id)
         return false;
     Entry& entry = it->second;
-    UpdatePlan plan = PlanUpdate(*entry.state, acquainted, update);
+    UpdatePlan plan = PlanUpdate(*entry.state, update);
     if (!plan.next)
         return false;
     uint64_t const id = ++_lastOperation;
@@ -222,6 +225,17 @@ void Store::Finish(StoreCompletion completion, StoreTime now)
         BackOff(completion.botGuid, entry, now);
 }
 
+bool Store::TakeOffer(uint64_t generation, uint64_t botGuid)
+{
+    if (!IsCurrent(generation) || !botGuid)
+        return false;
+    uint32_t& offers = _offers[botGuid];
+    if (offers >= MaxCardOffers)
+        return false;
+    ++offers;
+    return true;
+}
+
 void Store::Pump(StoreTime now)
 {
     if (!_port)
@@ -241,11 +255,9 @@ Store& WorldStore()
     return store;
 }
 
-CardContext ReadCard(Store const& store, uint64_t generation, uint64_t botGuid, bool personal, std::string& persona)
+CardContext ReadCard(Store const& store, uint64_t generation, uint64_t botGuid, std::string& persona)
 {
-    CardContext card{CardStatus::Unready, personal};
-    if (!personal)
-        return card;
+    CardContext card;
     StoreView const view = store.Observe(generation, botGuid);
     if (view.status == StoreStatus::Loading)
         card.status = CardStatus::Loading;
@@ -258,8 +270,8 @@ CardContext ReadCard(Store const& store, uint64_t generation, uint64_t botGuid, 
         card.status = CardStatus::Missing;
         return card;
     }
-    Card const* accepted = SelectAccepted(*view.state, true);
-    card.status = accepted ? CardStatus::Accepted : CardStatus::DraftOnly;
+    Card const* accepted = view.state->accepted ? &*view.state->accepted : nullptr;
+    card.status = accepted ? CardStatus::Accepted : CardStatus::NoCard;
     if (accepted && persona.size() + CardSeparator.size() + accepted->body.size() <= MaxCardBytes)
     {
         persona += CardSeparator;
@@ -282,8 +294,8 @@ std::string CardToken(CardContext const& card)
         case CardStatus::Missing:
             name = "missing";
             break;
-        case CardStatus::DraftOnly:
-            name = "draft";
+        case CardStatus::NoCard:
+            name = "none";
             break;
         case CardStatus::Accepted:
             name = "accepted";
@@ -301,20 +313,57 @@ std::optional<Source> ProviderSource(std::string_view provider)
     return std::nullopt;
 }
 
-ProposalStatus ProposeCard(Store& store, uint64_t generation, uint64_t botGuid, bool personal,
-                           std::string_view provider, uint64_t expectedRevision, uint64_t stamp, std::string body)
+char const* ProposalStatusName(ProposalStatus status)
+{
+    switch (status)
+    {
+        case ProposalStatus::Queued:
+            return "queued";
+        case ProposalStatus::Disabled:
+            return "disabled";
+        case ProposalStatus::Unauthenticated:
+            return "unauthenticated";
+        case ProposalStatus::Stale:
+            return "stale";
+        case ProposalStatus::Invalid:
+            return "invalid";
+        case ProposalStatus::HasCard:
+            return "has_card";
+        case ProposalStatus::ManualProtected:
+            return "manual_protected";
+        case ProposalStatus::Busy:
+            return "busy";
+    }
+    return "unknown";
+}
+
+ProposalStatus ProposeCard(Store& store, uint64_t generation, uint64_t botGuid, std::string_view provider,
+                           uint64_t expectedRevision, uint64_t stamp, std::string body)
 {
     if (!store.Enabled())
         return ProposalStatus::Disabled;
     auto const source = ProviderSource(provider);
     if (!source)
         return ProposalStatus::Unauthenticated;
-    if (!personal)
-        return ProposalStatus::Ineligible;
     StoreView const view = store.Observe(generation, botGuid);
     if (!view.state || view.stamp != stamp || view.state->revision != expectedRevision)
         return ProposalStatus::Stale;
-    Update const update{UpdateKind::ProposeAlternative, botGuid, expectedRevision, *source, std::move(body)};
-    return store.SubmitUpdate(generation, stamp, true, update) ? ProposalStatus::Queued : ProposalStatus::Rejected;
+    Update const update{UpdateKind::ApplyGenerated, botGuid, expectedRevision, *source, std::move(body)};
+    // The plan names the refusal; SubmitUpdate plans again against the same cached row and queues the write.
+    switch (PlanUpdate(*view.state, update).status)
+    {
+        case UpdateStatus::Ready:
+            break;
+        case UpdateStatus::Stale:
+            return ProposalStatus::Stale;
+        case UpdateStatus::ManualProtected:
+            return ProposalStatus::ManualProtected;
+        case UpdateStatus::HasCard:
+        case UpdateStatus::Unchanged:
+            return ProposalStatus::HasCard;
+        default:
+            return ProposalStatus::Invalid;
+    }
+    return store.SubmitUpdate(generation, stamp, update) ? ProposalStatus::Queued : ProposalStatus::Busy;
 }
 }  // namespace OllamaPersona

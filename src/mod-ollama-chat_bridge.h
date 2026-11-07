@@ -19,6 +19,7 @@ constexpr std::size_t MaxResponseBytes = 32768;
 constexpr std::size_t MaxTextBytes = 4096;
 // Persona card proposal body; equal to OllamaPersona::MaxCardBytes (checked where both are visible).
 constexpr std::size_t MaxCardProposalBytes = 8192;
+constexpr std::size_t MaxCardFactBytes = 64;  // Each string of `input.personaCard.context`.
 constexpr int64_t MaxLifetimeMs = 120000;
 constexpr int64_t CircuitCooldownMs = 5000;
 
@@ -54,14 +55,32 @@ struct Participant
     uint64_t visibleTargetGuid = 0;
 };
 
-// Optional persona card opportunity, set on world only for the eligible pair of a ready card store. The bridge may
-// then return one proposal for exactly this revision. The stamp names the store snapshot and never goes on the wire.
+// DS.12 in-world facts about the bot for a card generation, gathered on world. Empty strings and level 0 are left
+// out of the wire; the envelope bounds and sanitizes every string.
+struct CardFacts
+{
+    std::string name;
+    std::string race;
+    std::string className;
+    std::string gender;
+    uint32_t level = 0;
+    std::string zone;
+    std::string faction;
+    std::string guild;
+    std::string traits;
+};
+
+// Optional persona card opportunity, set on world only for a ready card store. With an accepted card in the persona
+// text it says so; for a bot without a card it carries the facts (bounded per bot and generation), and the bridge
+// may return one card for exactly this revision, which the module applies itself. The stamp names the store
+// snapshot and never goes on the wire.
 struct CardOpportunity
 {
     bool offered = false;
     uint64_t revision = 0;  // Canonical decimal on the wire; 0 means no row yet.
     uint64_t stamp = 0;
     bool accepted = false;  // Only when the persona text ends with the accepted card (not when it did not fit).
+    CardFacts facts;        // On the wire as `context` exactly when the card is offered and not accepted.
 };
 
 struct Context

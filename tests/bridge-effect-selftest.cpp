@@ -239,7 +239,8 @@ struct Env
 
     EffectResult Run(ChannelCommand const& command)
     {
-        return BridgeCommandExecutor::Effect(phase, ticket, guard, command, Authorize());
+        CommandRefusal why = CommandRefusal::None;
+        return BridgeCommandExecutor::Effect(phase, ticket, guard, command, Authorize(), why);
     }
 };
 

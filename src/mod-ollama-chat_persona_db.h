@@ -21,8 +21,6 @@ struct PersonaDbRow
     std::optional<uint64_t> revision;
     std::optional<uint8_t> acceptedSource;
     std::optional<std::string_view> acceptedBody;
-    std::optional<std::string_view> claudeAlternative;
-    std::optional<std::string_view> codexAlternative;
 };
 
 inline StoreCompletion DecodePersonaLookup(uint64_t botGuid, uint64_t id, bool committed,
@@ -33,20 +31,18 @@ inline StoreCompletion DecodePersonaLookup(uint64_t botGuid, uint64_t id, bool c
         return result;
     if (!row->botGuid)
     {
-        if (!row->revision && !row->acceptedSource && !row->acceptedBody && !row->claudeAlternative &&
-            !row->codexAlternative)
+        if (!row->revision && !row->acceptedSource && !row->acceptedBody)
             result.lookup = LookupStatus::Missing;
         return result;
     }
     auto const bounded = [](std::optional<std::string_view> const& body)
     { return !body || (!body->empty() && body->size() <= MaxCardBytes); };
     if (*row->botGuid != botGuid || !row->revision || !*row->revision || !row->acceptedSource ||
-        row->acceptedBody.has_value() != (*row->acceptedSource != 0) || !bounded(row->acceptedBody) ||
-        !bounded(row->claudeAlternative) || !bounded(row->codexAlternative))
+        row->acceptedBody.has_value() != (*row->acceptedSource != 0) || !bounded(row->acceptedBody))
         return result;
 
-    State state{botGuid, *row->revision, std::nullopt, std::string(row->claudeAlternative.value_or("")),
-                std::string(row->codexAlternative.value_or(""))};
+    // J14e: the draft columns of older rows are not read; a row without an accepted card holds no card.
+    State state{botGuid, *row->revision, std::nullopt};
     if (row->acceptedBody)
         state.accepted = Card{static_cast<Source>(*row->acceptedSource), std::string(*row->acceptedBody)};
     if (ValidState(state))

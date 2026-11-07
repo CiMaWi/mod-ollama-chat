@@ -26,114 +26,109 @@ void Refused(UpdatePlan const& plan, UpdateStatus expected, char const* label)
 
 State Apply(State const& state, Update const& update)
 {
-    UpdatePlan plan = PlanUpdate(state, true, update);
+    UpdatePlan plan = PlanUpdate(state, update);
     Check(plan.status == UpdateStatus::Ready && plan.next && ValidState(*plan.next) &&
               plan.next->revision == state.revision + 1 && plan.next->botGuid == state.botGuid,
           "write plans produce a valid, identity-preserving next row");
     return std::move(*plan.next);
 }
 
-void MissingAndProviderSwitch()
+State MissingRow() { return {BotGuid, 0, {}}; }
+
+// DS.12: a generated card is applied directly to a bot without a card; no acceptance step exists.
+void DirectApplication()
 {
-    State const missing{BotGuid, 0, {}, {}, {}};
-    Check(ValidState(missing) && !SelectAccepted(missing, true), "confirmed missing card is explicit");
-    Update claude{UpdateKind::ProposeAlternative, BotGuid, 0, Source::Claude, "A traveling blacksmith"};
-    Refused(PlanUpdate(missing, false, claude), UpdateStatus::Ineligible, "unknown acquaintance cannot write");
-    Refused(PlanUpdate(missing, true, {UpdateKind::AcceptAlternative, BotGuid, 0, Source::Claude, {}}),
-            UpdateStatus::MissingAlternative, "promotion requires a stored draft");
-
+    State const missing{BotGuid, 0, {}};
+    Check(ValidState(missing) && !missing.accepted, "confirmed missing card is explicit");
+    Update claude{UpdateKind::ApplyGenerated, BotGuid, 0, Source::Claude, "A traveling blacksmith"};
     State const first = Apply(missing, claude);
-    Check(first.claudeAlternative == claude.body && first.codexAlternative.empty() && !SelectAccepted(first, true),
-          "first provider draft stays separate from the accepted card");
-    Refused(PlanUpdate(first, true, claude), UpdateStatus::Stale, "retry from the missing revision is stale");
+    Check(first.revision == 1 && first.accepted && first.accepted->source == Source::Claude &&
+              first.accepted->body == claude.body,
+          "a generated card is applied at once with its provenance");
+    Refused(PlanUpdate(first, claude), UpdateStatus::Stale, "retry from the missing revision is stale");
     claude.expectedRevision = 1;
-    Refused(PlanUpdate(first, true, claude), UpdateStatus::Unchanged, "same draft does not churn revisions");
+    Refused(PlanUpdate(first, claude), UpdateStatus::Unchanged, "same card does not churn revisions");
+    Update const other{UpdateKind::ApplyGenerated, BotGuid, 1, Source::Claude, "A retired sea captain"};
+    Refused(PlanUpdate(first, other), UpdateStatus::HasCard, "a second card never replaces the first");
+    Update const codex{UpdateKind::ApplyGenerated, BotGuid, 1, Source::Codex, "A retired sea captain"};
+    Refused(PlanUpdate(first, codex), UpdateStatus::HasCard, "another provider never replaces a card either");
 
-    Update const promote{UpdateKind::AcceptAlternative, BotGuid, 1, Source::Claude, {}};
-    State const accepted = Apply(first, promote);
-    Card const* card = SelectAccepted(accepted, true);
-    Check(card && card->source == Source::Claude && card->body == claude.body, "accepted card retains provenance");
-    Check(!SelectAccepted(accepted, false), "unknown acquaintance cannot read");
+    State const codexFirst = Apply(missing, {UpdateKind::ApplyGenerated, BotGuid, 0, Source::Codex, "A gnome tinker"});
+    Check(codexFirst.accepted->source == Source::Codex, "either native provider may apply");
 
-    Update const codex{UpdateKind::ProposeAlternative, BotGuid, 2, Source::Codex, "A retired sea captain"};
-    State const switched = Apply(accepted, codex);
-    Check(switched.accepted->source == Source::Claude && switched.accepted->body == claude.body &&
-              switched.claudeAlternative == claude.body && switched.codexAlternative == codex.body,
-          "switching provider preserves the accepted identity and the other provider's draft");
-    Refused(PlanUpdate(switched, true, promote), UpdateStatus::Stale, "older selection cannot replace a newer row");
-    Refused(PlanUpdate(switched, true, {UpdateKind::AcceptAlternative, BotGuid, 3, Source::Claude, {}}),
-            UpdateStatus::Unchanged, "accepting the same card does not churn revisions");
-
-    State const refreshed = Apply(switched, {UpdateKind::ProposeAlternative, BotGuid, 3, Source::Claude, "New draft"});
-    Check(refreshed.accepted->body == claude.body && refreshed.claudeAlternative == "New draft",
-          "refreshing the accepted provider's draft preserves the accepted copy");
-    State const selected = Apply(refreshed, {UpdateKind::AcceptAlternative, BotGuid, 4, Source::Codex, {}});
-    Check(selected.accepted->source == Source::Codex && selected.accepted->body == codex.body,
-          "a current explicit selection can change a generated accepted card");
+    // A row from before J14e held only drafts: a nonzero revision without a card, which a card fills.
+    State const legacy{BotGuid, 4, {}};
+    Check(ValidState(legacy), "a draft-only legacy row loads as a bot without a card");
+    State const filled = Apply(legacy, {UpdateKind::ApplyGenerated, BotGuid, 4, Source::Claude, "A herbalist"});
+    Check(filled.revision == 5 && filled.accepted->body == "A herbalist", "a legacy row takes a card at revision 5");
 }
 
 void ManualAndConflicts()
 {
-    State const loaded{BotGuid, 24, Card{Source::Manual, "A manually curated identity"}, "Claude draft", "Codex draft"};
-    Check(ValidState(loaded) && SelectAccepted(loaded, true)->source == Source::Manual,
-          "load a persistent manual card");
-    Update const claude{UpdateKind::ProposeAlternative, BotGuid, 24, Source::Claude, "Revised Claude draft"};
-    Update const codex{UpdateKind::ProposeAlternative, BotGuid, 24, Source::Codex, "Revised Codex draft"};
-    State const changed = Apply(loaded, claude);
-    Refused(PlanUpdate(changed, true, codex), UpdateStatus::Stale, "concurrent updates share one revision");
-    Check(changed.accepted->body == loaded.accepted->body && changed.codexAlternative == loaded.codexAlternative,
-          "draft update preserves the manual identity and unrelated draft");
-    Refused(PlanUpdate(changed, true, {UpdateKind::AcceptAlternative, BotGuid, 25, Source::Claude, {}}),
-            UpdateStatus::ManualProtected, "provider draft cannot displace a manual card");
-    Refused(PlanUpdate(changed, true, {UpdateKind::SetManual, BotGuid, 25, Source::Manual, loaded.accepted->body}),
+    State const generated{BotGuid, 3, Card{Source::Claude, "Generated"}};
+    State const manual = Apply(generated, {UpdateKind::SetManual, BotGuid, 3, Source::Manual, "Edited by the owner"});
+    Check(manual.accepted->source == Source::Manual && manual.accepted->body == "Edited by the owner",
+          "the owner may replace a generated card");
+    Refused(PlanUpdate(manual, {UpdateKind::ApplyGenerated, BotGuid, 4, Source::Claude, "New"}),
+            UpdateStatus::ManualProtected, "a provider never replaces the owner's card");
+    Refused(PlanUpdate(manual, {UpdateKind::ApplyGenerated, BotGuid, 4, Source::Claude, "Edited by the owner"}),
+            UpdateStatus::ManualProtected, "not even with the same text");
+    Refused(PlanUpdate(manual, {UpdateKind::SetManual, BotGuid, 4, Source::Manual, "Edited by the owner"}),
             UpdateStatus::Unchanged, "same manual card does not churn revisions");
-    State const edited = Apply(changed, {UpdateKind::SetManual, BotGuid, 25, Source::Manual, "Edited by the owner"});
-    Check(edited.accepted->source == Source::Manual && edited.accepted->body == "Edited by the owner" &&
-              edited.claudeAlternative == claude.body && edited.codexAlternative == loaded.codexAlternative,
-          "explicit manual edit preserves provider drafts");
+    Refused(PlanUpdate(manual, {UpdateKind::SetManual, BotGuid, 3, Source::Manual, "Late edit"}), UpdateStatus::Stale,
+            "a stale manual edit is refused");
+    State const longManual =
+        Apply(MissingRow(), {UpdateKind::SetManual, BotGuid, 0, Source::Manual, std::string(MaxCardBytes, 'm')});
+    Check(longManual.accepted->body.size() == MaxCardBytes, "the owner's card keeps the full card bound");
 }
 
 void InvalidInputsAndLimits()
 {
-    State const missing{BotGuid, 0, {}, {}, {}};
-    Update update{UpdateKind::ProposeAlternative, BotGuid, 0, Source::Codex, {}};
+    State const missing = MissingRow();
+    Update update{UpdateKind::ApplyGenerated, BotGuid, 0, Source::Claude, {}};
     for (std::string const& body :
-         {std::string{}, std::string(" \t\r\n"), std::string("a\0b", 3), std::string("a\x1b"), std::string("\xc0\xaf"),
-          std::string("\xed\xa0\x80"), std::string("\xf0\x9f\x8c"), std::string(MaxCardBytes + 1, 'a')})
+         {std::string{}, std::string(" \t\r\n"), std::string("a\0b", 3), std::string("a\x1b"), std::string("a\x7f"),
+          std::string("\xc0\xaf"), std::string("\xed\xa0\x80"), std::string("\xf0\x9f\x8c"),
+          std::string(MaxGeneratedCardBytes + 1, 'a'), std::string(MaxCardBytes + 1, 'a')})
     {
         update.body = body;
-        Refused(PlanUpdate(missing, true, update), UpdateStatus::Invalid, "malformed or overbound body");
+        Refused(PlanUpdate(missing, update), UpdateStatus::Invalid, "malformed or overbound generated card");
     }
-    update.body = std::string(MaxCardBytes - 4, 'a') + "\xf0\x9f\x8c\xb1";
-    Check(Apply(missing, update).codexAlternative.size() == MaxCardBytes, "exact UTF-8 byte ceiling");
+    update.body = std::string(MaxGeneratedCardBytes - 4, 'a') + "\xf0\x9f\x8c\xb1";
+    Check(Apply(missing, update).accepted->body.size() == MaxGeneratedCardBytes, "exact generated UTF-8 byte ceiling");
+    update.body = "Line one\n\tLine two\r\n";
+    Check(Apply(missing, update).accepted->body == update.body, "tabs and line breaks are allowed");
 
-    Refused(PlanUpdate(missing, true, {UpdateKind::ProposeAlternative, BotGuid + 1, 0, Source::Codex, "Wrong bot"}),
+    Refused(PlanUpdate(missing, {UpdateKind::ApplyGenerated, BotGuid + 1, 0, Source::Claude, "Wrong bot"}),
             UpdateStatus::Invalid, "wrong bot identity");
-    Refused(PlanUpdate(missing, true, {UpdateKind::ProposeAlternative, BotGuid, 0, Source::Manual, "Forged source"}),
-            UpdateStatus::Invalid, "manual source cannot use provider proposal route");
-    Refused(PlanUpdate(missing, true, {UpdateKind::SetManual, BotGuid, 0, Source::Codex, "Forged manual"}),
-            UpdateStatus::Invalid, "provider source cannot use manual route");
-    Refused(PlanUpdate(missing, true, {UpdateKind::AcceptAlternative, BotGuid, 0, Source::Codex, "Injected body"}),
-            UpdateStatus::Invalid, "promotion can select only a persisted body");
-    Refused(PlanUpdate(missing, true, {UpdateKind::ProposeAlternative, BotGuid, 0, Source(99), "Unknown provider"}),
+    Refused(PlanUpdate(missing, {UpdateKind::ApplyGenerated, BotGuid, 0, Source::Manual, "Forged source"}),
+            UpdateStatus::Invalid, "manual source cannot use the generated route");
+    Refused(PlanUpdate(missing, {UpdateKind::SetManual, BotGuid, 0, Source::Codex, "Forged manual"}),
+            UpdateStatus::Invalid, "provider source cannot use the manual route");
+    Refused(PlanUpdate(missing, {UpdateKind::ApplyGenerated, BotGuid, 0, Source(99), "Unknown provider"}),
             UpdateStatus::Invalid, "unknown source");
-    Refused(PlanUpdate(missing, true, {UpdateKind(99), BotGuid, 0, Source::Manual, "Unknown operation"}),
+    Refused(PlanUpdate(missing, {UpdateKind(99), BotGuid, 0, Source::Manual, "Unknown operation"}),
             UpdateStatus::Invalid, "unknown operation");
 
-    Check(!ValidState({0, 0, {}, {}, {}}) && !ValidState({BotGuid, 1, {}, {}, {}}), "reject corrupt row identity");
-    Check(!ValidState({BotGuid, 0, {}, "Draft", {}}), "revision zero is reserved for an absent row");
-    Check(!ValidState({BotGuid, 1, Card{Source(0), "Body"}, {}, {}}), "reject invalid stored provenance");
-    Check(!ValidState({BotGuid, 1, Card{Source::Manual, ""}, {}, {}}), "reject invalid stored accepted body");
-    Check(!ValidState({BotGuid, 1, {}, {}, std::string(MaxCardBytes + 1, 'a')}), "reject oversized stored draft");
-    Refused(PlanUpdate({BotGuid, 0, {}, "Corrupt", {}}, true, update), UpdateStatus::Invalid,
+    Check(!ValidState({0, 0, {}}), "reject corrupt row identity");
+    Check(!ValidState({BotGuid, 0, Card{Source::Claude, "Body"}}), "revision zero is reserved for an absent row");
+    Check(!ValidState({BotGuid, 1, Card{Source(0), "Body"}}), "reject invalid stored provenance");
+    Check(!ValidState({BotGuid, 1, Card{Source::Manual, ""}}), "reject invalid stored accepted body");
+    Check(!ValidState({BotGuid, 1, Card{Source::Manual, std::string(MaxCardBytes + 1, 'a')}}),
+          "reject oversized stored card");
+    update.body = "Fine";
+    Refused(PlanUpdate({BotGuid, 0, Card{Source::Claude, "Corrupt"}}, update), UpdateStatus::Invalid,
             "refuse to write over a corrupt cached row");
 
     uint64_t const maxRevision = std::numeric_limits<uint64_t>::max();
-    State const full{BotGuid, maxRevision, Card{Source::Manual, "Kept"}, {}, {}};
-    Refused(PlanUpdate(full, true, {UpdateKind::SetManual, BotGuid, maxRevision, Source::Manual, "New"}),
+    State const full{BotGuid, maxRevision, Card{Source::Manual, "Kept"}};
+    Refused(PlanUpdate(full, {UpdateKind::SetManual, BotGuid, maxRevision, Source::Manual, "New"}),
             UpdateStatus::RevisionExhausted, "revision must never wrap");
-    Refused(PlanUpdate(full, true, {UpdateKind::SetManual, BotGuid, maxRevision, Source::Manual, "Kept"}),
+    Refused(PlanUpdate(full, {UpdateKind::SetManual, BotGuid, maxRevision, Source::Manual, "Kept"}),
             UpdateStatus::Unchanged, "no-op needs no revision at the ceiling");
+    Refused(PlanUpdate({BotGuid, maxRevision, {}},
+                       {UpdateKind::ApplyGenerated, BotGuid, maxRevision, Source::Claude, "New"}),
+            UpdateStatus::RevisionExhausted, "a generated card never wraps the revision either");
 }
 }  // namespace
 
@@ -141,7 +136,7 @@ int main()
 {
     try
     {
-        MissingAndProviderSwitch();
+        DirectApplication();
         ManualAndConflicts();
         InvalidInputsAndLimits();
         std::cout << "persona-card selftest passed " << checks << " checks\n";

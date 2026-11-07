@@ -144,26 +144,8 @@ bool g_DebugEnabled = false;
 bool OllamaIsRealPlayer(Player* player) { return player && player->human; }
 std::string Roleplay_BuildVoicePrompt(Player*) { return "A quiet traveler."; }
 
-// The extracted capture reads the persona card through the production store (compiled in, gate closed: voice only)
-// and the acquaintance table; this fixture has neither enabled, so a card is never offered.
-struct Acquaintance
-{
-};
-struct AcquaintanceMgr
-{
-    static AcquaintanceMgr& Instance()
-    {
-        static AcquaintanceMgr manager;
-        return manager;
-    }
-    bool IsLoaded() const { return false; }
-    Acquaintance const* Find(uint32_t, uint32_t) const { return nullptr; }
-};
-struct PlayerbotAIConfig
-{
-    bool AcquaintanceEnable = false;
-} playerbotConfig;
-#define sPlayerbotAIConfig playerbotConfig
+// The extracted capture reads the persona card through the production store (compiled in, gate closed: voice only),
+// so a card is never offered.
 
 Clock clockNow;
 WorldPolicy g_bridgeWorld;

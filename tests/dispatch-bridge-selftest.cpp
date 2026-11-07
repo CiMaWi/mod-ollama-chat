@@ -284,31 +284,17 @@ struct PlayerbotsMgr
         return &ai;
     }
 };
-// The extracted capture reads the persona card through the production store (compiled in) and the acquaintance
-// table. Both stay off (voice only, no card offered) except in CardTests, which open them for every pair.
-struct Acquaintance
+// The extracted capture reads the persona card through the production store (compiled in). It stays off (voice
+// only, no card offered) except in CardTests. J14e: the handler's world-side fact gatherer (outside the extract) is a
+// stand-in that fills fixed facts and counts its calls.
+unsigned cardFactsCalls = 0;
+void BridgeCardFacts(Player*, OllamaBridge::CardFacts& facts)
 {
-};
-bool acquaintanceLoaded = false;
-struct AcquaintanceMgr
-{
-    static AcquaintanceMgr& Instance()
-    {
-        static AcquaintanceMgr manager;
-        return manager;
-    }
-    bool IsLoaded() const { return acquaintanceLoaded; }
-    Acquaintance const* Find(uint32_t, uint32_t) const
-    {
-        static Acquaintance row;
-        return acquaintanceLoaded ? &row : nullptr;
-    }
-};
-struct PlayerbotAIConfig
-{
-    bool AcquaintanceEnable = false;
-} playerbotConfig;
-#define sPlayerbotAIConfig playerbotConfig
+    ++cardFactsCalls;
+    facts.race = "Dwarf";
+    facts.className = "Warrior";
+    facts.level = 42;
+}
 bool Governor_IsRepetitive(ObjectGuid, std::string const&, std::string const&) { return false; }
 bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool)
 {
@@ -1120,14 +1106,14 @@ void CardFixture()
     while (!cardPort.submitted.empty())
         cardPort.Complete();
     AdapterFixture();
-    playerbotConfig.AcquaintanceEnable = acquaintanceLoaded = true;
+    cardFactsCalls = 0;
     // J5e: a same-state Configure keeps loaded rows, so the fixture switches off first to start empty.
     OllamaPersona::WorldStore().Configure(false);
     OllamaPersona::WorldStore().Configure(true);
     Check(OllamaPersona::WorldStore().SetPort(&cardPort), "card: store port attached");
 }
 
-// Personal pair: the controlling human whispers the bot.
+// The controlling human whispers the bot (DS.12: any speaker and channel reads the card).
 bool CardSubmit(std::string const& text)
 {
     return BridgeSubmit(&players[0], &players[1], SRC_WHISPER_LOCAL, text, true, "whisper-22", 0);
@@ -1177,6 +1163,9 @@ void CardTests()
     Check(second.request.input.card.offered && second.request.input.card.stamp && !second.request.input.card.revision &&
               !second.request.input.card.accepted && second.request.input.persona == voice,
           "card B: the renewal offers the missing card");
+    Check(second.request.input.card.facts.race == "Dwarf" && second.request.input.card.facts.level == 42 &&
+              cardFactsCalls == 1,
+          "card B: the offer carries the bot's facts, gathered once on world");
     Check(second.request.input.memory.find("First words.") != std::string::npos,
           "card B: the renewal keeps the one-exchange memory");
     Check(g_bridgeCardChurn == churn, "card B: a renewal from an empty card is not churn");
@@ -1184,10 +1173,10 @@ void CardTests()
           "card B: an unchanged ready card keeps the renewed binding");
 
     // C: a ready card that changes (a committed proposal) erases the binding and counts churn.
-    Check(OllamaPersona::ProposeCard(OllamaPersona::WorldStore(), g_bridgeWorld.Generation(), players[0].guid, true,
-                                     "codex", 0, second.request.input.card.stamp,
+    Check(OllamaPersona::ProposeCard(OllamaPersona::WorldStore(), g_bridgeWorld.Generation(), players[0].guid, "codex",
+                                     0, second.request.input.card.stamp,
                                      "A careful hunter.") == OllamaPersona::ProposalStatus::Queued,
-          "card C: proposal staged");
+          "card C: the generated card is staged for direct application");
     OllamaChat_BridgeRefresh();
     Check(g_bridgeBindings.empty() && g_bridgeCardChurn == churn + 1 && !g_bridgeWorld.Current(second, Now()),
           "card C: a changed ready card erases the binding and counts churn");
@@ -1206,8 +1195,9 @@ void CardTests()
           "card D: observe tolerates empty -> accepted, the reply is delivered");
     Check(CardSubmit("Again.") && persona() == voice + "\n\n" + "A careful hunter." &&
               g_queue.back().request.bridgeTicket.request.input.card.accepted &&
-              g_queue.back().request.bridgeTicket.request.input.card.revision == 1,
-          "card D: the renewal carries the accepted card");
+              g_queue.back().request.bridgeTicket.request.input.card.revision == 1 &&
+              g_queue.back().request.bridgeTicket.request.input.card.facts.race.empty() && !cardFactsCalls,
+          "card D: the renewal carries the accepted card and no facts");
     g_queue.clear();
 
     // E: a message while the card loads keeps the not-ready binding and its revision (J14d: the renewal would bring
@@ -1278,17 +1268,37 @@ void CardTests()
         g_queue.clear();
     }
 
-    // J6d: a stranger's whisper never reads the personal card, even for an acquainted pair.
+    // H (J14e, DS.12): a bot without a card is offered at most MaxCardOffers times per bridge generation.
+    CardFixture();
+    Check(CardSubmit("Morning."), "card H: first message admitted");
+    cardPort.Complete();
+    OllamaChat_BridgeRefresh();
+    Check(CardDeliver(), "card H: the first reply is delivered");
+    unsigned offers = 0;
+    for (unsigned i = 0; i < OllamaPersona::MaxCardOffers + 2; ++i)
+    {
+        Check(CardSubmit("Still there? " + std::to_string(i)), "card H: message admitted");
+        auto const card = g_queue.back().request.bridgeTicket.request.input.card;
+        if (card.offered)
+            ++offers;
+        Check(card.offered ? !card.accepted && card.facts.race == "Dwarf" : card.facts.race.empty(),
+              "card H: an offer carries the facts, no offer carries none");
+        Check(CardDeliver(), "card H: reply delivered");
+    }
+    Check(offers == OllamaPersona::MaxCardOffers && cardFactsCalls == OllamaPersona::MaxCardOffers,
+          "card H: three offers per bot and generation, facts gathered only for an offer");
+    g_queue.clear();
+
+    // J6d -> J14e: a stranger's whisper reads the bot's own card too (DS.12: the player never sees it).
     CardFixture();
     gameAI.master = nullptr;
     players[0].group = nullptr;
-    Check(CardSubmit("Who are you?") && !g_bridgeBindings.back().view.card.personal && cardPort.submitted.empty(),
-          "card J6d: a stranger's whisper gets no personal card");
+    Check(CardSubmit("Who are you?") && cardPort.submitted.size() == 1,
+          "card J14e: a stranger's whisper requests the bot's card");
     g_queue.clear();
 
     while (!cardPort.submitted.empty())
         cardPort.Complete();
-    playerbotConfig.AcquaintanceEnable = acquaintanceLoaded = false;
     OllamaPersona::WorldStore().Configure(false);
     Check(OllamaPersona::WorldStore().SetPort(nullptr), "card: store port detached");
     Reset();
