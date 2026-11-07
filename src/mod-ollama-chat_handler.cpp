@@ -5,7 +5,7 @@
 #include "Channel.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
-#include "BridgeLiteralRoute.h"
+#include "ChatCommandLine.h"
 #include "AcquaintanceMgr.h"
 #include "PlayerbotAIConfig.h"
 #include "Config.h"
@@ -1614,22 +1614,6 @@ void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::str
 }
 // END BRIDGE WORLD ADAPTER
 
-// A line playerbots executes through its own chat hook (or may: Uncertain) gets no bridge request. Say and yell
-// have no playerbots command hook. Pure text and shared-table check, independent of which hook runs first.
-static bool BridgeLiteralCommand(Player* bot, ChatChannelSourceLocal source, std::string const& text)
-{
-    uint32_t type = 0;
-    if (source == SRC_WHISPER_LOCAL)
-        type = CHAT_MSG_WHISPER;
-    else if (source == SRC_PARTY_LOCAL)
-        type = CHAT_MSG_PARTY;
-    else
-        return false;
-
-    return PlayerbotBridge::ClassifyBotLiteral(PlayerbotsMgr::instance().GetPlayerbotAI(bot), type, text) !=
-           PlayerbotBridge::LiteralClass::NotLiteral;
-}
-
 void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32_t lang, std::string& msg, ChatChannelSourceLocal sourceLocal, Channel* channel, Player* receiver, uint8_t chainDepth)
 {
     if (player == nullptr) {
@@ -1645,6 +1629,16 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
                            (sourceLocal != SRC_WHISPER_LOCAL && sourceLocal != SRC_PARTY_LOCAL &&
                             sourceLocal != SRC_SAY_LOCAL && sourceLocal != SRC_YELL_LOCAL)))
         return;
+    // A whisper or party line with the command indicator is for playerbots' own chat hooks (the same rule,
+    // ChatCommandLine.h): no request and no budget. Say and yell have no playerbots hook, so such a line stays chat.
+    std::string commandLine;
+    if (bridgeProvider && (sourceLocal == SRC_WHISPER_LOCAL || sourceLocal == SRC_PARTY_LOCAL) &&
+        PlayerbotBridge::ExtractChatCommand(msg, commandLine))
+    {
+        if (g_DebugEnabled)
+            LOG_INFO("module.ollamachat", "[Ollama Chat] Command line (indicator): no model reply.");
+        return;
+    }
     std::string chanName = (channel != nullptr) ? channel->GetName() : "Unknown";
     uint32_t channelId = (channel != nullptr) ? channel->GetChannelId() : 0;
     std::string receiverName = (receiver != nullptr) ? receiver->GetName() : "None";
@@ -1663,10 +1657,11 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         return text.size() == word.size() || !std::isalnum((unsigned char)text[word.size()]);
     };
 
+    // With the bridge provider only the command indicator above decides; no word list silences a line.
     std::string trimmedMsg = rtrim(msg);
     for (const std::string& blacklist : g_BlacklistCommands)
     {
-        if (startsWithWord(trimmedMsg, blacklist))
+        if (!bridgeProvider && startsWithWord(trimmedMsg, blacklist))
         {
             if (g_DebugEnabled)
                 LOG_INFO("server.loading",
@@ -2265,14 +2260,6 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     {
         if (!bot)
             continue;
-
-        // Before the governor, so a playerbots command line spends no budget and sends no request.
-        if (bridgeProvider && BridgeLiteralCommand(bot, sourceLocal, msg))
-        {
-            if (g_DebugEnabled)
-                LOG_INFO("module.ollamachat", "[Ollama Chat] Bot {} skipped: playerbots command line.", bot->GetName());
-            continue;
-        }
 
         // Everything below runs on the world thread: prompt building reads
         // live world state, and the governor decides before we spend an LLM
