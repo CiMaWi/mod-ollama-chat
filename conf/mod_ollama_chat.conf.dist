@@ -137,7 +137,7 @@ OllamaChat.Bridge.Token =
 #                  work immediately; a replacement epoch waits for actual payload disposal and drain.
 #                  The shared runtime installs filtered queries and current-mark event production.
 #                  While on, the module listens on 127.0.0.1:ChannelPort for the bridge (J5d, below);
-#                  typed commands remain rejected (J6).
+#                  typed commands are answered by the world thread (J6).
 #                  Live delivery awaits J9C/X proof.
 #                  No raw commands, inference fallback, or model text execution is permitted.
 #     Default:     0 (existing generation behavior; reverse mailbox unavailable)
@@ -151,8 +151,10 @@ OllamaChat.Bridge.ChannelEnabled = 0
 #                  world thread's filtered result in the reply (wire: hub bridge/game/README.md).
 #                  Other peers, wrong tokens and bodies over 65536 bytes are refused before the body
 #                  is read; nothing from a request is logged. Valid ports are 1024-65535; another value
-#                  or a busy port logs one warning and leaves the listener closed. A reload restarts
-#                  it only when the port or the token changed. Give the bridge the same port.
+#                  logs one warning and leaves the listener closed. On Windows SO_REUSEADDR lets a second
+#                  worldserver bind the same port silently, so give each instance with the channel
+#                  enabled its own ChannelPort. A reload restarts it only when the port or the token
+#                  changed. Give the bridge the same port.
 #     Default:     18732
 OllamaChat.Bridge.ChannelPort = 18732
 
