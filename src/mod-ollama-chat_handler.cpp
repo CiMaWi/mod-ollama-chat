@@ -1100,8 +1100,9 @@ std::string GenerateBotGameStateSnapshot(Player* bot)
     );
 }
 
+// BEGIN BRIDGE CARD FACTS -- extracted verbatim by the offline card-facts check (J5e-crash).
 // DS.12: the in-world facts a card generation gets about the bot, read on world. Outside the extracted adapter so
-// the offline checks supply their own; the envelope bounds and sanitizes every string. No database access.
+// the adapter checks supply their own; the envelope bounds and sanitizes every string. No database access.
 void BridgeCardFacts(Player* bot, OllamaBridge::CardFacts& facts)
 {
     facts.name = bot->GetName();
@@ -1110,7 +1111,10 @@ void BridgeCardFacts(Player* bot, OllamaBridge::CardFacts& facts)
     facts.gender = bot->getGender() == GENDER_FEMALE ? "female" : "male";
     facts.level = bot->GetLevel();
     facts.faction = bot->GetTeamId() == TEAM_ALLIANCE ? "Alliance" : "Horde";
-    facts.guild = bot->GetGuildName();
+    // J5e-crash: never Player::GetGuildName(), which dereferences the guild unchecked (a guildless bot's first card
+    // offer crashed the world thread). A guildless bot keeps an empty guild.
+    if (Guild const* guild = bot->GetGuild())
+        facts.guild = guild->GetName();
     if (PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot))
         if (AreaTableEntry const* zone = botAI->GetCurrentZone())
             facts.zone = botAI->GetLocalizedAreaName(zone);
@@ -1119,6 +1123,7 @@ void BridgeCardFacts(Player* bot, OllamaBridge::CardFacts& facts)
     if (g_EnableRPPersonalities && personality != g_BotPersonalityList.end() && personality->second != "default")
         facts.traits = OllamaBridge::CardTraitWord(personality->second);
 }
+// END BRIDGE CARD FACTS
 
 // BEGIN BRIDGE WORLD ADAPTER -- extracted verbatim by the offline game-adapter checks.
 namespace
