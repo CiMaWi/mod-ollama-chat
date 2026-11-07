@@ -114,10 +114,11 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
 // World-thread game adapter and bounded, audience-scoped conversation memory. No legacy memory is imported.
 bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard);
 OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource();
-// World-only typed effect adapter (bridge_effect.cpp). While kBridgeEffectsReleased is false it refuses
-// every command without a game read.
+// World-only typed effect adapter (bridge_effect.cpp).
 OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor();
 void OllamaChat_BridgeRefresh();
+// World thread: re-baselines the stored marks of botGuid's own bindings after its mark order, publishing nothing.
+void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid);
 void OllamaChat_BridgeReset();
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply);
 

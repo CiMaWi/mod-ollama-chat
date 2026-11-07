@@ -21,7 +21,7 @@ public:
     EffectResult Execute(EffectPhase const& phase, WorldTicket const& ticket, DispatchGuard const& guard,
                          ChannelCommand const& command, std::function<bool()> const& authorize) override
     {
-        // Release gate (flipped only by J6b4): refuse before any game read, authorization or playerbots call.
+        // Release gate (open since J6b4): closed, it refuses before any game read, authorization or playerbots call.
         if constexpr (!kBridgeEffectsReleased)
             return EffectResult::Rejected;
         else
@@ -126,7 +126,14 @@ private:
         order.X = effect->position.x;
         order.Y = effect->position.y;
         order.Z = effect->position.z;
-        switch (PlayerbotBridge::Execute(phase.join, order, authorize))
+        auto const outcome = PlayerbotBridge::Execute(phase.join, order, authorize);
+        // DS.10: a mark that applied or may have applied re-baselines only this bot's stored marks, so the bot does
+        // not react to its own mark change; other bots in the group still observe it. Rejected and Unavailable
+        // promise no mutation.
+        if (effect->intent == ChannelIntent::Mark && outcome != PlayerbotBridge::Result::Rejected &&
+            outcome != PlayerbotBridge::Result::Unavailable)
+            OllamaChat_BridgeNoteOwnMark(ticket.scope.botGuid);
+        switch (outcome)
         {
             case PlayerbotBridge::Result::Rejected:
                 return EffectResult::Rejected;

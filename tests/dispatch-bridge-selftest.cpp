@@ -72,7 +72,13 @@ namespace OllamaPersona
 void ForgetPersona(uint64_t) {}
 void RetirePersonas(uint64_t) {}
 }  // namespace OllamaPersona
-bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const&, std::vector<uint8_t> const&) { return false; }
+// The refresh's mark-change publication, counted per bot (self-mark guard, DS.10).
+std::vector<uint64_t> g_eventBots;
+bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const& guard, std::vector<uint8_t> const&)
+{
+    g_eventBots.push_back(guard.scope.botGuid);
+    return false;
+}
 
 #include "dispatch-types.inc"
 
@@ -81,6 +87,7 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest, OllamaBridge::WorldScope con
                                  OllamaBridge::DispatchGuard, int64_t);
 bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&);
 void OllamaChat_BridgeRefresh();
+void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid);
 void OllamaChat_BridgeReset();
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const&, std::string const&);
 
@@ -117,6 +124,7 @@ bool apiEntered = false;
 bool throwApi = false;
 std::string routedText;
 bool adapterMode = false;
+bool secondBot = false;  // players[3] is a second bot of the group, sharing the first bot's AI double.
 bool g_Enable = true;
 bool g_EnableWhisperReplies = true;
 bool g_DisableForSayYell = false;
@@ -269,7 +277,7 @@ struct PlayerbotsMgr
     PlayerbotAI* GetPlayerbotAI(Player* player)
     {
         if (adapterMode)
-            return player == &players[0] ? &gameAI : nullptr;
+            return (player == &players[0] || (secondBot && player == &players[3])) ? &gameAI : nullptr;
         static PlayerbotAI ai;
         return &ai;
     }
@@ -723,6 +731,7 @@ void AdapterFixture()
     Reset();
     g_bridgeWorld.InvalidateScope(gameGuard.scope.botGuid, gameGuard.scope.contextId);
     adapterMode = true;
+    secondBot = false;
     party = {};
     for (unsigned i = 0; i < std::size(players); ++i)
     {
@@ -937,6 +946,64 @@ void AdapterTests()
           "expired binding capacity reusable");
     Reset();
 }
+
+// DS.10: after its own mark order the executor calls OllamaChat_BridgeNoteOwnMark(bot); the next refresh then opens no
+// events route for that bot's bindings, while other bots and human mark changes still publish.
+void SelfMarkTests()
+{
+    using namespace OllamaBridge;
+    auto const events = [](uint64_t bot)
+    { return static_cast<std::size_t>(std::count(g_eventBots.begin(), g_eventBots.end(), bot)); };
+    AdapterFixture();
+    secondBot = true;
+    players[3].human = false;
+    party.members.push_back({ObjectGuid(44)});
+    party.marks[0] = players[4].guid;
+    Check(AdapterSubmit(), "self-mark: bot party binding");
+    Check(BridgeSubmit(&players[0], &players[1], SRC_WHISPER_LOCAL, "Question", true, "scope", 0),
+          "self-mark: second binding of the same bot");
+    Check(BridgeSubmit(&players[3], &players[2], SRC_PARTY_LOCAL, "A public question.", true, "party-99", 0),
+          "self-mark: other bot's binding");
+    g_queue.clear();
+    OllamaChat_BridgeRefresh();  // A new binding stores no marks; the first refresh takes [A] as its baseline.
+    g_eventBots.clear();
+    OllamaChat_BridgeRefresh();
+    Check(g_bridgeBindings.size() == 3 && g_eventBots.empty(), "self-mark: baseline marks publish nothing");
+
+    party.marks[1] = players[5].guid;
+    OllamaChat_BridgeNoteOwnMark(11);
+    Check(g_eventBots.empty() && g_bridgeBindings.size() == 3, "self-mark: the re-baseline itself publishes nothing");
+    OllamaChat_BridgeRefresh();
+    Check(events(11) == 0 && events(44) == 1 && g_eventBots.size() == 1,
+          "self-mark: own mark opens no events route; the other bot still reacts once");
+
+    g_eventBots.clear();
+    party.marks[2] = players[6].guid;
+    OllamaChat_BridgeRefresh();
+    Check(events(11) == 2 && events(44) == 1, "self-mark: a human mark still opens one route per binding");
+
+    g_eventBots.clear();
+    party.marks[3] = players[7].guid;
+    OllamaChat_BridgeNoteOwnMark(44);
+    OllamaChat_BridgeRefresh();
+    Check(events(11) == 2 && events(44) == 0, "self-mark: the guard is per bot, not per group");
+
+    g_eventBots.clear();
+    party.marks[4] = players[8].guid;
+    OllamaChat_BridgeNoteOwnMark(999);
+    OllamaChat_BridgeRefresh();
+    Check(events(11) == 2 && events(44) == 1, "self-mark: a note for another bot keeps these baselines");
+
+    g_eventBots.clear();
+    party.marks[5] = players[9].guid;
+    players[2].visible = false;
+    OllamaChat_BridgeNoteOwnMark(11);
+    Check(g_bridgeBindings.size() == 3 && g_eventBots.empty(), "self-mark: a failed capture keeps the binding");
+    OllamaChat_BridgeRefresh();
+    Check(g_bridgeBindings.size() == 1 && g_eventBots.empty(),
+          "self-mark: the refresh retires lost bindings; the re-baselined one stays silent");
+    Reset();
+}
 }  // namespace
 
 int main()
@@ -951,6 +1018,7 @@ int main()
         TerminalTests();
         DrainTest();
         AdapterTests();
+        SelfMarkTests();
         g_queue.clear();
         g_done.clear();
         Check(!OllamaBridge::DispatchSlot::Used(), "final no leaked slots");

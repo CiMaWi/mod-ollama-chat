@@ -23,6 +23,7 @@
 #include "ObjectAccessor.h"
 #include "Player.h"
 
+#include "ChatCommandLine.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 
@@ -342,6 +343,8 @@ bool PrepareBridge(Completion& c)
             c.text = Roleplay_FilterMetaTerms(c.text);
             if (c.text.empty())
                 c.bridgeOutcome = WorldOutcome::Filtered;
+            else  // Bot speech is never a playerbots command line, whoever hears it ("# Plan" -> "Plan").
+                PlayerbotBridge::NeutralizeCommandIndicator(c.text);
         }
     }
     auto const action = DispatchTerminal(c.bridgeOutcome, c.request.directAddress);
@@ -471,6 +474,11 @@ bool PrepareBridge(Completion& c)
     // The chat line of a consumed bridge generation. Every exit returns to DeliverBridge, which holds the claim.
     void DeliverBridgeLine(Completion const& c, OllamaWorldSnapshot const& world)
     {
+        // Fail closed for every text source (PrepareBridge strips generated text): a line that playerbots would parse
+        // as a command is never sent, so no bot commands another bot or itself, and no send budget is spent on it.
+        std::string commandLine;
+        if (PlayerbotBridge::ExtractChatCommand(c.text, commandLine))
+            return;
         Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(c.request.botGuid));
         if (!bot || !bot->IsInWorld())
             return;
@@ -1017,9 +1025,9 @@ void LogBridgeCommands(Clock::time_point now)
     g_nextCommandsLog = now + std::chrono::minutes(1);
     LOG_INFO("module.ollamachat",
              "[Ollama Chat] Bridge commands: proposed {} duplicates {} refused {} attempts {} applied {} "
-             "failed {} withheld {} effects {}",
+             "failed {} withheld {}",
              stats.proposed, stats.duplicates, stats.refused, stats.attempts, stats.applied, stats.failed,
-             stats.withheld, OllamaBridge::kBridgeEffectsReleased ? "released" : "closed");
+             stats.withheld);
 }
 }  // namespace
 
@@ -1033,8 +1041,8 @@ void OllamaDispatch_Update(uint32_t /*diff*/, PlayerbotBridge::PostMapJoin const
             g_bridgeWorld.Scopes(OllamaBridge::Now()),
             g_bridgeInFlight.load() == 0 && OllamaBridge::DispatchSlot::Used() == 0 && g_bridgeChannel.Drained(),
             OllamaBridge::Now());
-    // J4 generation intents have no strategy captures or typed execution.
-    // Future strategy owners must replace this proof; unknown obligations fail closed.
+    // Generation intents and the six one-shot typed effects (synchronous, no strategy capture) are the only
+    // obligations, so this proof holds. J12 adds lasting orders and must replace it; unknown obligations fail closed.
     if (!g_nativeSelected &&
         g_bridgeWorld.ObserveDrain(
             g_bridgeInFlight.load() == 0 && OllamaBridge::DispatchSlot::Used() == 0 && g_bridgeChannel.Drained(),

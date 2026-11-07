@@ -14,6 +14,14 @@
 
 // ---- game doubles -------------------------------------------------------------------------------------------------
 float g_SayDistance = 17.5f;
+// The handler's self-mark re-baseline (DS.10), counted.
+unsigned ownMarkNotes = 0;
+uint64_t ownMarkBot = 0;
+void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid)
+{
+    ++ownMarkNotes;
+    ownMarkBot = botGuid;
+}
 
 struct ObjectGuid
 {
@@ -156,6 +164,8 @@ struct Env
         game = Counters{};
         PlayerbotBridge::pb = PlayerbotBridge::Doubles{};
         g_SayDistance = 17.5f;
+        ownMarkNotes = 0;
+        ownMarkBot = 0;
         botGroup.guid = controllerGroup.guid = kGroup;
         bot.group = &botGroup;
         controller.group = &controllerGroup;
@@ -305,11 +315,17 @@ void Gates()
     {
         Env env;
         BridgeCommandExecutor executor;
-        static_assert(!kBridgeEffectsReleased, "effects stay closed in this plan state");
+        static_assert(kBridgeEffectsReleased, "effects are on since J6b4 (DS.5)");
         Check(executor.Execute(env.phase, env.ticket, env.guard, ValidCmd(ChannelIntent::Follow), env.Authorize()) ==
-                      EffectResult::Rejected &&
-                  Untouched(),
-              "closed release gate: fixed refusal before any read");
+                      EffectResult::Applied &&
+                  PlayerbotBridge::pb.executes == 1 && env.authorizeCalls == 1,
+              "open release gate: Execute reaches the typed effect");
+    }
+    {
+        Env env;
+        env.phase.join.current = false;
+        Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Rejected && ownMarkNotes == 0,
+              "a mark refused before playerbots re-baselines nothing");
     }
     for (int which = 0; which < 4; ++which)
     {
@@ -477,6 +493,10 @@ void ResultMapping()
             PlayerbotBridge::pb.result = pair.in;
             Check(env.Run(ValidCmd(verb.intent)) == pair.out && PlayerbotBridge::pb.executes == 1,
                   "playerbots result maps one to one; unknown is failed, never applied");
+            bool const mayHaveMarked = verb.intent == ChannelIntent::Mark &&
+                                       (pair.out == EffectResult::Applied || pair.out == EffectResult::Failed);
+            Check(ownMarkNotes == (mayHaveMarked ? 1u : 0u) && (!mayHaveMarked || ownMarkBot == kBot),
+                  "only a mark that applied or may have applied re-baselines the marking bot's own marks");
         }
 }
 }  // namespace

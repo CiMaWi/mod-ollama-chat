@@ -13,9 +13,8 @@
 // rate, epoch, route, deadline and authority; a world-only executor supplies the one game effect.
 namespace OllamaBridge
 {
-// Typed effects stay closed until literal routing, generated speech and the cumulative J6 review are done.
-// Only J6b4 flips this; while it is false the production executor refuses every command without a game read.
-constexpr bool kBridgeEffectsReleased = false;
+// Typed effects are on since J6b4 (DS.5); the bridge channel enable is the only switch.
+constexpr bool kBridgeEffectsReleased = true;
 
 struct WorldTicket;
 struct DispatchGuard;

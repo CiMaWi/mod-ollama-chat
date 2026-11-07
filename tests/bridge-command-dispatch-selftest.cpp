@@ -213,7 +213,7 @@ struct Fixture
 
 void PureSeam()
 {
-    Check(!kBridgeEffectsReleased, "typed effects stay closed until the J6 release join");
+    Check(kBridgeEffectsReleased, "typed effects are on since the J6 release join (J6b4)");
     unsigned supported = 0;
     for (int intent = 0; intent <= static_cast<int>(ChannelIntent::DungeonClear); ++intent)
         supported += EffectSupported(static_cast<ChannelIntent>(intent)) ? 1 : 0;

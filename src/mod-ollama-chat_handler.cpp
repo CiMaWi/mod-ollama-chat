@@ -1567,6 +1567,20 @@ void OllamaChat_BridgeRefresh()
     }
 }
 
+void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid)
+{
+    // DS.10: only the marking bot's bindings take the new marks as their baseline, so the next refresh opens no
+    // events route for its own mark. A failed capture leaves the binding for the refresh to retire.
+    for (auto& binding : g_bridgeBindings)
+    {
+        auto const& guard = binding.view.guard;
+        BridgeView current;
+        if (guard.scope.botGuid == botGuid &&
+            BridgeCapture(guard.scope.botGuid, guard.speakerGuid, guard.source, current))
+            binding.marks = std::move(current.marks);
+    }
+}
+
 bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard)
 {
     BridgeView current;
@@ -1625,6 +1639,8 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     }
     if (lang == LANG_ADDON) return;
     bool const bridgeProvider = OllamaConfig_Snapshot().provider == OllamaProvider::Bridge;
+    // Only a human's line opens a bridge request. A bot's own replies (BridgeHuman false) and bot chains never do,
+    // so generated speech cannot feed back into the bridge or start a bot-to-bot loop.
     if (bridgeProvider && (!g_Enable || !BridgeHuman(player) || chainDepth || channel ||
                            (sourceLocal != SRC_WHISPER_LOCAL && sourceLocal != SRC_PARTY_LOCAL &&
                             sourceLocal != SRC_SAY_LOCAL && sourceLocal != SRC_YELL_LOCAL)))
