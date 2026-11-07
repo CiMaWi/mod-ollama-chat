@@ -10,6 +10,7 @@
 #include <iostream>
 #include <list>
 #include <mutex>
+#include <nlohmann/json.hpp>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -43,17 +44,28 @@ using OllamaBridgeObserver = bool (*)(OllamaBridge::WorldTicket const&, OllamaBr
 #define LOG_ERROR(...) ((void)0)
 
 OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource();
+// The production phase holds the post-map-join token; the stand-in executor below never reads it.
+namespace OllamaBridge
+{
+struct EffectPhase
+{
+};
+}  // namespace OllamaBridge
 // The production channel names the world-only typed effect adapter, which needs game headers. This fixture stands in
-// with the closed release gate: every command is refused without a game read.
+// with the closed release gate (every command refused without a game read) unless a DS.14 silent-answer test opens
+// it: then it asks the channel's authorization once and reports the chosen result only when granted.
+OllamaBridge::EffectResult executorResult = OllamaBridge::EffectResult::Rejected;
 OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
 {
     struct Closed final : OllamaBridge::CommandExecutor
     {
         OllamaBridge::EffectResult Execute(OllamaBridge::EffectPhase const&, OllamaBridge::WorldTicket const&,
                                            OllamaBridge::DispatchGuard const&, OllamaBridge::ChannelCommand const&,
-                                           std::function<bool()> const&) override
+                                           std::function<bool()> const& authorize) override
         {
-            return OllamaBridge::EffectResult::Rejected;
+            if (executorResult == OllamaBridge::EffectResult::Rejected || !authorize())
+                return OllamaBridge::EffectResult::Rejected;
+            return executorResult;
         }
     };
     static Closed executor;
@@ -295,6 +307,33 @@ void BridgeCardFacts(Player*, OllamaBridge::CardFacts& facts)
     facts.className = "Warrior";
     facts.level = 42;
 }
+// J5f: the bot-state reader (playerbots, outside the extract) is a stand-in too. Each call reads 10 points less
+// health, the rest stays fixed; the marker zone shows whether state leaked into a signature or a prompt.
+unsigned stateFactsCalls = 0;
+void BridgeBotStateFacts(Player*, Player*, OllamaBridge::BotState& state)
+{
+    ++stateFactsCalls;
+    state.present = true;
+    state.healthPct = 100.0f - 10.0f * static_cast<float>(stateFactsCalls);
+    state.alive = true;
+    state.zone = "MARKERZONE";
+}
+// J5f-b: the topic reader (playerbots, outside the extract); not exercised here.
+bool BridgeBotStateTopic(uint64_t, OllamaBridge::StateTopic, std::vector<OllamaBridge::StateEntry>& entries)
+{
+    entries.clear();
+    return false;
+}
+// J6e-c: the watch fact reader and the wake's governor scope (outside the extract) are stand-ins.
+OllamaBridge::WatchFacts watchFacts;
+unsigned watchFactsCalls = 0;
+bool BridgeWatchFacts(uint64_t, uint64_t, OllamaBridge::WatchFacts& facts)
+{
+    ++watchFactsCalls;
+    facts = watchFacts;
+    return facts.ready;
+}
+std::string BridgeWakeScopeKey(Player*, ChatChannelSourceLocal) { return "wake-scope"; }
 bool Governor_IsRepetitive(ObjectGuid, std::string const&, std::string const&) { return false; }
 bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool)
 {
@@ -396,7 +435,7 @@ void Reset()
 bool Submit(bool addressed = true, std::string memory = {}, int64_t lifetimeMs = 1000)
 {
     OllamaChatRequest request;
-    request.botGuid = 11;
+    request.botGuid = gameGuard.scope.botGuid;  // 11 except in the DS.14 silent tests (one bot per command).
     request.targetGuid = 33;
     request.botName = "Bot";
     request.source = SRC_PARTY_LOCAL;
@@ -747,6 +786,142 @@ void AdapterFixture()
 bool AdapterSubmit(ChatChannelSourceLocal source = SRC_PARTY_LOCAL, std::string text = "A public question.")
 {
     return BridgeSubmit(&players[0], &players[2], source, text, true, "party-99", 0);
+}
+
+// DS.14 (b): one typed act on the generation's own route, as the bridge sends it before the terminal result.
+void SendAct(OllamaBridge::WorldTicket const& ticket, OllamaBridge::EffectResult result)
+{
+    static OllamaBridge::EffectPhase const phase{};
+    executorResult = result;
+    nlohmann::json const act = {{"version", 1},
+                                {"instance", ticket.scope.instance},
+                                {"provider", ticket.scope.provider},
+                                {"epoch", ticket.scope.epoch},
+                                {"requestId", ticket.request.requestId},
+                                {"deadlineUnixMs", ticket.request.deadline.unixMs},
+                                {"type", "command"},
+                                {"commandId", "act-" + ticket.request.requestId},  // Ids are once per epoch.
+                                {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
+                                {"botGuid", std::to_string(ticket.scope.botGuid)},
+                                {"intent", "attack_own_target"},
+                                {"params", nlohmann::json::object()}};
+    uint64_t receipt = 0;
+    auto const before = g_bridgeChannel.Commands();
+    Check(g_bridgeChannel.Receive(config.bridge.token, ticket.request.requestId, act.dump(), receipt) ==
+              OllamaBridge::ChannelError::None,
+          "DS.14: the act was received on the generation route");
+    Check(g_bridgeChannel.Update(&phase) == 1, "DS.14: one world tick takes the act");
+    Check(g_bridgeChannel.Commands().proposed == before.proposed + 1, "DS.14: the act was decided");
+    std::unique_ptr<OllamaBridge::ChannelPacket> packet;
+    char const* const outcome = result == OllamaBridge::EffectResult::Applied  ? "applied"
+                                : result == OllamaBridge::EffectResult::Failed ? "failed"
+                                                                               : "rejected";
+    Check(g_bridgeChannel.Take(config.bridge.token, receipt, packet) == OllamaBridge::ChannelError::None && packet &&
+              packet->error == OllamaBridge::ChannelError::None &&
+              nlohmann::json::parse(packet->body).at("outcome") == outcome,
+          "DS.14: the bridge sees the act's outcome");
+    executorResult = OllamaBridge::EffectResult::Rejected;
+}
+
+// The channel binds an epoch once (ChannelPolicy never reuses one); Reset keeps the same selected identity.
+void OpenChannel()
+{
+    g_channelEnabled = true;
+    if (!g_bridgeChannel.Activate())
+        g_bridgeChannel.Configure(true);
+    Check(g_bridgeChannel.Activate(), "DS.14: game link channel open");
+}
+
+void SilentTests()
+{
+    using namespace OllamaBridge;
+    // A silent answer stands only after an authorized attempt (Applied or Failed) on its own route: no line, no
+    // outage, no governor send, completed and consumed once, counted. Otherwise it is no answer: Empty, so the outage
+    // line for an addressed human and silence otherwise. Each case uses its own bot (the 2 s command interval).
+    struct Case
+    {
+        char const* label;
+        std::optional<EffectResult> act;
+        bool addressed;
+        uint64_t bot;
+        bool stands;
+    };
+    for (auto const& c :
+         {Case{"applied", EffectResult::Applied, true, 12, true}, Case{"failed", EffectResult::Failed, false, 13, true},
+          Case{"rejected", EffectResult::Rejected, true, 14, false},
+          Case{"rejected, unaddressed", EffectResult::Rejected, false, 15, false},
+          Case{"no command", std::nullopt, true, 16, false},
+          Case{"no command, unaddressed", std::nullopt, false, 17, false}})
+    {
+        Reset();
+        gameGuard.scope.botGuid = c.bot;
+        gameGuard.audience = {c.bot, 22, 33};
+        Check(g_bridgeWorld.ObserveScope(gameGuard.scope, Now()), "DS.14: silent fixture scope observed");
+        OpenChannel();
+        Check(Submit(c.addressed), "DS.14: silent fixture admitted");
+        auto const ticket = g_queue.front().request.bridgeTicket;
+        if (c.act)
+            SendAct(ticket, *c.act);
+        apiResult = {};
+        apiResult.ok = true;
+        apiResult.silent = true;
+        auto done = Finish();
+        Check(done.bridgeOutcome == WorldOutcome::Silent && done.text.empty(), "DS.14: the worker maps silent");
+        g_EnableTypingSimulation = true;
+        uint64_t const counted = g_bridgeSilent;
+        bool const prepared = PrepareBridge(done);
+        if (c.stands)
+        {
+            Check(prepared && done.bridgeOutcome == WorldOutcome::Silent && done.text.empty() &&
+                      done.deliverAt <= std::chrono::steady_clock::now(),
+                  "DS.14: a silent answer after an act stands, without outage text or typing delay");
+            Check(!g_bridgeWorld.Complete(ticket, WorldOutcome::Success, Now()), "DS.14: the silent ticket completed");
+            DeliverBridge(done, {});
+            DeliverBridge(done, {});
+            Check(!routeCalls && !governorCalls && !recordCalls && g_bridgeSilent == counted + 1,
+                  "DS.14: no line and no governor send; counted once");
+            Check(!g_bridgeWorld.Current(ticket, Now()) && !g_bridgeWorld.Pending(), "DS.14: the claim is disposed");
+        }
+        else if (c.addressed)
+        {
+            Check(prepared && done.bridgeOutcome == WorldOutcome::Empty && done.text == DispatchOutageText(),
+                  "DS.14: silence without an act is no answer: the outage line for an addressed human");
+            DeliverBridge(done, {});
+            Check(routeCalls == 1 && governorCalls == 1 && routedText == DispatchOutageText() &&
+                      g_bridgeSilent == counted,
+                  "DS.14: the outage line is routed and not counted silent");
+        }
+        else
+        {
+            Check(!prepared && !routeCalls && !governorCalls && g_bridgeSilent == counted,
+                  "DS.14: silence without an act stays silent when not addressed");
+            g_bridgeWorld.Cancel(ticket);
+        }
+        Check(!g_bridgeChannel.Close(ticket), "DS.14: the route was closed by the dispatcher");
+    }
+    Check(DispatchTerminal(WorldOutcome::Silent, true) == TerminalAction::Silence &&
+              DispatchTerminal(WorldOutcome::Silent, false) == TerminalAction::Silence,
+          "DS.14: a silent outcome never maps to the outage line");
+
+    // The real adapter remembers the exchange as an answer without words, never as quoted speech.
+    AdapterFixture();
+    OpenChannel();
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Come here."), "DS.14: adapter silent fixture");
+    auto const ticket = g_queue.front().request.bridgeTicket;
+    SendAct(ticket, EffectResult::Applied);
+    apiResult = {};
+    apiResult.ok = true;
+    apiResult.silent = true;
+    auto done = Finish();
+    Check(PrepareBridge(done), "DS.14: adapter silent answer prepared");
+    DeliverBridge(done, {});
+    Check(!routeCalls && !governorCalls && g_bridgeBindings.size() == 1 &&
+              g_bridgeBindings[0].memory == "Earlier the same speaker said: Come here.\nYou answered without words.",
+          "DS.14: the memory records a wordless answer");
+    done = {};
+    g_channelEnabled = false;
+    g_bridgeChannel.Configure(false);
+    Reset();
 }
 
 void AdapterTests()
@@ -1199,6 +1374,32 @@ bool CardDeliver()
 // Observe); Submit compares strictly and renews the binding with the card, keeping its one-exchange memory. A ready
 // card that changes under the same voice is churn: the binding is erased and counted. J14d: Submit keeps a tolerated
 // binding while the new card is not ready either or while one of its replies is in flight.
+// J5f (DS.14 (d)): the bot state is read on world for every request, outside the capture. Two messages whose
+// state differs only in health keep the same binding (BridgeSame, no renewal) and each request carries its own
+// reading; a refresh reads no state; no state value reaches the binding signature, system prompt or persona.
+void StateTests()
+{
+    AdapterFixture();
+    stateFactsCalls = 0;
+    Check(AdapterSubmit(SRC_PARTY_LOCAL, "Come here."), "state: first message admitted");
+    auto const first = g_queue.back().request.bridgeTicket;
+    OllamaChat_BridgeRefresh();
+    Check(stateFactsCalls == 1 && g_bridgeBindings.size() == 1, "state: a refresh reads no state");
+    Check(AdapterSubmit(SRC_PARTY_LOCAL, "Where are you?"), "state: second message admitted");
+    auto const second = g_queue.back().request.bridgeTicket;
+    Check(stateFactsCalls == 2 && first.request.input.state.present && second.request.input.state.present &&
+              first.request.input.state.healthPct == 90.0f && second.request.input.state.healthPct == 80.0f,
+          "state: each request carries its own fresh reading");
+    Check(second.scope == first.scope && g_bridgeBindings.size() == 1,
+          "state: a health-only difference stays BridgeSame (no renewal)");
+    auto const leaks = [](std::string const& text) { return text.find("MARKERZONE") != std::string::npos; };
+    Check(!leaks(g_bridgeBindings[0].view.signature) && !leaks(g_bridgeBindings[0].view.context.systemPrompt) &&
+              !leaks(g_bridgeBindings[0].view.context.persona) && !leaks(second.request.input.systemPrompt) &&
+              !leaks(second.request.input.persona) && g_bridgeBindings[0].view.context.state.zone.empty(),
+          "state: no state value in the binding, signature, system prompt or persona");
+    g_queue.clear();
+}
+
 void CardTests()
 {
     using namespace OllamaBridge;
@@ -1396,6 +1597,134 @@ void CardTests()
     Check(OllamaPersona::WorldStore().SetPort(nullptr), "card: store port detached");
     Reset();
 }
+
+// J6e-c (DS.14 (c)): one act on a route as the bridge sends it; the act's result.
+nlohmann::json WakeAct(OllamaBridge::WorldTicket const& ticket, std::string const& id)
+{
+    static OllamaBridge::EffectPhase const phase{};
+    executorResult = OllamaBridge::EffectResult::Applied;
+    nlohmann::json const act = {{"version", 1},
+                                {"instance", ticket.scope.instance},
+                                {"provider", ticket.scope.provider},
+                                {"epoch", ticket.scope.epoch},
+                                {"requestId", ticket.request.requestId},
+                                {"deadlineUnixMs", ticket.request.deadline.unixMs},
+                                {"type", "command"},
+                                {"commandId", id},
+                                {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
+                                {"botGuid", std::to_string(ticket.scope.botGuid)},
+                                {"intent", "attack_own_target"},
+                                {"params", nlohmann::json::object()}};
+    uint64_t receipt = 0;
+    Check(g_bridgeChannel.Receive(config.bridge.token, ticket.request.requestId, act.dump(), receipt) ==
+              OllamaBridge::ChannelError::None,
+          "wake: the act was received on the wake route");
+    Check(g_bridgeChannel.Update(&phase) == 1, "wake: one world tick takes the act");
+    std::unique_ptr<OllamaBridge::ChannelPacket> packet;
+    Check(g_bridgeChannel.Take(config.bridge.token, receipt, packet) == OllamaBridge::ChannelError::None && packet &&
+              packet->error == OllamaBridge::ChannelError::None,
+          "wake: the act's result is published");
+    executorResult = OllamaBridge::EffectResult::Rejected;
+    return nlohmann::json::parse(packet->body);
+}
+
+// J6e-c (DS.14 (c)): a fired watch opens one unaddressed generation through BridgeSubmit on the partner's
+// conversation, with fresh state and the chain's depth and origin; acts on it pass the same command path and rate.
+void WakeTests()
+{
+    using namespace OllamaBridge;
+    AdapterFixture();
+    players[0].guid = 77;  // A bot no earlier test commanded: the 2 s command interval survives resets.
+    party.members.front().guid = ObjectGuid(77);
+    OpenChannel();
+    stateFactsCalls = 0;
+    int64_t const before = Now().unixMs;
+    Check(AdapterSubmit(SRC_PARTY_LOCAL, "Come to me once this fight is over."), "wake: chat line admitted");
+    auto const line = g_queue.back().request.bridgeTicket;
+    Check(line.request.input.wakeCondition.empty() && line.request.input.wakeWatchId.empty() &&
+              line.request.input.wakeDepth == 0 && line.request.input.originUnixMs >= before &&
+              line.request.input.originUnixMs <= Now().unixMs,
+          "wake: a chat line starts its chain now, at depth 0");
+    OllamaChat_BridgeRemember(line, "I will.");
+    std::string const remembered = g_bridgeBindings.size() == 1 ? g_bridgeBindings[0].memory : std::string();
+    Check(remembered.find("Come to me once this fight is over.") != std::string::npos,
+          "wake: the chat exchange is remembered");
+
+    Watch watch;
+    watch.id = "watch-77";
+    watch.botGuid = 77;
+    watch.partnerGuid = players[2].guid;
+    watch.source = DispatchSource::Party;
+    watch.channel = line.scope.channel;
+    watch.contextId = line.scope.contextId;
+    watch.condition = WatchCondition::CombatEnd;
+    watch.depth = 2;
+    watch.originUnixMs = line.request.input.originUnixMs - 1000;
+    std::size_t queued = g_queue.size();
+    Check(OllamaChat_BridgeWake(watch) && g_queue.size() == queued + 1, "wake: a fired watch opens one generation");
+    auto const wake = g_queue.back().request.bridgeTicket;
+    bool const wakeAddressed = g_queue.back().request.directAddress;
+    std::string const wakeScopeKey = g_queue.back().request.scopeKey;
+    auto const& input = wake.request.input;
+    Check(input.text == "Your fight is over." && input.wakeCondition == "combat_end" && input.wakeWatchId == "watch-77",
+          "wake: the fixed in-world sentence and the watch's condition and id");
+    Check(!input.directAddress && !wakeAddressed, "wake: never addressed, so a failure stays silent");
+    Check(input.wakeDepth == 2 && input.originUnixMs == watch.originUnixMs, "wake: the chain's depth and origin");
+    Check(stateFactsCalls == 2 && input.state.present, "wake: the bot's state is read again for the wake");
+    Check(wakeScopeKey == "wake-scope" && wake.scope.botGuid == 77 && wake.scope.controllerGuid == players[2].guid &&
+              wake.scope.contextId == line.scope.contextId,
+          "wake: the partner's scope key and the same conversation");
+    Check(wake.request.deadline.unixMs <= Now().unixMs + 30000, "wake: at most 30 s");
+
+    OllamaChat_BridgeRemember(wake, "On my way.");
+    Check(g_bridgeBindings.size() == 1 && g_bridgeBindings[0].memory == remembered,
+          "wake: a wake reply is no exchange with the speaker; the earlier one stays remembered");
+
+    Check(WakeAct(wake, "wake-act-1").at("outcome") == "applied",
+          "wake: an act on the wake route passes the full command path");
+    auto const second = WakeAct(wake, "wake-act-2");
+    Check(second.at("outcome") == "rejected" && second.at("reason") == "too_soon",
+          "wake: the bot's command interval holds on a wake route");
+
+    auto other = watch;
+    other.contextId = "another-conversation";
+    queued = g_queue.size();
+    Check(!OllamaChat_BridgeWake(other) && g_queue.size() == queued,
+          "wake: a watch of another conversation opens nothing");
+    players[0].online = false;
+    Check(!OllamaChat_BridgeWake(watch) && g_queue.size() == queued, "wake: the bot gone, nothing opens");
+    players[0].online = true;
+    players[2].online = false;
+    Check(!OllamaChat_BridgeWake(watch) && g_queue.size() == queued, "wake: the partner gone, nothing opens");
+    players[2].online = true;
+
+    Check(BridgeSubmit(&players[0], &players[2], SRC_SAY_LOCAL, "Bot, wait for me.", true, "say-key", 0),
+          "wake: an addressed say line admitted");
+    auto sayWatch = watch;
+    sayWatch.id = "watch-say";
+    sayWatch.source = DispatchSource::Say;
+    sayWatch.contextId = g_queue.back().request.bridgeTicket.scope.contextId;
+    sayWatch.condition = WatchCondition::Time;
+    queued = g_queue.size();
+    Check(OllamaChat_BridgeWake(sayWatch) && g_queue.size() == queued + 1 &&
+              g_queue.back().request.source == SRC_SAY_LOCAL && !g_queue.back().request.directAddress &&
+              g_queue.back().request.bridgeTicket.request.input.text == "The time you meant to wait has passed.",
+          "wake: a say conversation wakes too, unaddressed");
+
+    // A wake failure is silence: no outage line, no governor send.
+    while (g_queue.size() > 1)
+        g_queue.pop_front();
+    auto const sayWake = g_queue.front().request.bridgeTicket;
+    apiResult = {};
+    apiResult.ok = false;
+    apiResult.error = "bridge_unavailable";
+    auto done = Finish();
+    Check(!PrepareBridge(done) && !routeCalls && !governorCalls, "wake: a failed wake stays silent");
+    g_bridgeWorld.Cancel(sayWake);
+    done = {};
+    g_queue.clear();
+    Reset();  // The channel stays open for SilentTests (it binds an epoch once per process).
+}
 }  // namespace
 
 int main()
@@ -1408,10 +1737,13 @@ int main()
         PublicationTest();
         ClaimedScopeTests();
         TerminalTests();
+        WakeTests();
+        SilentTests();
         DrainTest();
         AdapterTests();
         SelfMarkTests();
         CardTests();
+        StateTests();
         g_queue.clear();
         g_done.clear();
         Check(!OllamaBridge::DispatchSlot::Used(), "final no leaked slots");

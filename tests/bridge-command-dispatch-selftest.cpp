@@ -898,6 +898,78 @@ void PostEffectJoin()
           "an effect claimed without authorization is never reported applied");
 }
 
+void ActedRoutes()
+{
+    // DS.14 (b): Close reports whether the route made an authorized effect attempt (Applied or Failed), its receipt
+    // published or withheld; refusals, fixed refusals, queries and an unused route do not count. A second Close and
+    // an unknown route report nothing.
+    struct Case
+    {
+        char const* label;
+        void (*arrange)(Fixture&);
+        bool acted;
+    };
+    Case const cases[] = {
+        {"applied", [](Fixture& f) { f.Send(f.Attack("a")); }, true},
+        {"failed",
+         [](Fixture& f)
+         {
+             f.probe.result = EffectResult::Failed;
+             f.Send(f.Attack("a"));
+         },
+         true},
+        {"withheld receipt",
+         [](Fixture& f)
+         {
+             f.probe.after = [&f]
+             {
+                 f.now.unixMs += WorldLivenessMs;
+                 f.now.steadyMs += WorldLivenessMs;
+             };
+             f.Send(f.Attack("a"));
+         },
+         true},
+        {"executor refusal",
+         [](Fixture& f)
+         {
+             f.probe.early = EffectResult::Rejected;
+             f.Send(f.Attack("a"));
+         },
+         false},
+        {"refused after the grant",
+         [](Fixture& f)
+         {
+             f.probe.result = EffectResult::Rejected;
+             f.Send(f.Attack("a"));
+         },
+         false},
+        {"authorization denied",
+         [](Fixture& f)
+         {
+             f.probe.before = [&f] { f.guard.perceptible = false; };
+             f.Send(f.Attack("a"));
+         },
+         false},
+        {"no phase", [](Fixture& f) { f.Send(f.Attack("a"), false); }, false},
+        {"claimed without authorization",
+         [](Fixture& f)
+         {
+             f.probe.skipAuthorize = true;
+             f.Send(f.Attack("a"));
+         },
+         false},
+        {"query only", [](Fixture& f) { f.Send(f.Query("q")); }, false},
+        {"no command", [](Fixture&) {}, false},
+    };
+    for (auto const& c : cases)
+    {
+        Fixture f;
+        c.arrange(f);
+        Check(f.channel.Close(f.ticket) == c.acted, c.label);
+        Check(!f.channel.Close(f.ticket), "a closed route reports nothing twice");
+    }
+}
+
 void TransportLoss()
 {
     // Outcome decided, then the receipt is lost in transport: nothing re-executes.
@@ -944,6 +1016,7 @@ int main()
         LostGuards();
         RateAndClock();
         PostEffectJoin();
+        ActedRoutes();
         TransportLoss();
         std::cout << "PASS " << checks << " typed command dispatch checks\n";
     }

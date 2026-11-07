@@ -7,6 +7,7 @@
 
 #include "mod-ollama-chat_bridge.h"
 #include "mod-ollama-chat_bridge_intent.h"
+#include "mod-ollama-chat_bridge_watch.h"
 
 namespace OllamaBridge
 {
@@ -15,6 +16,8 @@ constexpr std::size_t ChannelMaxPending = 64;
 constexpr std::size_t ChannelMaxScopes = 64;
 constexpr std::size_t ChannelMaxEvents = 32;
 constexpr std::size_t ChannelMaxUnits = 40;
+constexpr std::size_t ChannelMaxTopicBytes = 8192;  // DS.14 (d): one bot_state topic's entries, encoded.
+constexpr std::size_t ChannelMaxTopicName = 64;     // Bytes of one entry's name, cut on a character boundary.
 
 enum class ChannelError : uint8_t
 {
@@ -63,10 +66,45 @@ enum class ChannelOutcome : uint8_t
     Failed
 };
 
+enum class QueryKind : uint8_t
+{
+    ObservableGroup,
+    BotState  // DS.14 (d), J5f-b: one topic of the bot's own state.
+};
+
+enum class StateTopic : uint8_t
+{
+    Inventory,
+    Quests,
+    Cooldowns,
+    Strategies,
+    Spells
+};
+constexpr std::size_t StateTopicCount = 5;
+
+char const* StateTopicName(StateTopic topic);
+std::size_t StateTopicLimit(StateTopic topic);  // Most entries a topic result carries.
+
+// One raw entry of a bot_state topic, as the game read it; FinishTopic filters, bounds and names the keys.
+//   inventory:  name, kind "equipped"/"bag", first = item quality 0..7, second = stack count
+//   quests:     name = title, kind "active"/"complete"/"failed", first = objectives done, second = needed
+//   cooldowns:  name, first = seconds left
+//   strategies: name (whitelisted), kind "combat"/"non_combat"
+//   spells:     name, first = rank (0 = none)
+struct StateEntry
+{
+    std::string name;
+    std::string kind;
+    int64_t first = 0;
+    int64_t second = 0;
+};
+
 struct ChannelQuery
 {
     uint64_t controllerGuid = 0;
     uint64_t botGuid = 0;
+    QueryKind kind = QueryKind::ObservableGroup;
+    StateTopic topic = StateTopic::Inventory;  // Only for QueryKind::BotState.
 };
 struct ChannelText
 {
@@ -75,7 +113,16 @@ struct ChannelText
 struct ChannelAck
 {
 };
-using ChannelPayload = std::variant<ChannelQuery, ChannelCommand, ChannelText, ChannelAck, ChannelFailure>;
+// J6e-c: arm, replace or clear the route bot's watch; its id shares the command replay namespace.
+struct ChannelWatch
+{
+    std::string commandId;
+    uint64_t botGuid = 0;
+    WatchCondition condition = WatchCondition::None;
+    int64_t untilUnixMs = 0;
+};
+using ChannelPayload =
+    std::variant<ChannelQuery, ChannelCommand, ChannelText, ChannelAck, ChannelFailure, ChannelWatch>;
 
 // Owned values only. Successful decode is staging, never an effect-execution grant.
 struct ChannelMessage
@@ -117,12 +164,19 @@ public:
     bool Current(ChannelEnvelope const& envelope, WorldScope const& current, Clock now, bool requireOpen = true) const;
     ChannelError FinishQuery(ChannelEnvelope const& envelope, WorldScope const& current,
                              std::vector<Participant> const& observedUnits, Clock now, std::string& body);
+    // J5f-b: a bot_state result (`topic`, `entries`); a query id still never authorizes a command.
+    ChannelError FinishTopic(ChannelEnvelope const& envelope, WorldScope const& current, StateTopic topic,
+                             std::vector<StateEntry> const& entries, Clock now, std::string& body);
     ChannelError FinishFailure(ChannelEnvelope const& envelope, ChannelFailure failure, WorldScope const& current,
                                Clock now, std::string& body);
     // J5e: a rejected or failed outcome carries `reason` and `reasonText` (None words as cannot_now or failed).
     ChannelError FinishCommand(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
                                WorldScope const& current, Clock now, std::string& body,
                                CommandRefusal refusal = CommandRefusal::None);
+    // J6e-c: `watch.result` with outcome armed, cleared or rejected (rejected also `reason` and `reasonText`).
+    ChannelError FinishWatch(ChannelEnvelope const& envelope, std::string const& commandId, WatchOutcome outcome,
+                             WorldScope const& current, Clock now, std::string& body,
+                             CommandRefusal refusal = CommandRefusal::None);
     std::size_t RequestReservations() const { return _requests.size(); }
     std::size_t CommandReservations() const { return _commands.size(); }
     std::size_t Pending() const;

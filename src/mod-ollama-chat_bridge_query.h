@@ -24,6 +24,20 @@ public:
     virtual bool GroupMembers(WorldTicket const& ticket, uint64_t groupGuid, std::vector<uint64_t>& members) = 0;
     virtual bool ResolveVisible(WorldTicket const& ticket, uint64_t guid, VisibleUnit& unit) = 0;
     virtual bool ReadMark(WorldTicket const& ticket, uint8_t icon, uint64_t& targetGuid) = 0;
+    // J5f-b: one bot_state topic of the ticket's own bot, raw (FinishTopic filters and bounds it); false when the
+    // bot cannot be read. Never another unit's state.
+    virtual bool ReadTopic(WorldTicket const& /*ticket*/, StateTopic /*topic*/, std::vector<StateEntry>& entries)
+    {
+        entries.clear();
+        return false;
+    }
+    // J6e-c: what a watch needs of botGuid (ready, combat, activity code); false when the bot cannot be read or is not
+    // ready (offline, out of the world, in a battleground or arena, partner offline). Never another unit's state.
+    virtual bool ReadWatch(uint64_t /*botGuid*/, uint64_t /*partnerGuid*/, WatchFacts& facts)
+    {
+        facts = {};
+        return false;
+    }
 };
 
 // These are owned observations, NOT authority. A publisher must call Current immediately before exposing

@@ -110,7 +110,7 @@ struct PlanCounters
     bool operator==(PlanCounters const&) const = default;
 };
 
-// The owner of a bot's live plans (one owner per bot), for the tick's group, controller and logout checks.
+// The owner of a bot's live plans (one owner per bot), for the tick's group, partner and logout checks.
 struct PlanLiveBot
 {
     uint64_t botGuid = 0;
@@ -160,7 +160,7 @@ public:
         {
             if (entry.key.botGuid != key.botGuid)
                 continue;
-            // Live entries carry the open generation (Open retires the others), so owner means group and controller.
+            // Live entries carry the open generation (Open retires the others), so owner means group and partner.
             if (entry.pending || entry.owner.groupGuid != owner.groupGuid ||
                 entry.owner.controllerGuid != owner.controllerGuid)
                 return PlanAdmission::Refused;
@@ -296,7 +296,7 @@ public:
         return true;
     }
 
-    // Distinct bots with live entries and their owner, in application order, for the world tick's group, controller
+    // Distinct bots with live entries and their owner, in application order, for the world tick's group, partner
     // and logout checks.
     std::vector<PlanLiveBot> LiveBots() const
     {

@@ -97,9 +97,13 @@ OllamaBridge::Settings g_nativeSettings;
 OllamaBridgeObserver g_bridgeObserver = nullptr;
 bool g_channelEnabled = false;
 OllamaBridge::CommandStats g_loggedCommands;  // World-thread: the counters in the last watchlist line.
+uint64_t g_bridgeSilent = 0;  // World-thread: delivered action-only answers (DS.14), in the commands line.
+uint64_t g_loggedSilent = 0;  // World-thread: the silent count in the last watchlist line.
 Clock::time_point g_nextCommandsLog{};
 OllamaBridge::PlanCounters g_loggedPlans;  // World-thread: the plan counters in the last watchlist line.
 Clock::time_point g_nextPlansLog{};
+OllamaBridge::WatchCounters g_loggedWatches;  // World-thread: the watch counters in the last watchlist line (J6e-c).
+Clock::time_point g_nextWatchesLog{};
 OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
                                            [](OllamaBridge::WorldTicket const& ticket,
                                               OllamaBridge::DispatchGuard& guard)
@@ -137,7 +141,7 @@ OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
     {
         using OllamaBridge::WorldOutcome;
         if (api.ok)
-            return api.text.empty() ? WorldOutcome::Empty : WorldOutcome::Success;
+            return api.silent ? WorldOutcome::Silent : api.text.empty() ? WorldOutcome::Empty : WorldOutcome::Success;
         if (api.error == "bridge_expired_or_invalid_request")
             return WorldOutcome::Cancelled;
         if (api.error == "bridge_circuit_open_or_inactive")
@@ -330,9 +334,13 @@ bool BridgeCurrent(Completion const& c)
 bool PrepareBridge(Completion& c)
 {
     using namespace OllamaBridge;
-    g_bridgeChannel.Close(c.request.bridgeTicket);
+    // DS.14: a silent answer stands only when this route did something (an authorized attempt, Applied or Failed);
+    // otherwise it is no answer: the outage line for an addressed human, silence otherwise.
+    bool const acted = g_bridgeChannel.Close(c.request.bridgeTicket);
     if (!BridgeCurrent(c))
         return false;
+    if (c.bridgeOutcome == WorldOutcome::Silent && !acted)
+        c.bridgeOutcome = WorldOutcome::Empty;
     if (c.bridgeOutcome == WorldOutcome::Success)
     {
         // Config-dependent cleanup stays on the world thread, after fresh authority/perception checks.
@@ -351,13 +359,14 @@ bool PrepareBridge(Completion& c)
         }
     }
     auto const action = DispatchTerminal(c.bridgeOutcome, c.request.directAddress);
-    if (action == TerminalAction::Silence || !BridgeCurrent(c) ||
+    bool const silent = c.bridgeOutcome == WorldOutcome::Silent;  // No line, yet completed and delivered.
+    if ((action == TerminalAction::Silence && !silent) || !BridgeCurrent(c) ||
         !g_bridgeWorld.Complete(c.request.bridgeTicket, c.bridgeOutcome, Now()))
         return false;
     if (action == TerminalAction::Outage)
         c.text = DispatchOutageText();
     uint64_t delayMs = 0;
-    if (g_EnableTypingSimulation)
+    if (g_EnableTypingSimulation && !silent)
     {
         delayMs = g_TypingSimulationBaseDelay + static_cast<uint64_t>(c.text.size()) * g_TypingSimulationDelayPerChar;
         if (g_TypingSimulationMaxDelay)
@@ -477,6 +486,13 @@ bool PrepareBridge(Completion& c)
     // The chat line of a consumed bridge generation. Every exit returns to DeliverBridge, which holds the claim.
     void DeliverBridgeLine(Completion const& c, OllamaWorldSnapshot const& world)
     {
+        if (c.bridgeOutcome == OllamaBridge::WorldOutcome::Silent)
+        {
+            // DS.14: the act was the answer: no line and no governor send; counted and remembered as wordless.
+            ++g_bridgeSilent;
+            OllamaChat_BridgeRemember(c.request.bridgeTicket, {});
+            return;
+        }
         // Fail closed for every text source (PrepareBridge strips generated text): a line that playerbots would parse
         // as a command is never sent, so no bot commands another bot or itself, and no send budget is spent on it.
         std::string commandLine;
@@ -661,7 +677,10 @@ OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; 
 
 bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const& guard, std::vector<uint8_t> const& icons)
 {
-    if (g_eventPublications.size() >= OllamaBridge::WorldChannel::MaxPackets)
+    // J6e-c: only the native (Codex observer) adapter takes event routes. The generic 127.0.0.1 port has no events
+    // endpoint, so an event route there held a packet slot until retirement (64 mark changes in an epoch refused every
+    // later query and command with capacity) and a world reservation of the binding's scope for nothing.
+    if (!g_nativeSelected || g_eventPublications.size() >= OllamaBridge::WorldChannel::MaxPackets)
         return false;
     OllamaBridge::EventPublication publication;
     if (!g_bridgeChannel.ObserveEvents(guard, icons, publication))
@@ -691,6 +710,8 @@ OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, u
 {
     return g_bridgeChannel.Take(bearer, receipt, packet);
 }
+
+void OllamaDispatch_BridgeWatchLogout(uint64_t guid) { g_bridgeChannel.Watches().Cancel(guid); }
 
 namespace
 {
@@ -898,8 +919,8 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
         default:
             return false;
     }
-    if (guard.source != source ||
-        ((source == DispatchSource::Say || source == DispatchSource::Yell) && !input.directAddress))
+    if (guard.source != source || ((source == DispatchSource::Say || source == DispatchSource::Yell) &&
+                                   !input.directAddress && input.wakeCondition.empty()))
         return false;
     auto settings = OllamaConfig_Snapshot();
     Identity const identity{settings.bridge.instance, settings.bridge.provider, settings.bridge.endpoint, scope.epoch};
@@ -1063,15 +1084,16 @@ namespace
 void LogBridgeCommands(Clock::time_point now)
 {
     OllamaBridge::CommandStats const& stats = g_bridgeChannel.Commands();
-    if (now < g_nextCommandsLog || stats == g_loggedCommands)
+    if (now < g_nextCommandsLog || (stats == g_loggedCommands && g_bridgeSilent == g_loggedSilent))
         return;
     g_loggedCommands = stats;
+    g_loggedSilent = g_bridgeSilent;
     g_nextCommandsLog = now + std::chrono::minutes(1);
     LOG_INFO("module.ollamachat",
              "[Ollama Chat] Bridge commands: proposed {} duplicates {} refused {} attempts {} applied {} "
-             "failed {} withheld {}",
+             "failed {} withheld {} silent {}",
              stats.proposed, stats.duplicates, stats.refused, stats.attempts, stats.applied, stats.failed,
-             stats.withheld);
+             stats.withheld, g_bridgeSilent);
 }
 
 // Smoke-test watchlist (J12): lasting-plan counters, after a change and at most once a minute.
@@ -1088,7 +1110,38 @@ void LogBridgePlans(Clock::time_point now)
              plans.applied, plans.renewed, plans.expired, plans.regrouped, plans.retired, plans.restored,
              plans.departed, plans.abandoned, plans.unrecorded);
 }
+
+// Smoke-test watchlist (J6e-c): watch counters beside the plan counters, after a change and at most once a minute.
+void LogBridgeWatches(Clock::time_point now)
+{
+    OllamaBridge::WatchCounters const watches = g_bridgeChannel.Watches().Counters();
+    if (now < g_nextWatchesLog || watches == g_loggedWatches)
+        return;
+    g_loggedWatches = watches;
+    g_nextWatchesLog = now + std::chrono::minutes(1);
+    LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge watches: armed {} fired {} expired {} dropped {} rejected {}",
+             watches.armed, watches.fired, watches.expired, watches.dropped, watches.rejected);
+}
 }  // namespace
+
+// DS.14 (c), J6e-c: one watch scan. Each watch costs one fresh read of its own bot; a fired watch opens at most one
+// wake, which gets no authority of its own (BridgeSubmit, then the full command path on its route).
+static void ScanBridgeWatches()
+{
+    auto& watches = g_bridgeChannel.Watches();
+    std::vector<OllamaBridge::Watch> due;
+    watches.Scan(
+        OllamaBridge::Now(), [](OllamaBridge::Watch const& watch, OllamaBridge::WatchFacts& facts)
+        { return OllamaChat_BridgeQuerySource().ReadWatch(watch.botGuid, watch.partnerGuid, facts); }, due);
+    for (auto const& watch : due)
+    {
+        bool const opened = OllamaChat_BridgeWake(watch);
+        if (!opened)
+            LOG_DEBUG("module.ollamachat", "[Ollama Chat] Bridge wake dropped: bot {} watch {}", watch.botGuid,
+                      watch.id);
+        watches.Woke(watch, opened, OllamaBridge::Now());
+    }
+}
 
 // The bridge lifecycle part of the world tick, in order: restores of pending lasting plans first (J12), so a
 // retirement made by a reload or the previous call can be proven drained in this one; then native and generic
@@ -1121,10 +1174,14 @@ void OllamaDispatch_Update(uint32_t /*diff*/, PlayerbotBridge::PostMapJoin const
     UpdateBridgeLifecycle(phase);
     // J5e: the plan restores above run while disabled too, so their counters line stays visible.
     LogBridgePlans(Clock::now());
+    LogBridgeWatches(Clock::now());
     if (!g_Enable)
         return;  // Disabled: the plan restores above are the only work (OnUpdate calls this tick in that state too).
     // Bounded independent reverse lane; no HTTP, waits or generation-worker dependency.
     g_bridgeChannel.Update(&phase);
+    // DS.14 (c), J6e-c: watches, post-map-join, at most every 500 ms and nothing at all while none exists.
+    if (g_bridgeChannel.Watches().Due(OllamaBridge::Now()))
+        ScanBridgeWatches();
     const auto now = Clock::now();
     LogBridgeCommands(now);
 

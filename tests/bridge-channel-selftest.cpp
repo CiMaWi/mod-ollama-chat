@@ -1,6 +1,7 @@
 // Offline checks of the actual production channel helper; no game authority or effect executor.
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <set>
 #include <stdexcept>
 
 #include "mod-ollama-chat_bridge_channel.h"
@@ -421,6 +422,316 @@ void QueriesEventsAndCapacity()
 }
 }  // namespace
 
+// J5f-b: bot_state queries, one topic each; entries filtered and bounded per topic.
+Json StateQuery(Fixture const& f, std::string const& id, Json topic)
+{
+    auto json = f.Wire("query", id);
+    json["controllerGuid"] = std::to_string(f.scope.controllerGuid);
+    json["botGuid"] = std::to_string(f.scope.botGuid);
+    json["query"] = "bot_state";
+    json["topic"] = std::move(topic);
+    return json;
+}
+
+Json Topic(Fixture& f, std::string const& id, StateTopic topic, std::vector<StateEntry> const& entries)
+{
+    ChannelMessage message;
+    Check(f.policy.Receive(bearer, StateQuery(f, id, StateTopicName(topic)).dump(), f.scope, now, message, "work") ==
+              ChannelError::None,
+          "bot_state query admitted");
+    auto const& query = std::get<ChannelQuery>(message.payload);
+    Check(query.kind == QueryKind::BotState && query.topic == topic, "typed bot_state topic");
+    std::string body;
+    Check(f.policy.FinishTopic(message.envelope, f.scope, topic, entries, now, body) == ChannelError::None,
+          "topic result encoded");
+    Check(body.size() <= MaxResponseBytes, "topic result within the response cap");
+    auto json = Json::parse(body);
+    Check(json.size() == 9 && json.at("type") == "query.result" && json.at("topic") == StateTopicName(topic) &&
+              json.at("entries").is_array() && !json.contains("units"),
+          "topic result shape");
+    Check(json.at("entries").dump().size() <= ChannelMaxTopicBytes, "topic entries within 8 KB");
+    return json.at("entries");
+}
+
+bool Keys(Json const& entry, std::set<std::string> const& keys)
+{
+    std::set<std::string> found;
+    for (auto const& item : entry.items())
+        found.insert(item.key());
+    return found == keys;
+}
+
+void Topics()
+{
+    Fixture f;
+    // Parse: the five topics, nothing else.
+    for (std::string bad : {"bank", "", "Inventory", "talents"})
+        Check(f.Receive(StateQuery(f, "bad-" + bad, bad)) == ChannelError::Invalid, "unknown topic invalid_input");
+    Check(f.Receive(StateQuery(f, "bad-number", 1)) == ChannelError::Invalid, "topic must be a string");
+    auto missing = StateQuery(f, "missing", "inventory");
+    missing.erase("topic");
+    Check(f.Receive(missing) == ChannelError::Invalid, "bot_state needs a topic");
+    auto extra = f.Wire("query", "extra");
+    extra["controllerGuid"] = std::to_string(f.scope.controllerGuid);
+    extra["botGuid"] = std::to_string(f.scope.botGuid);
+    extra["query"] = "observable_group";
+    extra["topic"] = "inventory";
+    Check(f.Receive(extra) == ChannelError::Invalid, "observable_group takes no topic");
+    auto spare = StateQuery(f, "spare", "spells");
+    spare["units"] = Json::array();
+    Check(f.Receive(spare) == ChannelError::Invalid, "bot_state exact keys");
+    auto other = StateQuery(f, "other-bot", "spells");
+    other["botGuid"] = "5";
+    Check(f.Receive(other) == ChannelError::Stale, "bot_state only for the route's own bot");
+    Check(f.Receive(StateQuery(f, "state-1", "quests")) == ChannelError::None, "bot_state reserves its id");
+    Check(f.Receive(StateQuery(f, "state-1", "quests")) == ChannelError::Duplicate, "bot_state id replay refused");
+    Check(f.Receive(f.Command("effect-state", "state-1")) == ChannelError::Invalid,
+          "a bot_state query id never authorizes a command");
+
+    // Inventory: 40 entries, quality names, kinds, counts.
+    std::vector<StateEntry> items;
+    for (int i = 0; i < 50; ++i)
+        items.push_back({"Item " + std::to_string(i), i < 19 ? "equipped" : "bag", i % 8, i == 0 ? 0 : 5000});
+    items.insert(items.begin(), {{"Bad quality", "bag", 8, 1}, {"Bad kind", "bank", 1, 1}, {"", "bag", 1, 1}});
+    auto entries = Topic(f, "inv", StateTopic::Inventory, items);
+    Check(entries.size() == 40, "inventory at most 40 entries");
+    Check(entries.at(0).at("name") == "Item 0" && Keys(entries.at(0), {"where", "name", "quality", "count"}),
+          "inventory fixed keys, bad quality, kind and empty name dropped");
+    Check(entries.at(0).at("where") == "equipped" && entries.at(0).at("quality") == "poor" &&
+              entries.at(0).at("count") == 1 && entries.at(7).at("quality") == "heirloom" &&
+              entries.at(19).at("where") == "bag" && entries.at(1).at("count") == 1000,
+          "inventory values bounded and named");
+
+    // Quests: 25 entries, done never above needed.
+    std::vector<StateEntry> quests{{"Odd status", "abandoned", 1, 2}};
+    for (int i = 0; i < 30; ++i)
+        quests.push_back({"Quest " + std::to_string(i),
+                          i % 3 == 0   ? "complete"
+                          : i % 3 == 1 ? "failed"
+                                       : "active",
+                          i == 0 ? 99 : -4, i == 0 ? 8 : 20000});
+    entries = Topic(f, "quests", StateTopic::Quests, quests);
+    Check(entries.size() == 25 && Keys(entries.at(0), {"title", "status", "done", "needed"}),
+          "quests at most 25 with fixed keys");
+    Check(entries.at(0).at("title") == "Quest 0" && entries.at(0).at("done") == 8 && entries.at(0).at("needed") == 8 &&
+              entries.at(0).at("status") == "complete" && entries.at(1).at("status") == "failed" &&
+              entries.at(2).at("status") == "active" && entries.at(1).at("done") == 0 &&
+              entries.at(1).at("needed") == 10000,
+          "quest progress bounded");
+
+    // Cooldowns: 20 entries, only positive seconds, capped at a week.
+    std::vector<StateEntry> cooldowns{{"Ready", "", 0, 0}};
+    for (int i = 0; i < 30; ++i)
+        cooldowns.push_back({"Spell " + std::to_string(i), "", i == 0 ? 100000000 : 30 - i, 0});
+    entries = Topic(f, "cooldowns", StateTopic::Cooldowns, cooldowns);
+    Check(entries.size() == 20 && Keys(entries.at(0), {"name", "seconds"}) && entries.at(0).at("name") == "Spell 0" &&
+              entries.at(0).at("seconds") == 604800,
+          "cooldowns at most 20, ready spells dropped, seconds capped");
+
+    // Strategies: whitelist, kinds, repeats dropped.
+    entries = Topic(f, "strategies", StateTopic::Strategies,
+                    {{"tank", "combat"},
+                     {"debug", "combat"},
+                     {"follow", "non_combat"},
+                     {"follow", "non_combat"},
+                     {"heal", "sideways"},
+                     {"rtsc", "non_combat"},
+                     {"Tank", "combat"}});
+    Check(entries.size() == 2 && entries.at(0).at("name") == "tank" && entries.at(0).at("kind") == "combat" &&
+              entries.at(1).at("name") == "follow" && Keys(entries.at(1), {"name", "kind"}),
+          "strategies through the whitelist, unknown and repeated dropped");
+
+    // Spells: 40 entries, rank bounded.
+    std::vector<StateEntry> spells;
+    for (int i = 0; i < 50; ++i)
+        spells.push_back({"Spell " + std::to_string(i), "", i == 0 ? 150 : i == 1 ? -1 : 3, 0});
+    entries = Topic(f, "spells", StateTopic::Spells, spells);
+    Check(entries.size() == 40 && Keys(entries.at(0), {"name", "rank"}) && entries.at(0).at("rank") == 99 &&
+              entries.at(1).at("rank") == 0 && entries.at(2).at("rank") == 3,
+          "spells at most 40, rank bounded");
+
+    // Names: cut to 64 bytes on a character boundary; control characters and invalid UTF-8 dropped.
+    std::string accented;
+    for (int i = 0; i < 40; ++i)
+        accented += "\xC3\xA9";
+    entries = Topic(f, "names", StateTopic::Spells,
+                    {{std::string(100, 'x'), "", 1, 0},
+                     {"x" + accented, "", 1, 0},
+                     {"Bad\nline", "", 1, 0},
+                     {"Bad \xFF byte", "", 1, 0},
+                     {"   ", "", 1, 0}});
+    Check(entries.size() == 2, "names with controls, invalid UTF-8 or no text dropped");
+    Check(entries.at(0).at("name") == std::string(64, 'x'), "name cut at 64 bytes");
+    Check(entries.at(1).at("name").get<std::string>().size() == 63, "name cut on a character boundary");
+
+    // Worst case per topic stays inside 8 KB without the byte cut.
+    for (std::size_t t = 0; t < StateTopicCount; ++t)
+    {
+        auto const topic = static_cast<StateTopic>(t);
+        std::vector<StateEntry> worst;
+        for (int i = 0; i < 60; ++i)
+            worst.push_back({std::to_string(i) + std::string(64, 'w'),
+                             topic == StateTopic::Inventory    ? "equipped"
+                             : topic == StateTopic::Quests     ? "complete"
+                             : topic == StateTopic::Strategies ? "non_combat"
+                                                               : "",
+                             topic == StateTopic::Inventory ? 5 : 604800, 10000});
+        auto const result = Topic(f, "worst-" + std::to_string(t), topic, worst);
+        Check(result.size() == (topic == StateTopic::Strategies ? 0 : StateTopicLimit(topic)), "worst case count");
+    }
+
+    // Terminal once, unknown topic value refused, wrong work refused.
+    ChannelMessage message;
+    Check(f.policy.Receive(bearer, StateQuery(f, "once", "spells").dump(), f.scope, now, message, "work") ==
+              ChannelError::None,
+          "query for terminal check");
+    std::string body;
+    Check(f.policy.FinishTopic(message.envelope, f.scope, static_cast<StateTopic>(9), {}, now, body) ==
+                  ChannelError::Invalid &&
+              body.empty(),
+          "unknown topic value refused");
+    Check(f.policy.FinishTopic(message.envelope, f.scope, StateTopic::Spells, {}, now, body) == ChannelError::None &&
+              Json::parse(body).at("entries").empty(),
+          "empty topic result");
+    Check(f.policy.FinishTopic(message.envelope, f.scope, StateTopic::Spells, {}, now, body) == ChannelError::Stale &&
+              body.empty(),
+          "topic result terminal once");
+    f.Open("gen");
+    ChannelEnvelope envelope{f.scope.instance, f.scope.provider, f.scope.epoch, "gen", deadline.unixMs};
+    Check(f.policy.FinishTopic(envelope, f.scope, StateTopic::Spells, {}, now, body) == ChannelError::Stale,
+          "a generation route never carries a topic result");
+}
+
+// J6e-c (DS.14 (c)): a watch on the route's own bot; its id is a command id (one replay reservation).
+Json WatchWire(Fixture const& f, std::string const& id, Json condition = "combat_end", Json until = 160000,
+               std::string const& request = "work")
+{
+    auto json = f.Wire("watch", request);
+    json["commandId"] = id;
+    json["botGuid"] = std::to_string(f.scope.botGuid);
+    json["condition"] = std::move(condition);
+    json["untilUnixMs"] = std::move(until);
+    return json;
+}
+
+void Watches()
+{
+    Fixture f;
+    f.Open();
+    std::pair<char const*, WatchCondition> const conditions[] = {{"combat_end", WatchCondition::CombatEnd},
+                                                                 {"activity_done", WatchCondition::ActivityDone},
+                                                                 {"time", WatchCondition::Time},
+                                                                 {"none", WatchCondition::None}};
+    for (auto const& [name, condition] : conditions)
+    {
+        ChannelMessage message;
+        std::string const id = std::string("w-") + name;
+        Check(f.policy.Receive(bearer, WatchWire(f, id, name).dump(), f.scope, now, message, "work") ==
+                  ChannelError::None,
+              "watch: each condition admitted");
+        auto const* watch = std::get_if<ChannelWatch>(&message.payload);
+        Check(watch && watch->commandId == id && watch->botGuid == f.scope.botGuid && watch->condition == condition &&
+                  watch->untilUnixMs == 160000,
+              "watch: typed payload");
+    }
+    for (auto const* key : {"commandId", "botGuid", "condition", "untilUnixMs"})
+    {
+        auto missing = WatchWire(f, std::string("missing-") + key);
+        missing.erase(key);
+        Check(f.Receive(missing) == ChannelError::Invalid, "watch: every key required");
+    }
+    for (auto const* key : {"issuerGuid", "intent", "params", "text"})
+    {
+        auto extra = WatchWire(f, std::string("extra-") + key);
+        extra[key] = "x";
+        Check(f.Receive(extra) == ChannelError::Invalid, "watch: no other key");
+    }
+    for (Json const& bad : {Json("combat"), Json(""), Json("Combat_End"), Json("their_answer"), Json(1), Json(nullptr)})
+        Check(f.Receive(WatchWire(f, "bad-condition", bad)) == ChannelError::Invalid,
+              "watch: the condition one of four names");
+    for (Json const& bad : {Json(-1), Json(1.5), Json("160000"), Json(9007199254740992ULL), Json(nullptr), Json(true)})
+        Check(f.Receive(WatchWire(f, "bad-until", "time", bad)) == ChannelError::Invalid,
+              "watch: until a safe non-negative integer");
+    Check(f.Receive(WatchWire(f, "safe-until", "time", Json(9007199254740991ULL))) == ChannelError::None,
+          "watch: until up to the largest safe integer");
+    for (std::string const& bad :
+         {std::string(), std::string("-lead"), std::string("has space"), std::string(129, 'a')})
+        Check(f.Receive(WatchWire(f, bad)) == ChannelError::Invalid, "watch: the id an identifier");
+    auto other = WatchWire(f, "other-bot");
+    other["botGuid"] = "5";
+    Check(f.Receive(other) == ChannelError::Invalid, "watch: only the route's own bot");
+
+    Check(f.Receive(WatchWire(f, "w-combat_end")) == ChannelError::Duplicate, "watch: id replay refused");
+    Check(f.Receive(f.Command("cmd-1")) == ChannelError::None &&
+              f.Receive(WatchWire(f, "cmd-1")) == ChannelError::Duplicate,
+          "watch: a command id cannot be reused by a watch");
+    Check(f.Receive(WatchWire(f, "w-shared")) == ChannelError::None &&
+              f.Receive(f.Command("w-shared")) == ChannelError::Duplicate,
+          "watch: a watch id cannot be reused by a command");
+    ChannelMessage query;
+    Check(f.policy.Receive(bearer, f.Query("q-watch").dump(), f.scope, now, query, "work") == ChannelError::None,
+          "watch: a query route");
+    Check(f.Receive(WatchWire(f, "on-query", "time", 160000, "q-watch")) == ChannelError::Invalid,
+          "watch: never on a query route");
+    std::string body;
+    Check(f.policy.OpenEvents(f.scope, "ev-watch", deadline, {{1, 0}}, now, body) == ChannelError::None,
+          "watch: an events route");
+    Check(f.Receive(WatchWire(f, "on-events", "time", 160000, "ev-watch")) == ChannelError::Invalid,
+          "watch: never on an events route");
+
+    ChannelEnvelope const envelope{f.scope.instance, f.scope.provider, f.scope.epoch, "work", deadline.unixMs};
+    Check(f.policy.FinishWatch(envelope, "w-combat_end", WatchOutcome::Armed, f.scope, now, body) == ChannelError::None,
+          "watch: armed result");
+    auto json = Json::parse(body);
+    Check(json.size() == 9 && json.at("type") == "watch.result" && json.at("requestId") == "work" &&
+              json.at("commandId") == "w-combat_end" && json.at("outcome") == "armed",
+          "watch: armed result exact keys");
+    Check(f.policy.FinishWatch(envelope, "w-combat_end", WatchOutcome::Armed, f.scope, now, body) ==
+                  ChannelError::Duplicate &&
+              body.empty(),
+          "watch: one result per id");
+    Check(f.policy.FinishWatch(envelope, "w-none", WatchOutcome::Cleared, f.scope, now, body) == ChannelError::None &&
+              Json::parse(body).size() == 9 && Json::parse(body).at("outcome") == "cleared",
+          "watch: cleared result exact keys");
+    Check(
+        f.policy.FinishWatch(envelope, "never-seen", WatchOutcome::Armed, f.scope, now, body) == ChannelError::Unknown,
+        "watch: an unknown id has no result");
+    struct Words
+    {
+        CommandRefusal refusal;
+        char const* code;
+        char const* text;
+    };
+    Words const words[] = {{CommandRefusal::NotFighting, "not_fighting", "I am not fighting anything right now."},
+                           {CommandRefusal::NotBusy, "not_busy", "I am not busy with anything."},
+                           {CommandRefusal::WaitTooShort, "wait_too_short", "That is hardly worth waiting for."},
+                           {CommandRefusal::WaitTooLong, "wait_too_long", "I cannot wait that long."},
+                           {CommandRefusal::PutOff, "put_off", "I have put this off long enough already."},
+                           {CommandRefusal::CannotNow, "cannot_now", nullptr}};
+    for (auto const& w : words)
+    {
+        std::string const id = std::string("r-") + w.code;
+        Check(f.Receive(WatchWire(f, id)) == ChannelError::None, "watch: rejected fixture");
+        Check(f.policy.FinishWatch(envelope, id, WatchOutcome::Rejected, f.scope, now, body) == ChannelError::Invalid &&
+                  body.empty(),
+              "watch: rejected needs a refusal");
+        Check(f.policy.FinishWatch(envelope, id, WatchOutcome::Armed, f.scope, now, body, w.refusal) ==
+                  ChannelError::Invalid,
+              "watch: a refusal only with rejected");
+        Check(f.policy.FinishWatch(envelope, id, WatchOutcome::Rejected, f.scope, now, body, w.refusal) ==
+                  ChannelError::None,
+              "watch: rejected result");
+        json = Json::parse(body);
+        Check(json.size() == 11 && json.at("outcome") == "rejected" && json.at("reason") == w.code &&
+                  (w.text ? json.at("reasonText") == w.text : !json.at("reasonText").get<std::string>().empty()),
+              "watch: rejected carries reason and in-world reasonText");
+    }
+    auto terminal = f.Wire("generation.result");
+    terminal["text"] = "I will come once this is done.";
+    Check(f.Receive(terminal) == ChannelError::None && f.Receive(WatchWire(f, "late")) == ChannelError::Closed,
+          "watch: none after the terminal result");
+}
+
 int main()
 {
     try
@@ -429,6 +740,8 @@ int main()
         ExpiryAndScope();
         Schemas();
         QueriesEventsAndCapacity();
+        Topics();
+        Watches();
         std::cout << "PASS " << checks << " production channel checks\n";
         return 0;
     }

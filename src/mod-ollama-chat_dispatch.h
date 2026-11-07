@@ -126,11 +126,18 @@ void OllamaChat_BridgePlansRetire();
 void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const& phase);
 bool OllamaChat_BridgePlansEmpty();
 OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters();
+// DS.14/J5f: OllamaBridge::BotState::plans bits (PlanKind order) of the bot's live bridge plans; world thread.
+uint8_t OllamaChat_BridgePlanKinds(uint64_t botGuid);
 void OllamaChat_BridgeRefresh();
 // World thread: re-baselines the stored marks of botGuid's own bindings after its mark order, publishing nothing.
 void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid);
 void OllamaChat_BridgeReset();
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply);
+// J6e-c, world thread (post-map-join scan): opens the wake generation of a fired watch through BridgeSubmit on a fresh
+// capture with the stored bot, partner and source; false when none opened (capture failed, context changed, refused).
+bool OllamaChat_BridgeWake(OllamaBridge::Watch const& watch);
+// J6e-c, world thread (logout hook): ends the watches whose bot or partner is guid.
+void OllamaDispatch_BridgeWatchLogout(uint64_t guid);
 
 // Drain finished generations and deliver them. World thread only. join is the post-map-join token that only
 // OllamaBotRandomChatter::OnUpdate constructs, on its stack; it is used during this call and never stored.

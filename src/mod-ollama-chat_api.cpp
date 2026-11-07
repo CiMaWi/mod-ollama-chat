@@ -857,6 +857,7 @@ OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, Ollama
     result.error = std::move(bridge.error);
     result.status = bridge.status;
     result.personaProposal = std::move(bridge.personaProposal);
+    result.silent = bridge.silent;
     return result;
 }
 

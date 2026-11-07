@@ -215,6 +215,21 @@ ChannelCommand Command(Json const& body)
     return command;
 }
 
+// J6e-c: a watch on the route's own bot; condition one of four names, untilUnixMs an absolute UTC time in ms.
+ChannelWatch WatchMessage(Json const& body)
+{
+    if (!Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type", "commandId",
+                      "botGuid", "condition", "untilUnixMs"}))
+        throw std::runtime_error("invalid");
+    ChannelWatch watch;
+    watch.commandId = String(body.at("commandId"));
+    watch.botGuid = Guid(body.at("botGuid"));
+    watch.untilUnixMs = static_cast<int64_t>(Integer(body.at("untilUnixMs"), MaxSafeInteger));
+    if (!Identifier(watch.commandId) || !ParseWatchCondition(String(body.at("condition")), watch.condition))
+        throw std::runtime_error("invalid");
+    return watch;
+}
+
 Json EnvelopeJson(ChannelEnvelope const& envelope, char const* type)
 {
     return {{"version", 1},
@@ -225,7 +240,165 @@ Json EnvelopeJson(ChannelEnvelope const& envelope, char const* type)
             {"deadlineUnixMs", envelope.deadlineUnixMs},
             {"type", type}};
 }
+// J5f-b: valid UTF-8 without control characters, cut to max bytes on a character boundary; empty when unusable.
+std::string TopicText(std::string const& text, std::size_t max)
+{
+    if (std::any_of(text.begin(), text.end(), [](unsigned char c) { return c < 0x20 || c == 0x7F; }))
+        return {};
+    std::size_t end = std::min(max, text.size());
+    while (end > 0 && end < text.size() && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80)
+        --end;
+    std::string result = text.substr(0, end);
+    try
+    {
+        (void)Json(result).dump();  // Throws on invalid UTF-8.
+    }
+    catch (std::exception const&)
+    {
+        return {};
+    }
+    return Text(result, max) ? result : std::string();
+}
+
+// Gameplay strategies the bot can talk about; every other playerbots strategy name is dropped.
+bool StrategyAllowed(std::string const& name)
+{
+    static constexpr char const* allowed[] = {"tank",
+                                              "tank assist",
+                                              "heal",
+                                              "dps",
+                                              "dps assist",
+                                              "dps aoe",
+                                              "aoe",
+                                              "cure",
+                                              "buff",
+                                              "boost",
+                                              "cc",
+                                              "threat",
+                                              "potions",
+                                              "food",
+                                              "loot",
+                                              "gather",
+                                              "passive",
+                                              "aggressive",
+                                              "save mana",
+                                              "close",
+                                              "ranged",
+                                              "behind",
+                                              "avoid aoe",
+                                              "kite",
+                                              "mount",
+                                              "quest",
+                                              "grind",
+                                              "rpg",
+                                              "new rpg",
+                                              "travel",
+                                              "explore",
+                                              "attack tagged",
+                                              "follow",
+                                              "stay",
+                                              "guard",
+                                              "runaway",
+                                              "focus heal targets",
+                                              "sit"};
+    return std::any_of(std::begin(allowed), std::end(allowed), [&](char const* item) { return name == item; });
+}
+
+bool ParseTopic(std::string const& name, StateTopic& topic)
+{
+    for (std::size_t i = 0; i < StateTopicCount; ++i)
+        if (name == StateTopicName(static_cast<StateTopic>(i)))
+        {
+            topic = static_cast<StateTopic>(i);
+            return true;
+        }
+    return false;
+}
+
+// One entry with its topic's fixed keys, or false when the entry is unusable (dropped, never rejected whole).
+bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
+{
+    auto const name = TopicText(entry.name, ChannelMaxTopicName);
+    if (name.empty())
+        return false;
+    switch (topic)
+    {
+        case StateTopic::Inventory:
+        {
+            static constexpr char const* qualities[] = {"poor", "common",    "uncommon", "rare",
+                                                        "epic", "legendary", "artifact", "heirloom"};
+            if ((entry.kind != "equipped" && entry.kind != "bag") || entry.first < 0 || entry.first > 7)
+                return false;
+            value = {{"where", entry.kind},
+                     {"name", name},
+                     {"quality", qualities[entry.first]},
+                     {"count", std::clamp<int64_t>(entry.second, 1, 1000)}};
+            return true;
+        }
+        case StateTopic::Quests:
+        {
+            if (entry.kind != "active" && entry.kind != "complete" && entry.kind != "failed")
+                return false;
+            auto const needed = std::clamp<int64_t>(entry.second, 0, 10000);
+            value = {{"title", name},
+                     {"status", entry.kind},
+                     {"done", std::clamp<int64_t>(entry.first, 0, needed)},
+                     {"needed", needed}};
+            return true;
+        }
+        case StateTopic::Cooldowns:
+            if (entry.first <= 0)
+                return false;
+            value = {{"name", name}, {"seconds", std::min<int64_t>(entry.first, 604800)}};
+            return true;
+        case StateTopic::Strategies:
+            if (!StrategyAllowed(entry.name) || (entry.kind != "combat" && entry.kind != "non_combat"))
+                return false;
+            value = {{"name", entry.name}, {"kind", entry.kind}};
+            return true;
+        case StateTopic::Spells:
+            value = {{"name", name}, {"rank", std::clamp<int64_t>(entry.first, 0, 99)}};
+            return true;
+    }
+    return false;
+}
 }  // namespace
+
+char const* StateTopicName(StateTopic topic)
+{
+    switch (topic)
+    {
+        case StateTopic::Inventory:
+            return "inventory";
+        case StateTopic::Quests:
+            return "quests";
+        case StateTopic::Cooldowns:
+            return "cooldowns";
+        case StateTopic::Strategies:
+            return "strategies";
+        case StateTopic::Spells:
+            return "spells";
+    }
+    return "";
+}
+
+std::size_t StateTopicLimit(StateTopic topic)
+{
+    switch (topic)
+    {
+        case StateTopic::Inventory:
+            return 40;
+        case StateTopic::Quests:
+            return 25;
+        case StateTopic::Cooldowns:
+            return 20;
+        case StateTopic::Strategies:
+            return 40;
+        case StateTopic::Spells:
+            return 40;
+    }
+    return 0;
+}
 
 char const* ChannelErrorName(ChannelError error)
 {
@@ -470,11 +643,23 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
         ChannelPayload payload;
         if (type == "query")
         {
-            if (!Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
-                              "controllerGuid", "botGuid", "query"}) ||
-                String(json.at("query")) != "observable_group")
+            auto const kind = String(json.at("query"));
+            ChannelQuery query;
+            if (kind == "bot_state")
+            {
+                // J5f-b: one topic of the bot's own state; an unknown topic is invalid_input.
+                if (!Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
+                                  "controllerGuid", "botGuid", "query", "topic"}) ||
+                    !ParseTopic(String(json.at("topic")), query.topic))
+                    return ChannelError::Invalid;
+                query.kind = QueryKind::BotState;
+            }
+            else if (kind != "observable_group" ||
+                     !Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
+                                   "controllerGuid", "botGuid", "query"}))
                 return ChannelError::Invalid;
-            ChannelQuery query{Guid(json.at("controllerGuid")), Guid(json.at("botGuid"))};
+            query.controllerGuid = Guid(json.at("controllerGuid"));
+            query.botGuid = Guid(json.at("botGuid"));
             if (query.controllerGuid != current.controllerGuid || query.botGuid != current.botGuid)
                 return ChannelError::Stale;
             if (now.unixMs < 0 || now.steadyMs < 0 || envelope.deadlineUnixMs <= now.unixMs ||
@@ -493,6 +678,8 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
         // Fully validate syntax before reserving any replay id or closing a request.
         if (type == "command")
             payload = Command(json);
+        else if (type == "watch")
+            payload = WatchMessage(json);
         else if (type == "generation.result")
         {
             if (!Exact(json,
@@ -544,6 +731,17 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
                 return ChannelError::Capacity;
             _commands.emplace(command->commandId, CommandEntry{envelope.requestId});
         }
+        else if (auto const* watch = std::get_if<ChannelWatch>(&payload))
+        {
+            // J6e-c: only on an open generation (or wake) route and for its own bot; the id is a command id.
+            if (entry.work != ChannelWork::Generation || watch->botGuid != entry.scope.botGuid)
+                return ChannelError::Invalid;
+            if (_commands.contains(watch->commandId))
+                return ChannelError::Duplicate;
+            if (_commands.size() >= _maxIds)
+                return ChannelError::Capacity;
+            _commands.emplace(watch->commandId, CommandEntry{envelope.requestId});
+        }
         else
         {
             if ((type == "generation.result" && entry.work != ChannelWork::Generation) ||
@@ -593,6 +791,52 @@ ChannelError ChannelPolicy::FinishQuery(ChannelEnvelope const& envelope, WorldSc
     {
         auto json = EnvelopeJson(envelope, "query.result");
         json["units"] = std::move(units);
+        auto encoded = json.dump();
+        if (encoded.size() > MaxResponseBytes)
+            return ChannelError::TooLarge;
+        _requests.at(envelope.requestId).terminal = true;
+        body = std::move(encoded);
+        return ChannelError::None;
+    }
+    catch (std::exception const&)
+    {
+        return ChannelError::Invalid;
+    }
+}
+
+ChannelError ChannelPolicy::FinishTopic(ChannelEnvelope const& envelope, WorldScope const& current, StateTopic topic,
+                                        std::vector<StateEntry> const& entries, Clock now, std::string& body)
+{
+    body.clear();
+    if (static_cast<std::size_t>(topic) >= StateTopicCount)
+        return ChannelError::Invalid;
+    if (!Current(envelope, current, now) || _requests.at(envelope.requestId).work != ChannelWork::Query)
+        return ChannelError::Stale;
+    try
+    {
+        // Entries in the game's order, unusable and repeated ones dropped, cut at the topic's count and byte bounds.
+        Json list = Json::array();
+        std::set<std::string> seen;
+        std::size_t bytes = 2;  // The enclosing brackets.
+        for (auto const& entry : entries)
+        {
+            if (list.size() >= StateTopicLimit(topic))
+                break;
+            Json value;
+            if (!TopicEntry(topic, entry, value))
+                continue;
+            auto encoded = value.dump();
+            auto const size = encoded.size() + (list.empty() ? 0 : 1);
+            if (!seen.insert(std::move(encoded)).second)
+                continue;
+            if (bytes + size > ChannelMaxTopicBytes)
+                break;
+            bytes += size;
+            list.push_back(std::move(value));
+        }
+        auto json = EnvelopeJson(envelope, "query.result");
+        json["topic"] = StateTopicName(topic);
+        json["entries"] = std::move(list);
         auto encoded = json.dump();
         if (encoded.size() > MaxResponseBytes)
             return ChannelError::TooLarge;
@@ -660,6 +904,36 @@ ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::
     {
         if (refusal == CommandRefusal::None)
             refusal = outcome == ChannelOutcome::Failed ? CommandRefusal::Failed : CommandRefusal::CannotNow;
+        auto const words = DescribeRefusal(refusal);
+        json["reason"] = words.code;
+        json["reasonText"] = words.text;
+    }
+    body = json.dump();
+    found->second.terminal = true;
+    return ChannelError::None;
+}
+
+ChannelError ChannelPolicy::FinishWatch(ChannelEnvelope const& envelope, std::string const& commandId,
+                                        WatchOutcome outcome, WorldScope const& current, Clock now, std::string& body,
+                                        CommandRefusal refusal)
+{
+    body.clear();
+    if (!Current(envelope, current, now, false))
+        return ChannelError::Stale;
+    auto found = _commands.find(commandId);
+    if (found == _commands.end() || found->second.requestId != envelope.requestId)
+        return ChannelError::Unknown;
+    if (found->second.terminal)
+        return ChannelError::Duplicate;
+    if ((outcome == WatchOutcome::Rejected) != (refusal != CommandRefusal::None))
+        return ChannelError::Invalid;
+    auto json = EnvelopeJson(envelope, "watch.result");
+    json["commandId"] = commandId;
+    json["outcome"] = outcome == WatchOutcome::Armed     ? "armed"
+                      : outcome == WatchOutcome::Cleared ? "cleared"
+                                                         : "rejected";
+    if (outcome == WatchOutcome::Rejected)
+    {
         auto const words = DescribeRefusal(refusal);
         json["reason"] = words.code;
         json["reasonText"] = words.text;

@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <tuple>
 
 namespace OllamaBridge
@@ -136,6 +139,143 @@ nlohmann::json CardContextJson(CardFacts const& facts)
     PutCardFact(context, "guild", facts.guild);
     PutCardFact(context, "traits", facts.traits);
     return context;
+}
+
+uint32_t StatePercent(float value)
+{
+    if (!(value > 0.0f))
+        return 0;
+    return value >= 100.0f ? 100 : static_cast<uint32_t>(value + 0.5f);
+}
+
+// Whole yards; a value that is not finite or beyond any map reads as 0.
+int64_t StateYards(float value)
+{
+    return std::isfinite(value) && std::fabs(value) <= 100000.0f ? std::llround(value) : 0;
+}
+
+char const* StatePower(uint8_t type)
+{
+    switch (type)
+    {
+        case 0:
+            return "mana";
+        case 1:
+            return "rage";
+        case 2:
+            return "focus";
+        case 3:
+            return "energy";
+        case 6:
+            return "runic";
+        default:
+            return nullptr;
+    }
+}
+
+// The most absorbing thing the bot is doing.
+char const* StateActivity(BotState const& state)
+{
+    if (!state.alive)
+        return "idle";
+    if (state.flying)
+        return "flying";
+    if (state.inCombat)
+        return "fighting";
+    if (state.casting)
+        return "casting";
+    if (state.looting)
+        return "looting";
+    if (state.resting)
+        return "resting";
+    if ((state.travelling || state.working) && !state.questTitle.empty())
+        return "questing";
+    if (state.travelling)
+        return "travelling";
+    return "idle";
+}
+
+char const* StateMovement(BotState const& state)
+{
+    return state.stay      ? "stay"
+           : state.follow  ? "follow"
+           : state.guard   ? "guard"
+           : state.grind   ? "grind"
+           : state.passive ? "passive"
+                           : "none";
+}
+
+// DS.14/J5f `input.state`: what the bot itself knows about its condition, place and doings.
+nlohmann::json StateJson(BotState const& state)
+{
+    nlohmann::json json = nlohmann::json::object();
+    json["health"] = StatePercent(state.healthPct);
+    if (char const* kind = StatePower(state.powerType); kind && state.powerMax)
+        json["power"] = {{"kind", kind},
+                         {"pct", StatePercent(100.0f * std::min(state.powerCurrent, state.powerMax) / state.powerMax)}};
+    if (state.level)
+        json["level"] = std::min<uint32_t>(state.level, 255);
+    json["alive"] = state.alive ? "alive" : state.ghost ? "ghost" : "dead";
+    // Only the bot's own victim, and only while the bot can see it.
+    if (state.alive && state.inCombat && state.victim && state.victimVisible)
+    {
+        nlohmann::json target = nlohmann::json::object();
+        PutCardFact(target, "name", state.victimName);
+        if (state.victimLevel)
+            target["level"] = std::min<uint32_t>(state.victimLevel, 255);
+        target["health"] = StatePercent(state.victimHealthPct);
+        json["combat"] = {{"target", std::move(target)}};
+    }
+    char const* activity = StateActivity(state);
+    nlohmann::json doing = {{"kind", activity}};
+    if (std::string_view(activity) == "questing")
+        PutCardFact(doing, "detail", state.questTitle);
+    json["activity"] = std::move(doing);
+    nlohmann::json where = nlohmann::json::object();
+    PutCardFact(where, "zone", state.zone);
+    if (state.area != state.zone)
+        PutCardFact(where, "area", state.area);
+    where["mapId"] = state.mapId;
+    where["x"] = StateYards(state.x);
+    where["y"] = StateYards(state.y);
+    where["z"] = StateYards(state.z);
+    json["where"] = std::move(where);
+    // The partner only while in the bot's group or in its sight; distance and position only on the same map.
+    if (state.partnerOnline && (state.partnerInGroup || state.partnerVisible))
+    {
+        nlohmann::json partner = nlohmann::json::object();
+        PutCardFact(partner, "zone", state.partnerZone);
+        if (state.partnerSameMap)
+        {
+            partner["yards"] = std::max<int64_t>(StateYards(state.partnerYards), 0);
+            partner["x"] = StateYards(state.partnerX);
+            partner["y"] = StateYards(state.partnerY);
+            partner["z"] = StateYards(state.partnerZ);
+        }
+        json["partner"] = std::move(partner);
+    }
+    if (state.mounted)
+        json["mounted"] = true;
+    if (state.swimming)
+        json["swimming"] = true;
+    if (state.groupSize)
+    {
+        nlohmann::json group = {{"size", std::min<uint32_t>(state.groupSize, 40)}, {"leads", state.leads}};
+        if (state.follow)
+            PutCardFact(group, "follows", state.masterName);
+        json["group"] = std::move(group);
+    }
+    json["movement"] = StateMovement(state);
+    static char const* const planNames[] = {"movement", "formation", "save_mana", "focus_healing"};
+    nlohmann::json plans = nlohmann::json::array();
+    for (std::size_t kind = 0; kind < std::size(planNames); ++kind)
+        if (state.plans & (1u << kind))
+            plans.push_back(planNames[kind]);
+    if (!plans.empty())
+        json["plans"] = std::move(plans);
+    json["bags"] = std::min<uint32_t>(state.freeBagSlots, 255);
+    json["money"] = state.money;
+    return json;
 }
 }  // namespace
 
@@ -313,6 +453,10 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
                 card["context"] = CardContextJson(input.card.facts);
             envelope["input"]["personaCard"] = std::move(card);
         }
+        if (input.state.present)
+            envelope["input"]["state"] = StateJson(input.state);
+        if (!input.wakeCondition.empty())  // J6e-c: a wake turn (never addressed); the watch that opened it.
+            envelope["input"]["wake"] = {{"condition", input.wakeCondition}, {"watchId", input.wakeWatchId}};
         if (settings.provider == "codex" && settings.observerEnabled)
         {
             if (!ValidObserverSettings(settings) || !ValidScope(request.scope, settings, request.epoch) ||
@@ -484,11 +628,17 @@ Result Parse(Settings const& settings, Request const& request, std::string const
                 result.error = "bridge_terminal_failure";
             return result;
         }
-        if (!MatchesString(parsed, "type", "generation.result") || !parsed.contains("text") ||
-            !parsed["text"].is_string())
+        // DS.14: exactly one of text or "silent": true (an action-only answer, which never carries a card).
+        bool const silent = parsed.contains("silent");
+        if (!MatchesString(parsed, "type", "generation.result") || silent == parsed.contains("text"))
             return result;
-        auto const& text = parsed["text"].get_ref<std::string const&>();
-        if (text.empty() || text.size() > MaxTextBytes || Blank(text) || text.find('\0') != std::string::npos)
+        if (silent ? !parsed["silent"].is_boolean() || !parsed["silent"].get<bool>() || proposal
+                   : !parsed["text"].is_string())
+            return result;
+        static std::string const wordless;
+        auto const& text = silent ? wordless : parsed["text"].get_ref<std::string const&>();
+        if (!silent &&
+            (text.empty() || text.size() > MaxTextBytes || Blank(text) || text.find('\0') != std::string::npos))
             return result;
         if (proposal)
         {
@@ -506,6 +656,7 @@ Result Parse(Settings const& settings, Request const& request, std::string const
             result.personaProposal = cardBody;
         }
         result.ok = true;
+        result.silent = silent;
         result.text = text;
         result.error.clear();
     }
@@ -597,5 +748,16 @@ Result Generate(Settings const& settings, Request const& request, Circuit& circu
     }
     circuit.Complete(ticket, result.ok, readClock().steadyMs);
     return result;
+}
+
+uint8_t ActivityCode(BotState const& state)
+{
+    constexpr std::string_view kinds[] = {"idle",    "flying",  "fighting", "casting",
+                                          "looting", "resting", "questing", "travelling"};
+    std::string_view const kind = StateActivity(state);
+    for (std::size_t code = 0; code < std::size(kinds); ++code)
+        if (kinds[code] == kind)
+            return static_cast<uint8_t>(code);
+    return 0;
 }
 }  // namespace OllamaBridge

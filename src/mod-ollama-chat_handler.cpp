@@ -5,6 +5,7 @@
 #include "Channel.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "BridgeBotState.h"
 #include "ChatCommandLine.h"
 #include "AcquaintanceMgr.h"
 #include "PlayerbotAIConfig.h"
@@ -1125,6 +1126,121 @@ void BridgeCardFacts(Player* bot, OllamaBridge::CardFacts& facts)
 }
 // END BRIDGE CARD FACTS
 
+// DS.14/J5f: the bot's own state for one request, read by playerbots on world (the chat hook, map threads idle) and
+// copied as plain values; the envelope filters and bounds it. Outside the extracted adapter, like the card facts.
+void BridgeBotStateFacts(Player* bot, Player* partner, OllamaBridge::BotState& state)
+{
+    PlayerbotBridge::BotStateFacts facts;
+    if (!PlayerbotBridge::ReadBotState(bot->GetGUID(), partner->GetGUID(), facts))
+        return;
+    state.present = true;
+    state.healthPct = facts.healthPct;
+    state.powerType = facts.powerType;
+    state.powerCurrent = facts.powerCurrent;
+    state.powerMax = facts.powerMax;
+    state.level = facts.level;
+    state.alive = facts.alive;
+    state.ghost = facts.ghost;
+    state.inCombat = facts.inCombat;
+    state.victim = facts.victim;
+    state.victimVisible = facts.victimVisible;
+    state.victimName = std::move(facts.victimName);
+    state.victimLevel = facts.victimLevel;
+    state.victimHealthPct = facts.victimHealthPct;
+    state.flying = facts.flying;
+    state.casting = facts.casting;
+    state.looting = facts.looting;
+    state.resting = facts.resting;
+    state.travelling = facts.travelling;
+    state.working = facts.working;
+    state.questTitle = std::move(facts.questTitle);
+    state.zone = std::move(facts.zone);
+    state.area = std::move(facts.area);
+    state.mapId = facts.mapId;
+    state.x = facts.x;
+    state.y = facts.y;
+    state.z = facts.z;
+    state.partnerOnline = facts.partnerOnline;
+    state.partnerInGroup = facts.partnerInGroup;
+    state.partnerVisible = facts.partnerVisible;
+    state.partnerSameMap = facts.partnerSameMap;
+    state.partnerYards = facts.partnerYards;
+    state.partnerZone = std::move(facts.partnerZone);
+    state.partnerX = facts.partnerX;
+    state.partnerY = facts.partnerY;
+    state.partnerZ = facts.partnerZ;
+    state.mounted = facts.mounted;
+    state.swimming = facts.swimming;
+    state.groupSize = facts.groupSize;
+    state.leads = facts.leads;
+    state.masterName = std::move(facts.masterName);
+    state.follow = facts.follow;
+    state.stay = facts.stay;
+    state.guard = facts.guard;
+    state.grind = facts.grind;
+    state.passive = facts.passive;
+    state.plans = OllamaChat_BridgePlanKinds(bot->GetGUID().GetRawValue());
+    state.freeBagSlots = facts.freeBagSlots;
+    state.money = facts.money;
+}
+
+static_assert(static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Spells) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::Spells) &&
+              OllamaBridge::StateTopicCount == 5);
+
+// J5f-b: one topic of the bot's own state for a bot_state query, read by playerbots on world (WorldChannel::Update,
+// map threads idle) and copied as raw entries; the channel filters, bounds and names them.
+bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic,
+                         std::vector<OllamaBridge::StateEntry>& entries)
+{
+    entries.clear();
+    std::vector<PlayerbotBridge::BotStateItem> items;
+    if (!PlayerbotBridge::ReadBotStateTopic(ObjectGuid(botGuid), static_cast<PlayerbotBridge::BotStateTopic>(topic),
+                                            items))
+        return false;
+    for (auto& item : items)
+    {
+        OllamaBridge::StateEntry entry{std::move(item.name), {}, item.value, item.extra};
+        if (topic == OllamaBridge::StateTopic::Inventory)
+            entry.kind = item.code ? "equipped" : "bag";
+        else if (topic == OllamaBridge::StateTopic::Quests)
+            entry.kind = item.code == 1 ? "complete" : item.code == 2 ? "failed" : "active";
+        else if (topic == OllamaBridge::StateTopic::Strategies)
+            entry.kind = item.code ? "combat" : "non_combat";
+        entries.push_back(std::move(entry));
+    }
+    return true;
+}
+
+// DS.14 (c), J6e-c: what a watch needs of its bot, read on world (admission in the channel's post-map-join update and
+// the dispatcher's scan): ready only while the bot is a playerbot in the world outside battlegrounds and arenas and its
+// partner is online; then combat and the activity code from the J5f reader. Two lookups and one read per watch.
+bool BridgeWatchFacts(uint64_t botGuid, uint64_t partnerGuid, OllamaBridge::WatchFacts& facts)
+{
+    facts = {};
+    Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(botGuid));
+    Player* partner = ObjectAccessor::FindConnectedPlayer(ObjectGuid(partnerGuid));
+    if (!bot || !partner || !bot->IsInWorld() || bot->InBattleground() || bot->InArena())
+        return false;
+    OllamaBridge::BotState state;
+    BridgeBotStateFacts(bot, partner, state);
+    if (!state.present)
+        return false;
+    facts.ready = true;
+    facts.inCombat = state.inCombat;
+    facts.activity = OllamaBridge::ActivityCode(state);
+    return true;
+}
+
+// J6e-c: the governor scope of a wake's conversation, keyed as the chat hook keys a whisper, say, yell or party line
+// from the partner (no channel, no guild): the partner's group for party, else the partner's zone.
+std::string BridgeWakeScopeKey(Player* partner, ChatChannelSourceLocal source)
+{
+    Group* group = source == SRC_PARTY_LOCAL ? partner->GetGroup() : nullptr;
+    return Governor_MakeScopeKey(ChatChannelSourceLocalStr[source], 0, std::string(), 0,
+                                 group ? group->GetGUID().GetCounter() : partner->GetZoneId());
+}
+
 // BEGIN BRIDGE WORLD ADAPTER -- extracted verbatim by the offline game-adapter checks.
 namespace
 {
@@ -1246,6 +1362,17 @@ public:
             return false;
         targetGuid = group->GetTargetIcon(icon).GetRawValue();
         return targetGuid != 0;
+    }
+
+    bool ReadTopic(OllamaBridge::WorldTicket const& ticket, OllamaBridge::StateTopic topic,
+                   std::vector<OllamaBridge::StateEntry>& entries) override
+    {
+        return BridgeBotStateTopic(ticket.scope.botGuid, topic, entries);
+    }
+
+    bool ReadWatch(uint64_t botGuid, uint64_t partnerGuid, OllamaBridge::WatchFacts& facts) override
+    {
+        return BridgeWatchFacts(botGuid, partnerGuid, facts);
     }
 };
 
@@ -1498,7 +1625,7 @@ std::vector<BridgeBinding>::iterator BridgeObserveFresh(OllamaBridge::WorldTicke
 }
 
 bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, std::string const& text, bool addressed,
-                  std::string const& scopeKey, uint8_t chainDepth)
+                  std::string const& scopeKey, uint8_t chainDepth, OllamaBridge::Watch const* wake = nullptr)
 {
     using namespace OllamaBridge;
     DispatchSource origin = DispatchSource::Unsupported;
@@ -1520,7 +1647,7 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
             return false;
     }
     if (chainDepth || text.empty() || text.size() > MaxTextBytes ||
-        ((origin == DispatchSource::Say || origin == DispatchSource::Yell) && !addressed))
+        ((origin == DispatchSource::Say || origin == DispatchSource::Yell) && !addressed && !wake))
         return false;
     auto& cards = OllamaPersona::WorldStore();
     uint64_t const generation = OllamaDispatch_BridgeWorld().Generation();
@@ -1554,6 +1681,9 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
                  reason);
         return false;
     }
+    // J6e-c: a wake continues the conversation its watch was armed in, or nothing.
+    if (wake && view.guard.scope.contextId != wake->contextId)
+        return false;
     // The one load request: a qualified current encounter (DS.12: any speaker and channel; the card is the bot's own
     // data). Captures elsewhere only read. A closed gate does no I/O.
     cards.Prepare(generation, view.guard.scope.botGuid, std::chrono::steady_clock::now());
@@ -1635,7 +1765,18 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     bool const offerCard = input.card.offered && !input.card.accepted;
     input.text = text;
     input.directAddress = addressed;
+    // J6e-c: a chain starts at the player's line; a wake carries its watch's origin, depth and condition.
+    input.originUnixMs = wake ? wake->originUnixMs : now.unixMs;
+    if (wake)
+    {
+        input.wakeCondition = WatchConditionName(wake->condition);
+        input.wakeWatchId = wake->id;
+        input.wakeDepth = wake->depth;
+    }
     input.memory = it->memory;
+    // DS.14/J5f: the bot's own state, read fresh for every request and kept out of the capture, so a change (health,
+    // position) never renews a binding or a cached prompt prefix.
+    BridgeBotStateFacts(bot, speaker, input.state);
     OllamaChatRequest request;
     request.botGuid = bot->GetGUID().GetRawValue();
     request.targetGuid = speaker->GetGUID().GetRawValue();
@@ -1751,6 +1892,8 @@ OllamaPersona::ProposalStatus OllamaChat_BridgeProposeCard(OllamaBridge::WorldTi
 
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply)
 {
+    if (!ticket.request.input.wakeCondition.empty())
+        return;  // J6e-c: a wake is no exchange with the speaker; the earlier exchange stays remembered.
     OllamaBridge::DispatchGuard guard;
     if (!OllamaDispatch_BridgeWorld().Current(ticket, OllamaBridge::Now()) ||
         !OllamaChat_BridgeObserve(ticket, guard) ||
@@ -1762,10 +1905,40 @@ void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::str
             // Only successfully delivered Bridge exchanges, never legacy/condensed/private-history imports.
             // At most one exchange; if two maximum-size messages exceed 8 KiB, retain the human statement alone.
             binding.memory = "Earlier the same speaker said: " + ticket.request.input.text;
-            if (binding.memory.size() + reply.size() + 16 <= 8192)
+            if (reply.empty())  // DS.14: an action-only answer, remembered as one and never as quoted speech.
+                binding.memory += "\nYou answered without words.";
+            else if (binding.memory.size() + reply.size() + 16 <= 8192)
                 binding.memory += "\nYou replied: " + reply;
             return;
         }
+}
+bool OllamaChat_BridgeWake(OllamaBridge::Watch const& watch)
+{
+    using namespace OllamaBridge;
+    ChatChannelSourceLocal source = SRC_WHISPER_LOCAL;
+    switch (watch.source)
+    {
+        case DispatchSource::Whisper:
+            break;
+        case DispatchSource::Party:
+            source = SRC_PARTY_LOCAL;
+            break;
+        case DispatchSource::Say:
+            source = SRC_SAY_LOCAL;
+            break;
+        case DispatchSource::Yell:
+            source = SRC_YELL_LOCAL;
+            break;
+        default:
+            return false;
+    }
+    Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(watch.botGuid));
+    Player* partner = ObjectAccessor::FindConnectedPlayer(ObjectGuid(watch.partnerGuid));
+    if (!bot || !partner || !bot->IsInWorld() || !partner->IsInWorld())
+        return false;
+    // One generation like the partner's line: fixed in-world text, not addressed (a failure stays silent), 30 s.
+    return BridgeSubmit(bot, partner, source, WakeText(watch.condition), false, BridgeWakeScopeKey(partner, source), 0,
+                        &watch);
 }
 // END BRIDGE WORLD ADAPTER
 
@@ -2797,4 +2970,5 @@ void OllamaChatMaintenance::OnPlayerLogout(Player* player)
     Memory_ForgetBot(guid);
     OllamaRandomChatter_ForgetBot(guid);
     Topics_ForgetBot(guid);
+    OllamaDispatch_BridgeWatchLogout(guid.GetRawValue());  // J6e-c: its watches (as bot or partner) end now.
 }

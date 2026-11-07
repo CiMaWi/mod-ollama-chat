@@ -37,6 +37,7 @@ void WorldChannel::Retire()
     _policy.Retire();
     _selected = {};
     _bindings.clear();
+    _watches.Retire();  // J6e-c: module watches end with their epoch (counted dropped).
     std::lock_guard<std::mutex> lock(_mutex);
     _bearer.clear();
     _receive.clear();
@@ -161,17 +162,19 @@ bool WorldChannel::ObserveEvents(DispatchGuard const& guard, std::vector<uint8_t
     return true;
 }
 
-void WorldChannel::Close(WorldTicket const& ticket)
+bool WorldChannel::Close(WorldTicket const& ticket)
 {
     auto it = _bindings.find(ticket.request.requestId);
     if (it == _bindings.end())
-        return;
+        return false;
+    bool const acted = it->second.acted;
     std::string body;
     _policy.FinishFailure(RouteEnvelope(ticket), ChannelFailure::Cancelled, ticket.scope, _clock(), body);
     _bindings.erase(it);
     std::lock_guard<std::mutex> lock(_mutex);
     std::erase_if(_receive, [&](auto const& packet) { return packet->_route == ticket.request.requestId; });
     std::erase_if(_done, [&](auto const& pair) { return pair.second->_route == ticket.request.requestId; });
+    return acted;
 }
 
 bool WorldChannel::Authenticated(std::string_view bearer) const
@@ -278,6 +281,39 @@ ChannelError WorldChannel::Command(Binding const& binding, ChannelEnvelope const
                   outcome == ChannelOutcome::Rejected ? _executor->Refusal() : CommandRefusal::None);
 }
 
+ChannelError WorldChannel::Arm(Binding const& binding, ChannelEnvelope const& envelope, ChannelWatch const& watch,
+                               EffectPhase const* phase, bool& armed, std::string& body)
+{
+    // Receive already consumed this watch id in the replay ledger; no path below runs it twice.
+    armed = false;
+    auto const& ticket = binding.ticket;
+    auto const now = _clock();
+    if (!_policy.Current(envelope, ticket.scope, now, false))
+        return ChannelError::Stale;
+    if (watch.condition == WatchCondition::None)
+    {
+        _watches.Clear(ticket.scope.botGuid);
+        return _policy.FinishWatch(envelope, watch.commandId, WatchOutcome::Cleared, ticket.scope, now, body);
+    }
+    // The bot's own facts, read now with the post-map-join phase (J5f reader); unreadable counts as not ready.
+    WatchFacts facts;
+    if (!phase || !_source || !_source->ReadWatch(ticket.scope.botGuid, ticket.scope.controllerGuid, facts))
+        facts = {};
+    Watch entry;
+    entry.id = watch.commandId;
+    entry.botGuid = ticket.scope.botGuid;
+    entry.partnerGuid = ticket.scope.controllerGuid;
+    entry.source = binding.guard.source;
+    entry.channel = ticket.scope.channel;
+    entry.contextId = ticket.scope.contextId;
+    entry.condition = watch.condition;
+    WatchRoute const route{ticket.request.input.wakeDepth, ticket.request.input.originUnixMs};
+    auto const refusal = _watches.Arm(std::move(entry), route, facts, watch.untilUnixMs, now);
+    armed = refusal == CommandRefusal::None;
+    return _policy.FinishWatch(envelope, watch.commandId, armed ? WatchOutcome::Armed : WatchOutcome::Rejected,
+                               ticket.scope, now, body, refusal);
+}
+
 bool WorldChannel::ReceiptCurrent(WorldTicket const& ticket, Clock now) const
 {
     // An attempted effect may change facts Fresh checks (target, combat, marks). Its receipt needs only the
@@ -311,6 +347,7 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
         bool eventTerminal = false;
         bool command = false;    // A command outcome was decided for this packet.
         bool attempted = false;  // An authorized effect attempt; its receipt uses the post-effect join.
+        bool armed = false;      // J6e-c: a watch was armed on this route.
         std::optional<QueryObservation> observed;
         {
             auto const& binding = it->second;
@@ -323,11 +360,23 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
                 ++_stats.duplicates;
             if (packet->error == ChannelError::None && Fresh(binding, _clock()))
             {
-                if (std::holds_alternative<ChannelQuery>(message.payload))
+                if (auto const* query = std::get_if<ChannelQuery>(&message.payload))
                 {
                     QueryObservation capture;
-                    if (_source && FilteredQueryAdapter(_world, *_source, _clock)
-                                       .CaptureQuery(binding.ticket, binding.guard, capture))
+                    std::vector<StateEntry> entries;
+                    if (query->kind == QueryKind::BotState)
+                    {
+                        // J5f-b: the bot's own state, read now on the world thread; it names no other unit, so
+                        // there is no observation to recheck before publication (the route checks still apply).
+                        if (_source && _source->ReadTopic(binding.ticket, query->topic, entries))
+                            packet->error = _policy.FinishTopic(message.envelope, binding.ticket.scope, query->topic,
+                                                                entries, _clock(), packet->body);
+                        else
+                            packet->error = _policy.FinishFailure(message.envelope, ChannelFailure::Unavailable,
+                                                                  binding.ticket.scope, _clock(), packet->body);
+                    }
+                    else if (_source && FilteredQueryAdapter(_world, *_source, _clock)
+                                            .CaptureQuery(binding.ticket, binding.guard, capture))
                     {
                         observed = std::move(capture);
                         packet->error = _policy.FinishQuery(message.envelope, binding.ticket.scope, observed->units,
@@ -343,6 +392,8 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
                     packet->error =
                         Command(binding, message.envelope, *staged, phase, packet->_until, attempted, packet->body);
                 }
+                else if (auto const* watch = std::get_if<ChannelWatch>(&message.payload))
+                    packet->error = Arm(binding, message.envelope, *watch, phase, armed, packet->body);
                 else
                 {
                     eventTerminal = binding.events;
@@ -355,6 +406,10 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
         }  // Dispose parsed payload/settings BEFORE publishing the physical slot to another thread.
         // An executor ran game code: resolve the route again instead of trusting the earlier map reference.
         auto const route = _bindings.find(packet->_route);
+        if (attempted && route != _bindings.end())
+            route->second.acted = true;  // DS.14: the game did something on this route; a silent answer may stand.
+        if (armed && route != _bindings.end())
+            route->second.acted = true;  // J6e-c: so does a promise to act later (an armed watch).
         auto const exposable = [&]
         {
             return route != _bindings.end() &&
@@ -452,6 +507,8 @@ TerminalAction DispatchTerminal(WorldOutcome outcome, bool addressedHuman)
     {
         case WorldOutcome::Success:
             return TerminalAction::Reply;
+        case WorldOutcome::Silent:
+            return TerminalAction::Silence;  // DS.14: the act was the answer; no line and no outage.
         case WorldOutcome::Unavailable:
         case WorldOutcome::Empty:
         case WorldOutcome::Filtered:

@@ -13,6 +13,7 @@
 #include "mod-ollama-chat_bridge.h"
 #include "mod-ollama-chat_bridge_channel.h"
 #include "mod-ollama-chat_bridge_effect.h"
+#include "mod-ollama-chat_bridge_watch.h"
 
 namespace OllamaBridge
 {
@@ -21,6 +22,7 @@ constexpr std::size_t MaxWorldScopes = 64;
 constexpr uint64_t MaxEpochRequests = 4096;
 constexpr int64_t WorldLivenessMs = 5000;
 static_assert(CommandRate::MaxBots == MaxWorldScopes, "one rate entry per live world scope");
+static_assert(MaxWatches == MaxWorldScopes, "one watch per live world scope");
 
 struct WorldTicket
 {
@@ -32,6 +34,7 @@ struct WorldTicket
 enum class WorldOutcome : uint8_t
 {
     Success,
+    Silent,  // DS.14: an action-only answer; it stands only when its route made an authorized effect attempt.
     Unavailable,
     Empty,
     Filtered,
@@ -307,13 +310,18 @@ public:
                         std::function<bool()> const& current = {});
     // Synchronous world capture; reserves a separate event route and never renews an observation.
     bool ObserveEvents(DispatchGuard const& guard, std::vector<uint8_t> const& icons, EventPublication& publication);
-    void Close(WorldTicket const& ticket);
+    // Returns whether the closed route made an authorized effect attempt (Applied or Failed): the DS.14 rule for a
+    // silent answer. Nothing else reads the flag, and a second Close reports false.
+    bool Close(WorldTicket const& ticket);
     // World tick. Typed effects run only with the post-map-join phase, which is used during this call only;
     // without a phase every command gets the fixed refusal.
     std::size_t Update(EffectPhase const* phase = nullptr);
     bool Drained() const { return _used->load() == 0; }
     std::size_t Used() const { return _used->load(); }
     CommandStats const& Commands() const { return _stats; }
+    // J6e-c: the bots' watches, armed through Update and scanned by the post-map-join dispatcher; world only.
+    WatchTable& Watches() { return _watches; }
+    WatchTable const& Watches() const { return _watches; }
     ChannelError Receive(std::string_view bearer, std::string_view route, std::string_view body, uint64_t& receipt);
     ChannelError Take(std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet);
 
@@ -323,12 +331,16 @@ private:
         WorldTicket ticket;
         DispatchGuard guard;
         bool events = false;
+        bool acted = false;  // An authorized effect attempt on this route, its receipt published or not (DS.14).
     };
     bool Authenticated(std::string_view bearer) const;  // Caller holds _mutex.
     bool Fresh(Binding const& binding, Clock now) const;
     // Finishes one admitted command exactly once; attempted reports an authorized effect attempt.
     ChannelError Command(Binding const& binding, ChannelEnvelope const& envelope, ChannelCommand const& command,
                          EffectPhase const* phase, Deadline until, bool& attempted, std::string& body);
+    // J6e-c: arms, replaces or clears the route bot's watch exactly once; armed reports a new watch (DS.14 acted).
+    ChannelError Arm(Binding const& binding, ChannelEnvelope const& envelope, ChannelWatch const& watch,
+                     EffectPhase const* phase, bool& armed, std::string& body);
     ChannelError Finish(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
                         WorldScope const& scope, Clock now, std::string& body,
                         CommandRefusal refusal = CommandRefusal::None);
@@ -341,6 +353,7 @@ private:
     ChannelPolicy _policy;
     CommandRate _rate;  // Survives Retire: a new epoch never reopens a bot's command interval.
     CommandStats _stats;
+    WatchTable _watches;  // Retire ends every watch with its epoch.
     bool _enabled = false;
     Identity _selected;
     std::unordered_map<std::string, Binding> _bindings;

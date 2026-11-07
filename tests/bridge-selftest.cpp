@@ -2,6 +2,7 @@
 // No worldserver, game objects, native provider, authority or delivery proof is involved.
 #include "mod-ollama-chat_bridge.h"
 #define httplib ollamachat_httplib
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -11,6 +12,7 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #include "../src/httplib.h"
 
@@ -279,6 +281,37 @@ void BoundaryChecks()
     wrong = reply;
     wrong["text"] = std::string(4096, 'x');
     Check(Parse(settings, request, wrong.dump(), now).ok, "exact text cap");
+    // DS.14 (b): a generation result carries exactly one of text and "silent": true, in the same eight keys.
+    auto const spoken = Parse(settings, request, reply.dump(), now);
+    Check(spoken.ok && !spoken.silent && spoken.text == "I shall wait here.", "DS.14: a text answer is not silent");
+    auto silentReply = reply;
+    silentReply.erase("text");
+    silentReply["silent"] = true;
+    auto const silent = Parse(settings, request, silentReply.dump(), now);
+    Check(silent.ok && silent.silent && silent.text.empty() && silent.error.empty() && !silent.personaProposal,
+          "DS.14: an action-only answer parsed as silent");
+    for (auto const& value : {nlohmann::json(false), nlohmann::json(1), nlohmann::json("true"), nlohmann::json()})
+    {
+        wrong = silentReply;
+        wrong["silent"] = value;
+        auto const refused = Parse(settings, request, wrong.dump(), now);
+        Check(!refused.ok && !refused.silent && refused.error == "bridge_invalid_response",
+              "DS.14: silent only as true");
+    }
+    wrong = reply;
+    wrong["silent"] = true;
+    Check(!Parse(settings, request, wrong.dump(), now).ok, "DS.14: text and silent together malformed");
+    wrong = reply;
+    wrong.erase("text");
+    Check(!Parse(settings, request, wrong.dump(), now).ok, "DS.14: neither text nor silent malformed");
+    wrong = silentReply;
+    wrong["mood"] = "calm";
+    Check(!Parse(settings, request, wrong.dump(), now).ok, "DS.14: a silent answer with an extra key malformed");
+    wrong = silentReply;
+    wrong.erase("silent");
+    wrong["silent"] = true;
+    wrong["type"] = "failure";
+    Check(!Parse(settings, request, wrong.dump(), now).ok, "DS.14: silent only on a generation result");
     Check(!Parse(settings, request, "{broken" + settings.token, now).ok, "malformed reply");
     Check(Parse(settings, request, "{broken" + settings.token, now).error.find(settings.token) == std::string::npos,
           "fixed parse error");
@@ -865,6 +898,318 @@ void HttpChecks()
     Check(!result.ok() && result.body.empty() && std::chrono::steady_clock::now() - refusedAt < std::chrono::seconds(2),
           "actual quick refusal");
 }
+
+// J5f (DS.14 (d)): `input.state` exactly as Build encodes it. Absent unless present; every number bounded and every
+// string a card fact (64 bytes, no controls, valid UTF-8); the partner only in the bot's group or sight (yards and
+// position only on the same map); the combat target only the bot's own visible victim while alive and fighting.
+OllamaBridge::BotState FullState()
+{
+    OllamaBridge::BotState state;
+    state.present = true;
+    state.healthPct = 73.4f;
+    state.powerType = 0;
+    state.powerCurrent = 4100;
+    state.powerMax = 8200;
+    state.level = 42;
+    state.alive = true;
+    state.inCombat = true;
+    state.victim = true;
+    state.victimVisible = true;
+    state.victimName = "Defias Pillager";
+    state.victimLevel = 41;
+    state.victimHealthPct = 35.0f;
+    state.travelling = true;
+    state.questTitle = "The Defias Brotherhood";
+    state.zone = "Westfall";
+    state.area = "Moonbrook";
+    state.mapId = 0;
+    state.x = -11018.4f;
+    state.y = 1513.6f;
+    state.z = 43.2f;
+    state.partnerOnline = true;
+    state.partnerInGroup = true;
+    state.partnerVisible = true;
+    state.partnerSameMap = true;
+    state.partnerYards = 18.6f;
+    state.partnerZone = "Westfall";
+    state.partnerX = -11001.2f;
+    state.partnerY = 1520.4f;
+    state.partnerZ = 44.0f;
+    state.mounted = true;
+    state.swimming = true;
+    state.groupSize = 2;
+    state.masterName = "Aldric";
+    state.follow = true;
+    state.plans = OllamaBridge::StatePlanMovement | OllamaBridge::StatePlanFocusHealing;
+    state.freeBagSlots = 14;
+    state.money = 1234567;
+    return state;
+}
+
+// The encoded `input.state`, or null when the envelope has none.
+nlohmann::json StateWire(OllamaBridge::BotState const& state)
+{
+    auto request = Request();
+    request.input.state = state;
+    std::string body;
+    Check(OllamaBridge::Build(Settings(), request, {1000000, 10000}, body), "state: build");
+    auto const wire = nlohmann::json::parse(body);
+    return wire["input"].contains("state") ? wire["input"]["state"] : nlohmann::json();
+}
+
+std::string StateActivityKind(OllamaBridge::BotState const& state)
+{
+    return StateWire(state)["activity"]["kind"].get<std::string>();
+}
+
+void StateChecks()
+{
+    using namespace OllamaBridge;
+    float const nan = std::numeric_limits<float>::quiet_NaN();
+    float const inf = std::numeric_limits<float>::infinity();
+    BotState absent = FullState();
+    absent.present = false;
+    Check(StateWire(absent).is_null() && StateWire(BotState()).is_null(), "state: absent unless present");
+
+    Check(StateWire(FullState()) == nlohmann::json::parse(R"({"health":73,"power":{"kind":"mana","pct":50},"level":42,
+        "alive":"alive","combat":{"target":{"name":"Defias Pillager","level":41,"health":35}},
+        "activity":{"kind":"fighting"},"where":{"zone":"Westfall","area":"Moonbrook","mapId":0,"x":-11018,"y":1514,
+        "z":43},"partner":{"zone":"Westfall","yards":19,"x":-11001,"y":1520,"z":44},"mounted":true,"swimming":true,
+        "group":{"size":2,"leads":false,"follows":"Aldric"},"movement":"follow","plans":["movement","focus_healing"],
+        "bags":14,"money":1234567})"),
+          "state: every field encoded with its key");
+
+    // Bounds.
+    for (auto const& [pct, want] :
+         std::initializer_list<std::pair<float, int>>{{-5.0f, 0}, {150.0f, 100}, {nan, 0}, {inf, 100}, {99.6f, 100}})
+    {
+        auto state = FullState();
+        state.healthPct = pct;
+        state.victimHealthPct = pct;
+        auto const wire = StateWire(state);
+        Check(wire["health"] == want && wire["combat"]["target"]["health"] == want, "state: percent clamped");
+    }
+    auto state = FullState();
+    state.level = 300;
+    state.victimLevel = 300;
+    state.groupSize = 50;
+    state.freeBagSlots = 300;
+    state.powerCurrent = 9000;
+    state.x = nan;
+    state.y = 1e9f;
+    state.z = -inf;
+    state.partnerYards = -3.0f;
+    state.partnerX = inf;
+    auto wire = StateWire(state);
+    Check(wire["level"] == 255 && wire["combat"]["target"]["level"] == 255, "state: levels capped at 255");
+    Check(wire["group"]["size"] == 40 && wire["bags"] == 255, "state: group size and bags capped");
+    Check(wire["power"]["pct"] == 100, "state: power above its maximum reads full");
+    Check(wire["where"]["x"] == 0 && wire["where"]["y"] == 0 && wire["where"]["z"] == 0 &&
+              wire["partner"]["yards"] == 0 && wire["partner"]["x"] == 0,
+          "state: yards not finite, beyond any map or negative read 0");
+    state = FullState();
+    state.partnerYards = nan;
+    Check(StateWire(state)["partner"]["yards"] == 0, "state: partner distance NaN reads 0");
+    state.level = 0;
+    state.victimLevel = 0;
+    wire = StateWire(state);
+    Check(!wire.contains("level") && !wire["combat"]["target"].contains("level"), "state: an unknown level is omitted");
+    state = FullState();
+    state.victimName = std::string(63, 'a') + "\xC3\xA9" + std::string(10, 'b');
+    state.zone = std::string(70, 'z');
+    state.area = std::string("Moon\x01") + "brook\x7F";
+    state.questTitle = "\xFF\xFE";
+    state.casting = true;
+    state.inCombat = false;
+    state.masterName = "\t";
+    wire = StateWire(state);
+    Check(wire["where"]["zone"] == std::string(64, 'z') && wire["where"]["area"] == "Moonbrook",
+          "state: strings cut to 64 bytes, controls dropped");
+    Check(!wire.contains("combat") && wire["activity"] == nlohmann::json{{"kind", "casting"}},
+          "state: no target outside combat");
+    state.inCombat = true;
+    state.casting = false;
+    wire = StateWire(state);
+    Check(wire["combat"]["target"]["name"] == std::string(63, 'a'), "state: a cut never splits a UTF-8 sequence");
+    Check(!wire["group"].contains("follows"), "state: a blank name is omitted");
+    state.inCombat = false;
+    wire = StateWire(state);
+    Check(wire["activity"] == nlohmann::json{{"kind", "questing"}}, "state: an invalid UTF-8 quest title is omitted");
+
+    // The partner filter.
+    state = FullState();
+    state.partnerInGroup = false;
+    state.partnerVisible = false;
+    Check(!StateWire(state).contains("partner"), "state: partner absent when neither grouped nor visible");
+    state.partnerVisible = true;
+    Check(StateWire(state).contains("partner"), "state: a visible partner outside the group is known");
+    state = FullState();
+    state.partnerOnline = false;
+    Check(!StateWire(state).contains("partner"), "state: an offline partner is absent");
+    state = FullState();
+    state.partnerVisible = false;
+    state.partnerSameMap = false;
+    state.partnerZone = "Stormwind City";
+    Check(StateWire(state)["partner"] == nlohmann::json{{"zone", "Stormwind City"}},
+          "state: a grouped partner on another map gives the zone only");
+
+    // The combat filter: own victim, visible, alive and fighting.
+    for (int drop = 0; drop < 4; ++drop)
+    {
+        state = FullState();
+        (drop == 0 ? state.victim : drop == 1 ? state.victimVisible : drop == 2 ? state.inCombat : state.alive) = false;
+        Check(!StateWire(state).contains("combat"), "state: combat target only the bot's own visible victim");
+    }
+
+    // Activity priority: dead idle; flying > fighting > casting > looting > resting > questing > travelling > idle.
+    state = FullState();
+    state.flying = state.casting = state.looting = state.resting = state.working = true;
+    Check(StateActivityKind(state) == "flying", "state: flying first");
+    state.flying = false;
+    Check(StateActivityKind(state) == "fighting", "state: fighting before casting");
+    state.inCombat = false;
+    Check(StateActivityKind(state) == "casting", "state: casting before looting");
+    state.casting = false;
+    Check(StateActivityKind(state) == "looting", "state: looting before resting");
+    state.looting = false;
+    Check(StateActivityKind(state) == "resting", "state: resting before questing");
+    state.resting = false;
+    Check(StateWire(state)["activity"] == nlohmann::json({{"kind", "questing"}, {"detail", "The Defias Brotherhood"}}),
+          "state: questing names the quest");
+    state.travelling = false;
+    Check(StateActivityKind(state) == "questing", "state: working at a quest destination is questing");
+    state.working = false;
+    Check(StateActivityKind(state) == "idle", "state: nothing to do is idle");
+    state.travelling = true;
+    state.questTitle.clear();
+    Check(StateWire(state)["activity"] == nlohmann::json{{"kind", "travelling"}}, "state: travelling without a quest");
+    state.alive = false;
+    state.flying = true;
+    Check(StateActivityKind(state) == "idle" && StateWire(state)["alive"] == "dead", "state: the dead are idle");
+    state.ghost = true;
+    Check(StateWire(state)["alive"] == "ghost", "state: a ghost");
+
+    // Movement priority, plans, power kinds, optional keys.
+    state = FullState();
+    state.stay = state.guard = state.grind = state.passive = true;
+    Check(StateWire(state)["movement"] == "stay", "state: stay first");
+    state.stay = false;
+    Check(StateWire(state)["movement"] == "follow", "state: follow before guard");
+    state.follow = false;
+    Check(StateWire(state)["movement"] == "guard", "state: guard before grind");
+    state.guard = false;
+    Check(StateWire(state)["movement"] == "grind", "state: grind before passive");
+    state.grind = false;
+    Check(StateWire(state)["movement"] == "passive", "state: passive");
+    state.passive = false;
+    Check(StateWire(state)["movement"] == "none", "state: no movement strategy");
+    state.plans = StatePlanMovement | StatePlanFormation | StatePlanSaveMana | StatePlanFocusHealing;
+    Check(StateWire(state)["plans"] == nlohmann::json({"movement", "formation", "save_mana", "focus_healing"}),
+          "state: plan bits in PlanKind order");
+    state.plans = StatePlanSaveMana;
+    Check(StateWire(state)["plans"] == nlohmann::json({"save_mana"}), "state: one plan");
+    state.plans = 0;
+    Check(!StateWire(state).contains("plans"), "state: no plans, no key");
+    for (auto const& [type, kind] : std::initializer_list<std::pair<uint8_t, char const*>>{
+             {0, "mana"}, {1, "rage"}, {2, "focus"}, {3, "energy"}, {6, "runic"}})
+    {
+        state.powerType = type;
+        Check(StateWire(state)["power"]["kind"] == kind, "state: power kinds");
+    }
+    state.powerType = 4;
+    Check(!StateWire(state).contains("power"), "state: other power types omitted");
+    state.powerType = 1;
+    state.powerMax = 0;
+    Check(!StateWire(state).contains("power"), "state: no maximum, no power");
+    state = FullState();
+    state.area = state.zone;
+    state.mounted = state.swimming = false;
+    state.groupSize = 0;
+    wire = StateWire(state);
+    Check(!wire["where"].contains("area") && !wire.contains("mounted") && !wire.contains("swimming") &&
+              !wire.contains("group"),
+          "state: area equal to zone, false flags and no group omitted");
+
+    // Size over fixtures (recorded in the step's Log; the brief estimated 380-450 bytes).
+    std::vector<std::size_t> sizes;
+    state = FullState();
+    sizes.push_back(StateWire(state).dump().size());  // Grouped, fighting, everything set.
+    state.inCombat = false;
+    state.mounted = state.swimming = false;
+    sizes.push_back(StateWire(state).dump().size());  // Grouped, questing.
+    state.partnerInGroup = state.partnerVisible = false;
+    state.groupSize = 0;
+    state.follow = false;
+    state.plans = 0;
+    sizes.push_back(StateWire(state).dump().size());  // Solo, partner unknown.
+    state.travelling = false;
+    state.questTitle.clear();
+    state.area = state.zone;
+    sizes.push_back(StateWire(state).dump().size());  // Solo, idle.
+    state = FullState();
+    state.inCombat = false;
+    state.resting = true;
+    state.zone = "Stormwind City";
+    state.area = "Trade District";
+    sizes.push_back(StateWire(state).dump().size());  // Grouped, resting in a city.
+    state = FullState();
+    state.victimName = state.questTitle = state.zone = state.area = state.partnerZone = state.masterName =
+        std::string(80, 'w');
+    state.plans = 15;
+    state.money = 4294967295u;
+    std::size_t const worst = StateWire(state).dump().size();
+    std::sort(sizes.begin(), sizes.end());
+    std::cout << "bridge-selftest: input.state bytes p50 " << sizes[sizes.size() / 2] << ", max " << sizes.back()
+              << " over " << sizes.size() << " fixtures; worst case (all strings at the cap) " << worst << '\n';
+    Check(worst <= 1024, "state: worst case stays within 1 KiB");
+}
+
+// J6e-c (DS.14 (c)): `input.wake` is exactly {condition, watchId} and only on a wake; the chain's depth and origin
+// stay in the module. ActivityCode follows the state's activity kind (the watch compares codes).
+void WakeChecks()
+{
+    using namespace OllamaBridge;
+    auto request = Request();
+    std::string body;
+    Check(Build(Settings(), request, {1000000, 10000}, body) && !nlohmann::json::parse(body)["input"].contains("wake"),
+          "wake: absent on a chat line");
+    request.input.wakeCondition = "combat_end";
+    request.input.wakeWatchId = "watch-7";
+    request.input.wakeDepth = 2;
+    request.input.originUnixMs = 987654321;
+    Check(Build(Settings(), request, {1000000, 10000}, body), "wake: build");
+    auto const input = nlohmann::json::parse(body)["input"];
+    Check(input.contains("wake") &&
+              input["wake"] == nlohmann::json({{"condition", "combat_end"}, {"watchId", "watch-7"}}),
+          "wake: exactly condition and watch id");
+    Check(body.find("987654321") == std::string::npos && !input.contains("wakeDepth") && !input.contains("depth"),
+          "wake: depth and origin never on the wire");
+
+    auto const code = [](BotState const& state) { return static_cast<int>(ActivityCode(state)); };
+    BotState state = FullState();
+    Check(code(state) == 2, "activity code: fighting 2");
+    state.flying = true;
+    Check(code(state) == 1, "activity code: flying 1");
+    state = FullState();
+    state.alive = false;
+    Check(code(state) == 0, "activity code: dead is idle 0");
+    state = FullState();
+    state.inCombat = false;
+    Check(code(state) == 6, "activity code: questing 6");
+    state.casting = true;
+    Check(code(state) == 3, "activity code: casting 3");
+    state.casting = false;
+    state.looting = true;
+    Check(code(state) == 4, "activity code: looting 4");
+    state.looting = false;
+    state.resting = true;
+    Check(code(state) == 5, "activity code: resting 5");
+    state.resting = false;
+    state.questTitle.clear();
+    Check(code(state) == 7, "activity code: travelling 7");
+    state.travelling = false;
+    Check(code(state) == 0, "activity code: idle 0");
+}
 }  // namespace
 
 int main(int argc, char** argv)
@@ -872,6 +1217,8 @@ int main(int argc, char** argv)
     try
     {
         BoundaryChecks();
+        StateChecks();
+        WakeChecks();
         if (argc == 2)
             ObserverSettingsChecks(argv[1]);
         CircuitChecks();

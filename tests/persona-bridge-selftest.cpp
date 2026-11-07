@@ -299,6 +299,16 @@ void ParseChecks()
     result = ParseJson(missing, reply);
     Check(result.ok && result.personaProposal && *result.personaProposal == "First card.", "proposal for revision 0");
 
+    // DS.14 (b): an action-only answer never carries a card; the bridge keeps a pending proposal for a later reply.
+    reply = Reply(settings, offered);
+    reply.erase("text");
+    reply["silent"] = true;
+    result = ParseJson(offered, reply);
+    Check(result.ok && result.silent && result.text.empty() && !result.personaProposal,
+          "DS.14: a silent answer with an opportunity and no card");
+    reply["personaProposal"] = Proposal("5", "A silent card.");
+    Check(Invalid(ParseJson(offered, reply)), "DS.14: a silent answer with a card proposal refused");
+
     reply = Reply(settings, plain);
     reply["personaProposal"] = Proposal("5", "Unasked.");
     Check(Invalid(ParseJson(plain, reply)), "proposal without an opportunity refused");

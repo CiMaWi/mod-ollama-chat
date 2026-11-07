@@ -342,3 +342,19 @@ OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters()
 {
     return OllamaBridge::BridgeCommandExecutor::Plans().Counters();
 }
+
+uint8_t OllamaChat_BridgePlanKinds(uint64_t botGuid)
+{
+    using OllamaBridge::PlanKind;
+    // The bits of OllamaBridge::BotState::plans follow PlanKind.
+    static_assert(OllamaBridge::StatePlanMovement == 1u << static_cast<unsigned>(PlanKind::Movement) &&
+                  OllamaBridge::StatePlanFormation == 1u << static_cast<unsigned>(PlanKind::Formation) &&
+                  OllamaBridge::StatePlanSaveMana == 1u << static_cast<unsigned>(PlanKind::SaveMana) &&
+                  OllamaBridge::StatePlanFocusHealing == 1u << static_cast<unsigned>(PlanKind::FocusHealing) &&
+                  static_cast<unsigned>(PlanKind::Count) == 4);
+    uint8_t kinds = 0;
+    for (uint8_t kind = 0; kind < static_cast<uint8_t>(PlanKind::Count); ++kind)
+        if (OllamaBridge::BridgeCommandExecutor::Plans().LiveApplied({botGuid, static_cast<PlanKind>(kind)}))
+            kinds |= static_cast<uint8_t>(1u << kind);
+    return kinds;
+}

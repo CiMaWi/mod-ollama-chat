@@ -87,6 +87,68 @@ struct CardOpportunity
     CardFacts facts;        // On the wire as `context` exactly when the card is offered and not accepted.
 };
 
+// DS.14/J5f: the bot's own state for one request, raw as playerbots read it on world (BridgeBotState). It changes
+// constantly, so it is never part of a capture signature, the system prompt or the persona. The envelope filters it
+// (the partner only in the bot's group or in its sight, only the bot's own visible victim) and bounds every value;
+// strings follow the card-fact rule (MaxCardFactBytes, no controls, valid UTF-8). Absent from the wire unless present.
+constexpr uint8_t StatePlanMovement = 1;  // Bits of BotState::plans, in PlanKind order.
+constexpr uint8_t StatePlanFormation = 2;
+constexpr uint8_t StatePlanSaveMana = 4;
+constexpr uint8_t StatePlanFocusHealing = 8;
+
+struct BotState
+{
+    bool present = false;
+    float healthPct = 0.0f;
+    uint8_t powerType = 0xFF;  // Game power code: 0 mana, 1 rage, 2 focus, 3 energy, 6 runic power; others omitted.
+    uint32_t powerCurrent = 0;
+    uint32_t powerMax = 0;
+    uint32_t level = 0;
+    bool alive = false;
+    bool ghost = false;
+    bool inCombat = false;
+    bool victim = false;  // The bot's own current victim.
+    bool victimVisible = false;
+    std::string victimName;
+    uint32_t victimLevel = 0;
+    float victimHealthPct = 0.0f;
+    bool flying = false;
+    bool casting = false;
+    bool looting = false;
+    bool resting = false;
+    bool travelling = false;
+    bool working = false;  // At its travel destination.
+    std::string questTitle;
+    std::string zone;
+    std::string area;
+    uint32_t mapId = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    bool partnerOnline = false;
+    bool partnerInGroup = false;
+    bool partnerVisible = false;
+    bool partnerSameMap = false;  // Yards and position are set only then.
+    float partnerYards = 0.0f;
+    std::string partnerZone;
+    float partnerX = 0.0f;
+    float partnerY = 0.0f;
+    float partnerZ = 0.0f;
+    bool mounted = false;
+    bool swimming = false;
+    uint32_t groupSize = 0;  // 0 when ungrouped.
+    bool leads = false;
+    std::string masterName;
+    bool follow = false;  // Non-combat movement strategies.
+    bool stay = false;
+    bool guard = false;
+    bool grind = false;
+    bool passive = false;
+    uint8_t plans = 0;
+    uint32_t freeBagSlots = 0;
+    uint32_t money = 0;
+};
+
 struct Context
 {
     uint64_t speakerGuid = 0;
@@ -102,6 +164,13 @@ struct Context
     std::vector<std::string> observations;
     std::vector<Participant> party;
     CardOpportunity card;  // Absent from the wire unless offered.
+    BotState state;        // Per request, filled at submit; never in a capture.
+    // J6e-c: a wake request carries its condition and watch id as `input.wake`; depth and origin stay in the module
+    // (a watch armed on this route opens wake depth + 1 and may not outlast origin + 10 minutes).
+    std::string wakeCondition;  // Empty unless this request is a wake.
+    std::string wakeWatchId;
+    uint8_t wakeDepth = 0;
+    int64_t originUnixMs = 0;  // The player's line that started this conversation's chain.
 };
 
 // Exact captured game binding; owned values only, never a grant supplied by the model.
@@ -148,6 +217,8 @@ struct Result
 {
     bool ok = false;
     std::string text;
+    // DS.14: an action-only answer (wire "silent": true, no text); the module accepts it only after an act.
+    bool silent = false;
     std::string error;  // Fixed reason only; never remote text, credentials or JSON exceptions.
     int status = 0;
     // Validated card proposal body for the offered revision; never part of text. Staging it is a separate world step.
@@ -167,6 +238,9 @@ int64_t RemainingMs(Deadline deadline, Clock now);
 Identity MakeIdentity(Settings const& settings, Request const& request);
 OllamaHttpHeaders Headers(Settings const& settings);
 bool Build(Settings const& settings, Request const& request, Clock now, std::string& body);
+// DS.14/J6e-c: the `input.state` activity kind as a code: 0 idle, 1 flying, 2 fighting, 3 casting, 4 looting,
+// 5 resting, 6 questing, 7 travelling (one classifier for the wire and the watches).
+uint8_t ActivityCode(BotState const& state);
 Result Parse(Settings const& settings, Request const& request, std::string const& body, Clock now);
 
 struct ObserverChallenge

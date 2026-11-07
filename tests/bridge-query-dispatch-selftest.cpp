@@ -160,6 +160,18 @@ void RetirePersonas(uint64_t) {}
 QueryWorldSource& OllamaChat_BridgeQuerySource();
 bool OllamaChat_BridgeObserve(WorldTicket const&, DispatchGuard&);
 void OllamaChat_BridgeRefresh();
+// J5f-b: the topic reader (playerbots, outside the extract) is not part of these checks.
+bool BridgeBotStateTopic(uint64_t, StateTopic, std::vector<StateEntry>& entries)
+{
+    entries.clear();
+    return false;
+}
+// J6e-c: the watch fact reader (outside the extract) is not part of these checks.
+bool BridgeWatchFacts(uint64_t, uint64_t, WatchFacts& facts)
+{
+    facts = {};
+    return false;
+}
 WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
 bool OllamaDispatch_ChannelEvents(DispatchGuard const&, std::vector<uint8_t> const&);
 // The production channel names the world-only typed effect adapter, which needs game headers. This fixture stands in
@@ -375,9 +387,23 @@ void Queries()
 void Events()
 {
     Fixture f;
+    // J6e-c (DS.14 brief, Unclear 1): the generic port has no events endpoint, so nothing ever took an event receipt
+    // and each mark change held a packet slot until retirement. A mark change now opens no event route there: no
+    // publication, no packet slot and no world reservation, however many changes come.
+    EventPublication publication;
+    auto const used = g_bridgeChannel.Used();
+    auto const reserved = g_bridgeWorld.Pending();
+    for (unsigned i = 0; i < 2 * WorldChannel::MaxPackets; ++i)
+    {
+        party.marks[0] = i % 2 ? 0 : 77;
+        OllamaChat_BridgeRefresh();
+    }
+    Check(!OllamaDispatch_ChannelNextEvent(publication) && g_bridgeChannel.Used() == used &&
+              g_bridgeWorld.Pending() == reserved,
+          "generic provider: 128 mark changes open no event route and hold no packet slot");
+    g_nativeSelected = true;  // The native (Codex observer) adapter's handoff, unchanged.
     party.marks[0] = 77;
     OllamaChat_BridgeRefresh();
-    EventPublication publication;
     Check(OllamaDispatch_ChannelNextEvent(publication) && publication.receipt &&
               publication.route != f.ticket.request.requestId,
           "bounded existing refresh publishes distinct event route");
@@ -440,6 +466,7 @@ void Events()
           "full shared capacity rejects event and cancels reservation");
     g_bridgeChannel.Retire();
     Check(g_bridgeChannel.Drained(), "retirement disposes all queued event payloads");
+    g_nativeSelected = false;
 }
 
 void Lifetimes()

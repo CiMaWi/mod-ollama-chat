@@ -163,6 +163,11 @@ enum class CommandRefusal : uint8_t
     TargetNotVisible,
     Unreachable,
     Busy,
+    NotFighting,  // J6e-c watch refusals.
+    NotBusy,
+    WaitTooShort,
+    WaitTooLong,
+    PutOff,
     CannotNow,
     Failed
 };
@@ -208,6 +213,16 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
             return {"unreachable", "I cannot get to that spot from here."};
         case CommandRefusal::Busy:
             return {"busy", "I am still finishing an earlier order; ask me again shortly."};
+        case CommandRefusal::NotFighting:
+            return {"not_fighting", "I am not fighting anything right now."};
+        case CommandRefusal::NotBusy:
+            return {"not_busy", "I am not busy with anything."};
+        case CommandRefusal::WaitTooShort:
+            return {"wait_too_short", "That is hardly worth waiting for."};
+        case CommandRefusal::WaitTooLong:
+            return {"wait_too_long", "I cannot wait that long."};
+        case CommandRefusal::PutOff:
+            return {"put_off", "I have put this off long enough already."};
         case CommandRefusal::CannotNow:
             return {"cannot_now", "I cannot do that right now."};
         case CommandRefusal::Failed:

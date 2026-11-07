@@ -25,6 +25,7 @@ struct OllamaApiResult
     bool        thinkUsed = false;
     int         retryAfterSeconds = 0;   // provider's Retry-After on 429/503, else 0
     std::optional<std::string> personaProposal;  // bridge card proposal, never chat text
+    bool silent = false;                         // bridge action-only answer (DS.14): ok with empty text
 
     bool empty() const { return text.empty(); }
 };

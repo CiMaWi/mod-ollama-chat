@@ -9,6 +9,14 @@
 
 #include "mod-ollama-chat_bridge_query.h"
 
+// The production phase holds the post-map-join token (game headers); the channel only asks whether one is given.
+namespace OllamaBridge
+{
+struct EffectPhase
+{
+};
+}  // namespace OllamaBridge
+
 namespace
 {
 using namespace OllamaBridge;
@@ -80,6 +88,33 @@ struct Source : QueryWorldSource
             return false;
         target = marks[icon];
         return target != 0;
+    }
+    std::vector<StateEntry> topicEntries;
+    bool topicReadable = true;
+    unsigned topicReads = 0;
+    uint64_t topicBot = 0;
+    StateTopic topicAsked = StateTopic::Inventory;
+    bool ReadTopic(WorldTicket const& ticket, StateTopic topic, std::vector<StateEntry>& entries) override
+    {
+        ++topicReads;
+        topicBot = ticket.scope.botGuid;
+        topicAsked = topic;
+        entries = topicEntries;
+        return topicReadable;
+    }
+    // J6e-c: the bot's watch facts (J5f reader), read only with the post-map-join phase.
+    WatchFacts watchFacts{true, true, 2};
+    bool watchReadable = true;
+    unsigned watchReads = 0;
+    uint64_t watchBot = 0;
+    uint64_t watchPartner = 0;
+    bool ReadWatch(uint64_t botGuid, uint64_t partnerGuid, WatchFacts& facts) override
+    {
+        ++watchReads;
+        watchBot = botGuid;
+        watchPartner = partnerGuid;
+        facts = watchFacts;
+        return watchReadable;
     }
 };
 
@@ -340,6 +375,172 @@ void MarkPublication()
 }
 }  // namespace
 
+// J5f-b: a bot_state query on the real channel reads the route's own bot through the source, on the world update.
+void TopicPublication()
+{
+    Fixture f;
+    WorldChannel channel{f.world, [&f](WorldTicket const& ticket, DispatchGuard& guard)
+                         { return f.source.Observe(ticket, guard); }, [&f] { return f.now; }, &f.source};
+    channel.Configure(true);
+    Check(channel.Activate() && channel.Register(f.ticket, f.source.guard), "topic channel route");
+    auto const ask = [&](std::string const& id, std::string const& topic)
+    {
+        Json wire = {{"version", 1},    {"instance", "fixture"},    {"provider", "codex"}, {"epoch", "epoch-1"},
+                     {"requestId", id}, {"deadlineUnixMs", 104000}, {"type", "query"},     {"controllerGuid", "22"},
+                     {"botGuid", "11"}, {"query", "bot_state"},     {"topic", topic}};
+        uint64_t receipt = 0;
+        Check(channel.Receive(f.settings.token, f.ticket.request.requestId, wire.dump(), receipt) == ChannelError::None,
+              "topic query received");
+        channel.Update();
+        std::unique_ptr<ChannelPacket> packet;
+        channel.Take(f.settings.token, receipt, packet);
+        return packet;
+    };
+    f.source.topicEntries = {{"Hearthstone", "", 1800, 0}, {"Ready", "", 0, 0}};
+    auto packet = ask("topic-1", "cooldowns");
+    Check(packet && packet->error == ChannelError::None, "topic result published");
+    auto json = Json::parse(packet->body);
+    Check(json.at("type") == "query.result" && json.at("topic") == "cooldowns" && json.at("entries").size() == 1 &&
+              json.at("entries").at(0).at("seconds") == 1800,
+          "source entries filtered into the topic result");
+    Check(f.source.topicReads == 1 && f.source.topicBot == 11 && f.source.topicAsked == StateTopic::Cooldowns,
+          "the route's own bot read once for the asked topic");
+    Check(f.source.resolves == 0, "a topic reads no other unit");
+    f.source.topicReadable = false;
+    packet = ask("topic-2", "spells");
+    Check(packet && Json::parse(packet->body).at("code") == "unavailable", "unreadable bot answers unavailable");
+    f.source.topicReadable = true;
+    packet = ask("topic-3", "bank");
+    Check(packet && packet->error == ChannelError::Invalid && packet->body.empty() && f.source.topicReads == 2,
+          "unknown topic invalid_input without a read");
+    f.source.authority = false;
+    packet = ask("topic-4", "quests");
+    Check(!packet && f.source.topicReads == 2, "a stale route reads nothing and publishes nothing");
+}
+
+// J6e-c (DS.14 (c)): a watch on a real generation route: admitted on the world thread with the phase, from the
+// route's own binding; an armed watch counts as acting on the route (a silent answer may stand), a refused or cleared
+// one does not; epoch retirement ends it.
+void WatchArming()
+{
+    Fixture f;
+    WorldChannel channel{f.world, [&f](WorldTicket const& ticket, DispatchGuard& guard)
+                         { return f.source.Observe(ticket, guard); }, [&f] { return f.now; }, &f.source};
+    channel.Configure(true);
+    Check(channel.Activate(), "watch channel");
+    f.world.Cancel(f.ticket);
+    EffectPhase const phase{};
+    auto const open = [&](uint8_t depth)
+    {
+        Context input;
+        input.speakerGuid = 22;
+        input.channel = "direct";
+        input.text = "Come to me once this fight is over.";
+        input.wakeDepth = depth;
+        input.originUnixMs = f.now.unixMs - 1000;
+        auto ticket = f.world.Reserve(f.source.guard.scope, input, f.now, 30000);
+        Check(ticket.generation != 0 && channel.Register(ticket, f.source.guard), "watch route registered");
+        return ticket;
+    };
+    auto const watch =
+        [&](WorldTicket const& ticket, std::string const& id, std::string const& condition, EffectPhase const* with)
+    {
+        Json wire = {{"version", 1},
+                     {"instance", "fixture"},
+                     {"provider", "codex"},
+                     {"epoch", "epoch-1"},
+                     {"requestId", ticket.request.requestId},
+                     {"deadlineUnixMs", ticket.request.deadline.unixMs},
+                     {"type", "watch"},
+                     {"commandId", id},
+                     {"botGuid", "11"},
+                     {"condition", condition},
+                     {"untilUnixMs", f.now.unixMs + 60000}};
+        uint64_t receipt = 0;
+        if (channel.Receive(f.settings.token, ticket.request.requestId, wire.dump(), receipt) != ChannelError::None)
+            return Json();
+        channel.Update(with);
+        std::unique_ptr<ChannelPacket> packet;
+        channel.Take(f.settings.token, receipt, packet);
+        return packet && packet->error == ChannelError::None ? Json::parse(packet->body) : Json();
+    };
+    auto ticket = open(0);
+    auto result = watch(ticket, "watch-1", "combat_end", &phase);
+    Check(result.at("type") == "watch.result" && result.at("commandId") == "watch-1" &&
+              result.at("outcome") == "armed" && !result.contains("reason"),
+          "watch: an armed result is published");
+    auto const* armed = channel.Watches().Find(11);
+    Check(armed && armed->id == "watch-1" && armed->partnerGuid == 22 && armed->source == DispatchSource::Whisper &&
+              armed->channel == "direct" && armed->contextId == "ctx" && armed->depth == 1 &&
+              armed->originUnixMs == f.now.unixMs - 1000 && armed->condition == WatchCondition::CombatEnd &&
+              armed->activity == 2 && armed->untilUnixMs == f.now.unixMs + 60000,
+          "watch: the route's bot, partner, conversation and chain stored");
+    Check(f.source.watchReads == 1 && f.source.watchBot == 11 && f.source.watchPartner == 22,
+          "watch: the bot's facts read once, with its partner");
+    Check(channel.Close(ticket), "watch: an armed watch counts as acting on the route");
+    f.world.Cancel(ticket);
+
+    ticket = open(0);
+    f.source.watchFacts = {true, false, 0};
+    result = watch(ticket, "watch-2", "combat_end", &phase);
+    Check(result.at("outcome") == "rejected" && result.at("reason") == "not_fighting" &&
+              result.at("reasonText") == "I am not fighting anything right now.",
+          "watch: combat_end outside a fight is not_fighting");
+    result = watch(ticket, "watch-3", "activity_done", &phase);
+    Check(result.at("outcome") == "rejected" && result.at("reason") == "not_busy" &&
+              result.at("reasonText") == "I am not busy with anything.",
+          "watch: activity_done while idle is not_busy");
+    Check(channel.Watches().Find(11) && channel.Watches().Find(11)->id == "watch-1",
+          "watch: a refused watch leaves the bot's watch alone");
+    Check(!channel.Close(ticket), "watch: a refused watch is no act");
+    f.world.Cancel(ticket);
+
+    ticket = open(0);
+    result = watch(ticket, "watch-4", "none", &phase);
+    Check(result.at("outcome") == "cleared" && !channel.Watches().Find(11) && !channel.Close(ticket),
+          "watch: none clears the bot's watch and is no act");
+    f.world.Cancel(ticket);
+
+    ticket = open(0);
+    f.source.watchFacts = {true, true, 2};
+    unsigned const reads = f.source.watchReads;
+    result = watch(ticket, "watch-5", "combat_end", nullptr);
+    Check(result.at("outcome") == "rejected" && result.at("reason") == "cannot_now" && f.source.watchReads == reads &&
+              channel.Watches().Empty(),
+          "watch: without the post-map-join phase nothing is read or armed");
+    f.source.watchReadable = false;
+    result = watch(ticket, "watch-6", "time", &phase);
+    Check(result.at("reason") == "cannot_now" && channel.Watches().Empty(), "watch: an unreadable bot is not ready");
+    f.source.watchReadable = true;
+    channel.Close(ticket);
+    f.world.Cancel(ticket);
+
+    ticket = open(3);
+    result = watch(ticket, "watch-7", "time", &phase);
+    Check(result.at("reason") == "put_off" && channel.Watches().Empty(), "watch: a third wake cannot arm a fourth");
+    channel.Close(ticket);
+    f.world.Cancel(ticket);
+    ticket = open(2);
+    result = watch(ticket, "watch-8", "time", &phase);
+    Check(result.at("outcome") == "armed" && channel.Watches().Find(11) && channel.Watches().Find(11)->depth == 3,
+          "watch: the second wake arms the third");
+    channel.Close(ticket);
+    f.world.Cancel(ticket);
+
+    ticket = open(0);
+    Check(!channel.Close(ticket), "watch: route closed before its watch");
+    unsigned const before = f.source.watchReads;
+    Check(watch(ticket, "watch-9", "combat_end", &phase).is_null() && channel.Watches().Find(11)->id == "watch-8" &&
+              f.source.watchReads == before,
+          "watch: a closed route arms nothing");
+    f.world.Cancel(ticket);
+
+    auto const dropped = channel.Watches().Counters().dropped;
+    channel.Retire();
+    Check(channel.Watches().Empty() && channel.Watches().Counters().dropped == dropped + 1,
+          "watch: epoch retirement ends every watch");
+}
+
 int main()
 {
     try
@@ -348,6 +549,8 @@ int main()
         Currentness();
         Bounds();
         MarkPublication();
+        TopicPublication();
+        WatchArming();
         std::cout << "PASS " << checks << " production filtered query/event helper checks\n";
     }
     catch (std::exception const& error)
