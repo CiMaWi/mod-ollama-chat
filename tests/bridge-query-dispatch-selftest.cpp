@@ -138,6 +138,9 @@ bool g_DisableForParty = false;
 bool g_DisableForSayYell = false;
 float g_SayDistance = 25;
 float g_YellDistance = 100;
+// The adapter's debug-only card churn line (J14c).
+bool g_DebugEnabled = false;
+#define LOG_INFO(...) ((void)0)
 bool OllamaIsRealPlayer(Player* player) { return player && player->human; }
 std::string Roleplay_BuildVoicePrompt(Player*) { return "A quiet traveler."; }
 

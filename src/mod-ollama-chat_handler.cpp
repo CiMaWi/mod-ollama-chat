@@ -1106,6 +1106,8 @@ struct BridgeView
     OllamaBridge::DispatchGuard guard;
     OllamaBridge::Context context;
     std::string signature;
+    // Length of the signature's voice part; the card fields (appended accepted body, card token) follow it (DS.8).
+    std::size_t voiceSignature = 0;
     std::vector<OllamaBridge::ChannelObservedMark> marks;
     OllamaPersona::CardContext card;
 };
@@ -1125,10 +1127,14 @@ std::vector<BridgeBinding> g_bridgeBindings;
 uint64_t g_bridgeRevision = 0;
 // The bridge generation the persona store was last activated for; OllamaChat_BridgeReset retires it.
 uint64_t g_cardGeneration = 0;
+// Watchlist (DS.8): bindings erased because their ready card changed under an unchanged voice.
+uint64_t g_bridgeCardChurn = 0;
 
-void BridgeField(std::string& signature, std::string const& value)
+void BridgeField(std::string& signature, std::string_view value)
 {
-    signature += std::to_string(value.size()) + ":" + value;
+    signature += std::to_string(value.size());
+    signature += ':';
+    signature += value;
 }
 
 bool BridgeHuman(Player* player)
@@ -1354,6 +1360,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     view.context.persona = Roleplay_BuildVoicePrompt(bot);
     if (view.context.persona.size() > 8192)
         return false;
+    std::size_t const voiceSize = view.context.persona.size();
     BridgeCard(bot, speaker, controller, view);
     view.context.observations = {"Your name is " + bot->GetName() + ".", "The speaker is " + speaker->GetName() + "."};
     // Piggyback on this existing bounded observation; never add a world/group scan or tick hook.
@@ -1365,10 +1372,16 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
             if (BridgeVisibleUnit(bot, unit, distance))
                 view.marks.push_back({guid.GetRawValue(), icon});
         }
-    BridgeField(view.signature, view.context.persona);
-    // Readiness, revision and snapshot: a reload or update fails BridgeSame even when the text is unchanged.
+    std::string_view const persona = view.context.persona;
+    BridgeField(view.signature, persona.substr(0, voiceSize));
+    view.voiceSignature = view.signature.size();
+    // The appended accepted body, then readiness, revision and snapshot: a reload or update fails BridgeSame even
+    // when the text is unchanged.
     if (auto const card = OllamaPersona::CardToken(view.card); !card.empty())
+    {
+        BridgeField(view.signature, persona.substr(voiceSize));
         BridgeField(view.signature, card);
+    }
     return true;
 }
 
@@ -1376,6 +1389,44 @@ bool BridgeSame(BridgeBinding const& binding, BridgeView const& current)
 {
     return binding.generation == OllamaDispatch_BridgeWorld().Generation() &&
            binding.view.guard.scope.epoch == current.guard.scope.epoch && binding.view.signature == current.signature;
+}
+
+bool BridgeCardReady(OllamaPersona::CardStatus status)
+{
+    return status == OllamaPersona::CardStatus::Missing || status == OllamaPersona::CardStatus::DraftOnly ||
+           status == OllamaPersona::CardStatus::Accepted;
+}
+
+// The captures differ at most in their card fields.
+bool BridgeSameVoice(BridgeBinding const& binding, BridgeView const& current)
+{
+    return binding.generation == OllamaDispatch_BridgeWorld().Generation() &&
+           binding.view.guard.scope.epoch == current.guard.scope.epoch &&
+           binding.view.voiceSignature == current.voiceSignature &&
+           binding.view.signature.compare(0, current.voiceSignature, current.signature, 0, current.voiceSignature) == 0;
+}
+
+// DS.8, Refresh and Observe only: a binding captured without a ready card (Unready or Loading: voice only, nothing
+// offered, stamp 0) survives a card change, so a card loading after the message keeps the in-flight reply. Submit
+// stays strict (BridgeSame) and renews such a binding at the next message.
+bool BridgeTolerates(BridgeBinding const& binding, BridgeView const& current)
+{
+    return BridgeSame(binding, current) ||
+           (!BridgeCardReady(binding.view.card.status) && BridgeSameVoice(binding, current));
+}
+
+// Called before erasing a binding whose capture succeeded: counts a ready card that changed under the same voice
+// (a committed proposal, a reload). Such a change erases the pair's memory and native context.
+void BridgeCountChurn(BridgeBinding const& binding, BridgeView const& current)
+{
+    if (!BridgeCardReady(binding.view.card.status) || BridgeSame(binding, current) ||
+        !BridgeSameVoice(binding, current))
+        return;
+    ++g_bridgeCardChurn;
+    if (g_DebugEnabled)
+        LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge card churn for bot {}: {} -> {} ({} since start)",
+                 binding.view.guard.scope.botGuid, OllamaPersona::CardToken(binding.view.card),
+                 OllamaPersona::CardToken(current.card), g_bridgeCardChurn);
 }
 
 void BridgeErase(std::vector<BridgeBinding>::iterator it)
@@ -1401,10 +1452,12 @@ std::vector<BridgeBinding>::iterator BridgeObserveFresh(OllamaBridge::WorldTicke
         return it;
     auto const now = OllamaBridge::Now();
     auto const& captured = it->view.guard;
-    if (OllamaBridge::Expired(it->heartbeat, now) || OllamaBridge::Expired(it->idleUntil, now) ||
-        !BridgeCapture(captured.scope.botGuid, captured.speakerGuid, captured.source, current) ||
-        !BridgeSame(*it, current))
+    bool const fresh = !OllamaBridge::Expired(it->heartbeat, now) && !OllamaBridge::Expired(it->idleUntil, now) &&
+                       BridgeCapture(captured.scope.botGuid, captured.speakerGuid, captured.source, current);
+    if (!fresh || !BridgeTolerates(*it, current))
     {
+        if (fresh)
+            BridgeCountChurn(*it, current);
         BridgeErase(it);
         return g_bridgeBindings.end();
     }
@@ -1472,8 +1525,14 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
                                return item.view.guard.scope.botGuid == view.guard.scope.botGuid &&
                                       item.view.guard.scope.contextId == view.guard.scope.contextId;
                            });
+    std::string memory;
     if (it != g_bridgeBindings.end() && !BridgeSame(*it, view))
     {
+        // DS.8: a binding the refresh tolerated is renewed with its current card and a new persona revision; its
+        // one-exchange memory (same speaker, scope and voice) moves to the renewal.
+        if (BridgeTolerates(*it, view))
+            memory = std::move(it->memory);
+        BridgeCountChurn(*it, view);
         BridgeErase(it);
         it = g_bridgeBindings.end();
     }
@@ -1490,7 +1549,7 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
         g_bridgeBindings.push_back({OllamaDispatch_BridgeWorld().Generation(), std::move(view),
                                     CaptureDeadline(now, WorldLivenessMs),
                                     CaptureDeadline(now, MaxLifetimeMs),
-                                    "",
+                                    std::move(memory),
                                     {}});
         it = std::prev(g_bridgeBindings.end());
     }
@@ -1534,10 +1593,12 @@ void OllamaChat_BridgeRefresh()
     {
         BridgeView current;
         auto const& guard = it->view.guard;
-        if (Expired(it->heartbeat, now) || Expired(it->idleUntil, now) ||
-            !BridgeCapture(guard.scope.botGuid, guard.speakerGuid, guard.source, current) ||
-            !BridgeSame(*it, current) || !OllamaDispatch_BridgeWorld().ObserveScope(guard.scope, now))
+        bool const fresh = !Expired(it->heartbeat, now) && !Expired(it->idleUntil, now) &&
+                           BridgeCapture(guard.scope.botGuid, guard.speakerGuid, guard.source, current);
+        if (!fresh || !BridgeTolerates(*it, current) || !OllamaDispatch_BridgeWorld().ObserveScope(guard.scope, now))
         {
+            if (fresh)
+                BridgeCountChurn(*it, current);
             auto const index = it - g_bridgeBindings.begin();
             BridgeErase(it);
             it = g_bridgeBindings.begin() + index;

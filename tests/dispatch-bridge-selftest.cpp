@@ -10,6 +10,7 @@
 #include <iostream>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -282,11 +283,12 @@ struct PlayerbotsMgr
         return &ai;
     }
 };
-// The extracted capture reads the persona card through the production store (compiled in, gate closed: voice only)
-// and the acquaintance table; this fixture has neither enabled, so a card is never offered.
+// The extracted capture reads the persona card through the production store (compiled in) and the acquaintance
+// table. Both stay off (voice only, no card offered) except in CardTests, which open them for every pair.
 struct Acquaintance
 {
 };
+bool acquaintanceLoaded = false;
 struct AcquaintanceMgr
 {
     static AcquaintanceMgr& Instance()
@@ -294,8 +296,12 @@ struct AcquaintanceMgr
         static AcquaintanceMgr manager;
         return manager;
     }
-    bool IsLoaded() const { return false; }
-    Acquaintance const* Find(uint32_t, uint32_t) const { return nullptr; }
+    bool IsLoaded() const { return acquaintanceLoaded; }
+    Acquaintance const* Find(uint32_t, uint32_t) const
+    {
+        static Acquaintance row;
+        return acquaintanceLoaded ? &row : nullptr;
+    }
 };
 struct PlayerbotAIConfig
 {
@@ -1004,6 +1010,183 @@ void SelfMarkTests()
           "self-mark: the refresh retires lost bindings; the re-baselined one stays silent");
     Reset();
 }
+
+// The persona store's port: loads and writes wait in submitted until the test completes them.
+struct CardPort final : OllamaPersona::StorePort
+{
+    std::deque<OllamaPersona::StoreOperation> submitted;
+    std::deque<OllamaPersona::StoreCompletion> completed;
+    bool TrySubmit(OllamaPersona::StoreOperation operation) override
+    {
+        submitted.push_back(std::move(operation));
+        return true;
+    }
+    std::optional<OllamaPersona::StoreCompletion> TryPop() override
+    {
+        if (completed.empty())
+            return std::nullopt;
+        auto completion = std::move(completed.front());
+        completed.pop_front();
+        return completion;
+    }
+    // Completes the oldest operation: a load as a confirmed missing row or the given accepted card, a write as
+    // committed with its exact readback.
+    void Complete(std::string const& accepted = {})
+    {
+        auto operation = std::move(submitted.front());
+        submitted.pop_front();
+        OllamaPersona::StoreCompletion completion{operation.botGuid, operation.id, OllamaPersona::LookupStatus::Missing,
+                                                  std::nullopt, false};
+        if (operation.write)
+        {
+            completion.lookup = OllamaPersona::LookupStatus::Found;
+            completion.row = operation.write->next;
+            completion.committed = true;
+        }
+        else if (!accepted.empty())
+        {
+            OllamaPersona::State row;
+            row.botGuid = operation.botGuid;
+            row.revision = 1;
+            row.accepted = OllamaPersona::Card{OllamaPersona::Source::Manual, accepted};
+            completion.lookup = OllamaPersona::LookupStatus::Found;
+            completion.row = std::move(row);
+        }
+        completed.push_back(std::move(completion));
+        OllamaPersona::WorldStore().Pump(std::chrono::steady_clock::now());
+    }
+} cardPort;
+
+void CardFixture()
+{
+    while (!cardPort.submitted.empty())
+        cardPort.Complete();
+    AdapterFixture();
+    playerbotConfig.AcquaintanceEnable = acquaintanceLoaded = true;
+    OllamaPersona::WorldStore().Configure(true);
+    Check(OllamaPersona::WorldStore().SetPort(&cardPort), "card: store port attached");
+}
+
+// Personal pair: the controlling human whispers the bot.
+bool CardSubmit(std::string const& text)
+{
+    return BridgeSubmit(&players[0], &players[1], SRC_WHISPER_LOCAL, text, true, "whisper-22", 0);
+}
+
+bool CardDeliver()
+{
+    auto done = Finish();
+    bool const prepared = PrepareBridge(done);
+    DeliverBridge(done, {});
+    return prepared;
+}
+
+// J14c (DS.8): a card going from empty or loading to ready keeps the binding and its in-flight reply (Refresh and
+// Observe); Submit compares strictly and renews the binding with the card, keeping its one-exchange memory. A ready
+// card that changes under the same voice is churn: the binding is erased and counted.
+void CardTests()
+{
+    using namespace OllamaBridge;
+    auto const persona = [] { return g_queue.back().request.bridgeTicket.request.input.persona; };
+
+    // A: empty -> loading -> missing across refreshes; the first reply is delivered and remembered.
+    CardFixture();
+    Check(CardSubmit("First words."), "card A: first message admitted");
+    auto const first = g_queue.front().request.bridgeTicket;
+    Check(!first.request.input.card.offered && first.request.input.persona == voice && cardPort.submitted.size() == 1,
+          "card A: the first message rides on the voice and requests one load");
+    OllamaChat_BridgeRefresh();
+    Check(g_bridgeBindings.size() == 1 && g_bridgeBindings[0].view.card.status == OllamaPersona::CardStatus::Unready &&
+              g_bridgeWorld.Current(first, Now()),
+          "card A: empty -> loading keeps the binding and its request");
+    cardPort.Complete();
+    OllamaChat_BridgeRefresh();
+    Check(g_bridgeBindings.size() == 1 && g_bridgeWorld.Current(first, Now()),
+          "card A: loading -> missing keeps the binding and its request");
+    Check(CardDeliver() && routeCalls == 1 && g_bridgeBindings.size() == 1, "card A: the first reply is delivered");
+    Check(g_bridgeBindings[0].memory.find("First words.") != std::string::npos, "card A: first exchange remembered");
+
+    // B: strict Submit renews the binding once, offers the now-known card and keeps the exchange memory.
+    auto const churn = g_bridgeCardChurn;
+    Check(CardSubmit("Second words."), "card B: next message admitted");
+    auto const second = g_queue.back().request.bridgeTicket;
+    Check(!(second.scope == first.scope) && second.scope.personaRevision != first.scope.personaRevision &&
+              !g_bridgeWorld.Current(first, Now()) && g_bridgeBindings.size() == 1,
+          "card B: strict submit renews the binding and its persona revision");
+    Check(second.request.input.card.offered && second.request.input.card.stamp && !second.request.input.card.revision &&
+              !second.request.input.card.accepted && second.request.input.persona == voice,
+          "card B: the renewal offers the missing card");
+    Check(second.request.input.memory.find("First words.") != std::string::npos,
+          "card B: the renewal keeps the one-exchange memory");
+    Check(g_bridgeCardChurn == churn, "card B: a renewal from an empty card is not churn");
+    Check(CardSubmit("Third words.") && g_queue.back().request.bridgeTicket.scope == second.scope,
+          "card B: an unchanged ready card keeps the renewed binding");
+
+    // C: a ready card that changes (a committed proposal) erases the binding and counts churn.
+    Check(OllamaPersona::ProposeCard(OllamaPersona::WorldStore(), g_bridgeWorld.Generation(), players[0].guid, true,
+                                     "codex", 0, second.request.input.card.stamp,
+                                     "A careful hunter.") == OllamaPersona::ProposalStatus::Queued,
+          "card C: proposal staged");
+    OllamaChat_BridgeRefresh();
+    Check(g_bridgeBindings.empty() && g_bridgeCardChurn == churn + 1 && !g_bridgeWorld.Current(second, Now()),
+          "card C: a changed ready card erases the binding and counts churn");
+    g_queue.clear();
+    cardPort.Complete();
+    Check(CardSubmit("Fourth words.") && g_queue.back().request.bridgeTicket.request.input.card.revision == 1 &&
+              g_queue.back().request.bridgeTicket.request.input.memory.empty(),
+          "card C: after churn a fresh binding starts without memory");
+    g_queue.clear();
+
+    // D: Observe alone (no refresh between) tolerates a card that became accepted; the renewal carries the card.
+    CardFixture();
+    Check(CardSubmit("Hello."), "card D: first message admitted");
+    cardPort.Complete("A careful hunter.");
+    Check(CardDeliver() && routeCalls == 1 && g_bridgeBindings.size() == 1,
+          "card D: observe tolerates empty -> accepted, the reply is delivered");
+    Check(CardSubmit("Again.") && persona() == voice + "\n\n" + "A careful hunter." &&
+              g_queue.back().request.bridgeTicket.request.input.card.accepted &&
+              g_queue.back().request.bridgeTicket.request.input.card.revision == 1,
+          "card D: the renewal carries the accepted card");
+    g_queue.clear();
+
+    // E: a message while the card loads renews to a loading binding; that one tolerates loading -> ready too.
+    CardFixture();
+    Check(CardSubmit("One."), "card E: first message admitted");
+    g_queue.clear();
+    OllamaChat_BridgeRefresh();
+    Check(CardSubmit("Two."), "card E: message while loading admitted");
+    auto const loading = g_queue.back().request.bridgeTicket;
+    Check(g_bridgeBindings.size() == 1 && g_bridgeBindings[0].view.card.status == OllamaPersona::CardStatus::Loading,
+          "card E: the renewal captured the loading card");
+    cardPort.Complete();
+    OllamaChat_BridgeRefresh();
+    Check(g_bridgeBindings.size() == 1 && g_bridgeWorld.Current(loading, Now()) && CardDeliver() && routeCalls == 1,
+          "card E: loading -> missing keeps the request and delivers its reply");
+    g_queue.clear();
+
+    // F: the tolerance covers card fields only; a voice or audience change still erases a not-ready binding.
+    for (unsigned change = 0; change < 2; ++change)
+    {
+        CardFixture();
+        Check(CardSubmit("Hi."), "card F: first message admitted");
+        cardPort.Complete();
+        if (change == 0)
+            voice += " Revised.";
+        else
+            players[1].visible = false;
+        OllamaChat_BridgeRefresh();
+        Check(g_bridgeBindings.empty() && g_bridgeCardChurn == churn + 1,
+              "card F: a non-card change erases a not-ready binding and is not churn");
+        g_queue.clear();
+    }
+
+    while (!cardPort.submitted.empty())
+        cardPort.Complete();
+    playerbotConfig.AcquaintanceEnable = acquaintanceLoaded = false;
+    OllamaPersona::WorldStore().Configure(false);
+    Check(OllamaPersona::WorldStore().SetPort(nullptr), "card: store port detached");
+    Reset();
+}
 }  // namespace
 
 int main()
@@ -1019,6 +1202,7 @@ int main()
         DrainTest();
         AdapterTests();
         SelfMarkTests();
+        CardTests();
         g_queue.clear();
         g_done.clear();
         Check(!OllamaBridge::DispatchSlot::Used(), "final no leaked slots");
