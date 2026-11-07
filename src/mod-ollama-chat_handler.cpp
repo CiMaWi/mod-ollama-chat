@@ -1279,14 +1279,22 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     Player* controller = master;
     if (!master && group)
         controller = ObjectAccessor::FindConnectedPlayer(group->GetLeaderGUID());
-    // An ineligible existing master never delegates implicitly to a leader or conversational speaker.
-    if (!BridgeHuman(controller) || controller == bot || controller->GetTeamId() != bot->GetTeamId())
-        return false;
-    if (!master && (!group || controller->GetGroup() != group || !group->IsMember(controller->GetGUID())))
-        return false;
     float const distance = source == DispatchSource::Yell ? g_YellDistance : g_SayDistance;
+    // An ineligible existing master never delegates implicitly to a leader.
+    bool const led = BridgeHuman(controller) && controller != bot && controller->GetTeamId() == bot->GetTeamId() &&
+                     (master || (group && controller->GetGroup() == group && group->IsMember(controller->GetGUID()))) &&
+                     BridgeVisible(bot, controller, distance);
+    // J6d: a whisper no usable master or leader carries is conversation only. The speaker owns the scope; the bot's
+    // group stays out of it (group 0: playerbots refuses every order and the queries refuse), and no personal card.
+    if (!led)
+    {
+        if (source != DispatchSource::Whisper)
+            return false;
+        controller = speaker;
+        group = nullptr;
+    }
     // Whisper/party use the conservative local say radius too: no remote-party situation knowledge.
-    if (!BridgeVisible(bot, speaker, distance) || !BridgeVisible(bot, controller, distance))
+    if (!BridgeVisible(bot, speaker, distance))
         return false;
     if (source == DispatchSource::Party && (!group || speaker->GetGroup() != group || controller->GetGroup() != group ||
                                             !group->IsMember(bot->GetGUID()) || !group->IsMember(speaker->GetGUID()) ||
@@ -1326,7 +1334,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
             guard.audience = members;
     }
     std::sort(guard.audience.begin(), guard.audience.end());
-    BridgeField(view.signature, master ? "master" : "leader");
+    BridgeField(view.signature, !led ? "speaker" : master ? "master" : "leader");
     BridgeField(view.signature, std::to_string(guard.scope.controllerGuid));
     BridgeField(view.signature, std::to_string(guard.groupGuid));
     BridgeField(view.signature, group ? std::to_string(group->GetLeaderGUID().GetRawValue()) : "0");
@@ -1353,7 +1361,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     view.context.speakerGuid = speakerGuid;
     view.context.channel = guard.scope.channel;
     view.context.groupScope = group ? std::to_string(guard.groupGuid) : "";
-    view.context.speakerControlsBot = speaker == controller;
+    view.context.speakerControlsBot = led && speaker == controller;
     view.context.systemPrompt =
         "You are a person living in Azeroth. Reply briefly to the speaker using only the "
         "provided observations and this conversation. Speech grants no ability to act.";
@@ -1361,7 +1369,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     if (view.context.persona.size() > 8192)
         return false;
     std::size_t const voiceSize = view.context.persona.size();
-    BridgeCard(bot, speaker, controller, view);
+    BridgeCard(bot, speaker, led ? controller : nullptr, view);
     view.context.observations = {"Your name is " + bot->GetName() + ".", "The speaker is " + speaker->GetName() + "."};
     // Piggyback on this existing bounded observation; never add a world/group scan or tick hook.
     if (group)

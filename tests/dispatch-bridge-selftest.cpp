@@ -839,10 +839,45 @@ void AdapterTests()
     gameAI.master = &players[3];
     players[3].human = false;
     Check(!AdapterSubmit(), "ineligible existing master cannot fall back to eligible leader");
-    AdapterFixture();
-    gameAI.master = nullptr;
-    players[0].group = nullptr;
-    Check(!AdapterSubmit(SRC_WHISPER_LOCAL), "speaker alone cannot grant control");
+    // J6d: a whisper no usable master or leader carries is conversation only. The speaker owns the scope, without
+    // the bot's group (no orders, no queries), control or marks; say, yell and party stay refused.
+    std::vector<std::function<void()>> strangers = {[]
+                                                    {
+                                                        gameAI.master = nullptr;
+                                                        players[0].group = nullptr;
+                                                    },
+                                                    []
+                                                    {
+                                                        gameAI.master = nullptr;
+                                                        party.leader = 11;
+                                                    },
+                                                    [] { players[1].visible = false; },
+                                                    []
+                                                    {
+                                                        gameAI.master = &players[3];
+                                                        players[3].human = false;
+                                                    }};
+    for (auto const& stranger : strangers)
+    {
+        AdapterFixture();
+        party.marks[0] = 33;
+        stranger();
+        Check(!AdapterSubmit(SRC_SAY_LOCAL) && !AdapterSubmit(SRC_YELL_LOCAL) && !AdapterSubmit(),
+              "J6d: a stranger's say, yell or party line stays refused");
+        Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Hello there."), "J6d: a stranger's whisper is admitted");
+        auto const& ticket = g_queue.front().request.bridgeTicket;
+        auto const& binding = g_bridgeBindings.back();
+        Check(ticket.scope.controllerGuid == 33 && ticket.scope.channel == "direct" && !binding.view.guard.groupGuid &&
+                  !binding.view.guard.nonRaid && !ticket.request.input.speakerControlsBot &&
+                  binding.view.marks.empty() && ticket.request.input.party.size() == 2 &&
+                  binding.view.signature.rfind("7:speaker", 0) == 0,
+              "J6d: the stranger owns the scope without group, control or marks");
+        done = Finish();
+        Check(PrepareBridge(done), "J6d: stranger whisper prepared");
+        DeliverBridge(done, {});
+        Check(routeCalls == 1, "J6d: stranger reply delivered");
+        done = {};
+    }
     AdapterFixture();
     Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Private whisper."), "direct admitted");
     done = Finish();
@@ -1217,6 +1252,14 @@ void CardTests()
               "card F: a non-card change erases a not-ready binding and is not churn");
         g_queue.clear();
     }
+
+    // J6d: a stranger's whisper never reads the personal card, even for an acquainted pair.
+    CardFixture();
+    gameAI.master = nullptr;
+    players[0].group = nullptr;
+    Check(CardSubmit("Who are you?") && !g_bridgeBindings.back().view.card.personal && cardPort.submitted.empty(),
+          "card J6d: a stranger's whisper gets no personal card");
+    g_queue.clear();
 
     while (!cardPort.submitted.empty())
         cardPort.Complete();
