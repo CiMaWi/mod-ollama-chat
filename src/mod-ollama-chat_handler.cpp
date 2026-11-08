@@ -2040,6 +2040,9 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
              
     PlayerbotAI* senderAI = PlayerbotsMgr::instance().GetPlayerbotAI(player);
     bool senderIsBot = (senderAI && senderAI->IsBotAI());
+    // J5g: a human's line under the bridge provider (the gate above already let only those through). The combat
+    // filter below spares a local model; a bridge reply to a human is exempt (DS.14: a fighting bot may just act).
+    bool const bridgeHumanLine = bridgeProvider && !senderIsBot;
 
     // --- conversation governor -------------------------------------------
     // One key per conversation space so cooldowns, rate limits and repetition
@@ -2428,13 +2431,18 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         if (!candidateBots.empty())
         {
             Player* whisperBot = candidateBots[0]; // Should only be one bot for whispers
-            if (!(g_DisableRepliesInCombat && whisperBot->IsInCombat()))
+            if (!OllamaBridge::CombatSkipsReply(g_DisableRepliesInCombat, bridgeHumanLine, whisperBot->IsInCombat()))
             {
                 finalCandidates.push_back(whisperBot);
                 if(g_DebugEnabled)
                 {
                     LOG_INFO("module.ollamachat", "[Ollama Chat] Whisper: Bot {} selected to respond", whisperBot->GetName());
                 }
+            }
+            else if (g_DebugEnabled)
+            {
+                LOG_INFO("module.ollamachat", "[Ollama Chat] Whisper: Bot {} skipped - in combat",
+                         whisperBot->GetName());
             }
         }
     }
@@ -2454,7 +2462,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             {
                 continue;
             }
-            if (g_DisableRepliesInCombat && bot->IsInCombat())
+            if (OllamaBridge::CombatSkipsReply(g_DisableRepliesInCombat, bridgeHumanLine, bot->IsInCombat()))
             {
                 continue;
             }
@@ -2485,7 +2493,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             std::sort(mentionedBots.begin(), mentionedBots.end(),
                       [](const std::pair<size_t, Player*> &a, const std::pair<size_t, Player*> &b) { return a.first < b.first; });
             Player* chosen = mentionedBots.front().second;
-            if (!(g_DisableRepliesInCombat && chosen->IsInCombat()))
+            if (!OllamaBridge::CombatSkipsReply(g_DisableRepliesInCombat, bridgeHumanLine, chosen->IsInCombat()))
             {
                 finalCandidates.push_back(chosen);
                 if(g_DebugEnabled)
@@ -2499,7 +2507,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         {
             for (Player* bot : candidateBots)
             {
-                if (g_DisableRepliesInCombat && bot->IsInCombat())
+                if (OllamaBridge::CombatSkipsReply(g_DisableRepliesInCombat, bridgeHumanLine, bot->IsInCombat()))
                 {
                     if(g_DebugEnabled)
                     {

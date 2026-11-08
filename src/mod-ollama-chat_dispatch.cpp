@@ -27,6 +27,7 @@
 #include "ChatCommandLine.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "ThreadCheck.h"
 
 #include <algorithm>
 #include <atomic>
@@ -711,7 +712,19 @@ OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, u
     return g_bridgeChannel.Take(bearer, receipt, packet);
 }
 
-void OllamaDispatch_BridgeWatchLogout(uint64_t guid) { g_bridgeChannel.Watches().Cancel(guid); }
+void OllamaDispatch_BridgeWatchLogout(uint64_t guid)
+{
+    // J5g: the watch table is world-thread only (no mutex). Off the world thread the edit is skipped and reported
+    // once (playerbots' world-thread test, set on every world update); the 500 ms scan drops a watch whose bot or
+    // partner has gone.
+    if (!PlayerbotThreadCheck::IsWorldThread())
+    {
+        static std::atomic<bool> reported{false};
+        PlayerbotThreadCheck::ReportWrongThread(reported, "OllamaChat watch logout (skipped)", __FILE__, __LINE__);
+        return;
+    }
+    g_bridgeChannel.Watches().Cancel(guid);
+}
 
 namespace
 {

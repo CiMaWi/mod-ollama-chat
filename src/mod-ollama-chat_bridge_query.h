@@ -78,6 +78,13 @@ private:
     QueryWorldSource& _source;
     ReadClock const _clock;
 };
+
+// J5g: OllamaChat.DisableRepliesInCombat spares a local model in combat. A bridge reply to a human's line is exempt
+// (DS.14: a fighting bot answers, often by acting alone); all other chatter keeps the check.
+inline bool CombatSkipsReply(bool disableInCombat, bool bridgeHumanLine, bool inCombat)
+{
+    return disableInCombat && !bridgeHumanLine && inCombat;
+}
 }  // namespace OllamaBridge
 
 #endif
