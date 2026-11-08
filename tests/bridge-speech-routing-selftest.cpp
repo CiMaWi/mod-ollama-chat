@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "ChatCommandLine.h"
+#include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_persona_db.h"
