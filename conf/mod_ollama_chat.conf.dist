@@ -610,11 +610,14 @@ OllamaChat.TypingSimulationDelayPerChar = 250
 #     Description: Enables or disables the use of defined roleplay personalities for AI bots.
 #                  When enabled (1), bots will respond with distinct personalities based on their assigned type.
 #                  When disabled (0), bots will use a neutral/default response style.
+#                  Independent of this option: {bot_personality} and the bridge card's traits come from the bot's trait
+#                  words (mod-playerbots) whenever it has them; this option only governs the RP personality keys.
 #     Default:     0 (false)
 OllamaChat.EnableRPPersonalities = 0
 
 # OllamaChat.DefaultPersonalityPrompt
 #     Description: The fallback personality description used when a bot has no specific roleplay type assigned.
+#                  {bot_personality} uses it only for a bot without trait words.
 #     Default:     Talk like a standard WoW player.
 OllamaChat.DefaultPersonalityPrompt = "Speak like a real WoW player. Stay in character and use casual in-game tone."
 

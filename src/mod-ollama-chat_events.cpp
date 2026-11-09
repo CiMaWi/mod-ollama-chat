@@ -303,7 +303,7 @@ std::string OllamaBotEventChatter::BuildPrompt(Player* bot, std::string promptTe
         return "";
 
     const std::string personality       = GetBotPersonality(bot);
-    const std::string personalityPrompt = GetPersonalityPromptAddition(personality);
+    const std::string personalityPrompt = GetBotPersonalityPrompt(bot, personality);
 
     AreaTableEntry const* area = ai->GetCurrentArea();
     AreaTableEntry const* zone = ai->GetCurrentZone();

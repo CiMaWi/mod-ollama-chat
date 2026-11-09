@@ -137,7 +137,7 @@ namespace
             return "";
 
         const std::string personality       = GetBotPersonality(bot);
-        const std::string personalityPrompt = GetPersonalityPromptAddition(personality);
+        const std::string personalityPrompt = GetBotPersonalityPrompt(bot, personality);
 
         AreaTableEntry const* area = botAI->GetCurrentArea();
         AreaTableEntry const* zone = botAI->GetCurrentZone();

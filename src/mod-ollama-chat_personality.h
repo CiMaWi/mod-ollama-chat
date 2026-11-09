@@ -16,6 +16,10 @@ std::string GetBotPersonality(Player* bot);
 // Falls back to a default if not found.
 std::string GetPersonalityPromptAddition(const std::string& type);
 
+// WT11b: the text for {bot_personality}: the bot's trait words and interests (mod-playerbots ReadBotPersonality),
+// whatever EnableRPPersonalities says; without traits, GetPersonalityPromptAddition(personality).
+std::string GetBotPersonalityPrompt(Player* bot, const std::string& personality);
+
 // Set a bot's personality manually (saves to database)
 bool SetBotPersonality(Player* bot, const std::string& personality);
 

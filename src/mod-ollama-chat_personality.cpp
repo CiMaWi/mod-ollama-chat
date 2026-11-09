@@ -4,6 +4,8 @@
 #include "Log.h"
 #include "mod-ollama-chat_config.h"
 #include "DatabaseEnv.h"
+#include "BridgeBotTraits.h"
+#include "mod-ollama-chat_trait_words.h"
 #include <random>
 #include <vector>
 
@@ -87,6 +89,18 @@ std::string GetPersonalityPromptAddition(const std::string& personality)
     if (it != g_PersonalityPrompts.end())
         return it->second;
     return g_DefaultPersonalityPrompt;
+}
+
+std::string GetBotPersonalityPrompt(Player* bot, const std::string& personality)
+{
+    PlayerbotBridge::BotPersonality traits;
+    if (bot && PlayerbotBridge::ReadBotPersonality(bot->GetGUID(), traits))
+    {
+        std::string const text = OllamaTraitWords::FormatPersonalityPrompt(traits.words, traits.interests);
+        if (!text.empty())
+            return text;
+    }
+    return GetPersonalityPromptAddition(personality);
 }
 
 bool SetBotPersonality(Player* bot, const std::string& personality)

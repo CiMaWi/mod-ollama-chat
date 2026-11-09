@@ -116,6 +116,11 @@ talk about. Historically the module pasted every off-cooldown spell a bot knew
 into the prompt, which is exactly why bots kept talking about their spellbook.
 `OllamaChat.Snapshot.IncludeSpells` defaults to `0` for this reason.
 
+`{bot_personality}` comes from the bot's trait words and interests (mod-playerbots `ReadBotPersonality`, formatted by
+`mod-ollama-chat_trait_words.h`, words only, never numbers), then from the RP personality prompt when the bot has no
+traits. The bridge card's `traits` fact is the three strongest words. Both are independent of `EnableRPPersonalities`;
+the RP code stays, switched off.
+
 When adding prompt material, prefer things outside the bot — people nearby,
 what just happened, where they are — over facts about the bot itself. The
 weights in `OllamaChat.Topic.*` encode this deliberately.

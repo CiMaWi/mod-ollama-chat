@@ -6,6 +6,8 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "BridgeBotState.h"
+#include "BridgeBotTraits.h"
+#include "mod-ollama-chat_trait_words.h"
 #include "ChatCommandLine.h"
 #include "AcquaintanceMgr.h"
 #include "PlayerbotAIConfig.h"
@@ -1119,10 +1121,17 @@ void BridgeCardFacts(Player* bot, OllamaBridge::CardFacts& facts)
     if (PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot))
         if (AreaTableEntry const* zone = botAI->GetCurrentZone())
             facts.zone = botAI->GetLocalizedAreaName(zone);
-    // Only an existing assignment: GetBotPersonality may assign one with a synchronous query.
-    auto const personality = g_BotPersonalityList.find(bot->GetGUID().GetRawValue());
-    if (g_EnableRPPersonalities && personality != g_BotPersonalityList.end() && personality->second != "default")
-        facts.traits = OllamaBridge::CardTraitWord(personality->second);
+    // WT11b: the three strongest trait words (cache read, no query), whatever EnableRPPersonalities says.
+    PlayerbotBridge::BotPersonality traits;
+    if (PlayerbotBridge::ReadBotPersonality(bot->GetGUID(), traits))
+        facts.traits = OllamaTraitWords::FormatCardTraits(traits.words);
+    // Without trait words: only an existing RP assignment, GetBotPersonality may assign one with a synchronous query.
+    if (facts.traits.empty())
+    {
+        auto const personality = g_BotPersonalityList.find(bot->GetGUID().GetRawValue());
+        if (g_EnableRPPersonalities && personality != g_BotPersonalityList.end() && personality->second != "default")
+            facts.traits = OllamaBridge::CardTraitWord(personality->second);
+    }
 }
 // END BRIDGE CARD FACTS
 
@@ -2805,7 +2814,7 @@ std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* pl
     uint64_t playerGuid             = player->GetGUID().GetRawValue();
 
     std::string personality         = GetBotPersonality(bot);
-    std::string personalityPrompt   = GetPersonalityPromptAddition(personality);
+    std::string personalityPrompt   = GetBotPersonalityPrompt(bot, personality);
     std::string botName             = bot->GetName();
     uint32_t botLevel               = bot->GetLevel();
     uint8_t botGenderByte           = bot->getGender();
@@ -2939,7 +2948,7 @@ std::string BuildEmoteReactionPrompt(Player* bot, Player* player, uint32_t textE
         emoteName = "gestures at";
 
     const std::string personality       = GetBotPersonality(bot);
-    const std::string personalityPrompt = GetPersonalityPromptAddition(personality);
+    const std::string personalityPrompt = GetBotPersonalityPrompt(bot, personality);
 
     std::string prompt = SafeFormat(
         g_EmoteReactionPromptTemplate,
