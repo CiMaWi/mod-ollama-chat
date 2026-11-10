@@ -977,8 +977,8 @@ void TransportLoss()
     auto const lost = f.Send(f.Attack("lost-receipt"));
     f.Advance(WorldLivenessMs);
     std::unique_ptr<ChannelPacket> packet;
-    Check(f.channel.Take(f.settings.token, lost, packet) == ChannelError::Stale && !packet && f.channel.Drained(),
-          "an expired receipt is disposed, never resent");
+    Check(f.channel.Take(f.settings.token, lost, packet) == ChannelError::Unknown && !packet && f.channel.Drained(),
+          "empty world ticks dispose an expired receipt before the consumer asks");
     Check(f.Result(f.Send(f.Attack("lost-receipt")), "lost-receipt") == "duplicate" && f.probe.calls == 1,
           "a producer retry after receipt loss is a duplicate");
     f.Advance(CommandRate::IntervalMs);
@@ -997,6 +997,94 @@ void TransportLoss()
     Check(p.Result(p.Send(p.Attack("unseen")), "unseen") == "applied" && p.probe.calls == 1,
           "a never-admitted id runs once later");
     Check(p.Result(p.Send(p.Attack("unseen")), "unseen") == "duplicate" && p.probe.calls == 1, "and only once");
+}
+
+void AbandonedReceipts()
+{
+    Fixture f;
+    auto const command = f.Send(f.Attack("abandoned-command"));
+    f.Send(f.Query("abandoned-query"));
+    auto watch = f.Wire("watch", f.ticket.request.requestId);
+    watch["commandId"] = "abandoned-watch";
+    watch["botGuid"] = "11";
+    watch["condition"] = "none";
+    watch["untilUnixMs"] = f.now.unixMs + 60000;
+    f.Send(watch.dump());
+    // Separate event routes publish immediately, without an incoming packet or a
+    // native consumer.
+    while (f.channel.Used() < WorldChannel::MaxPackets)
+    {
+        Context input;
+        input.channel = "party";
+        input.speakerGuid = 22;
+        input.text = "Current observed marks.";
+        auto const event = f.world.Reserve(f.ticket.scope, input, f.now, 30000);
+        uint64_t receipt = 0;
+        Check(event.generation && f.channel.RegisterEvents(event, f.guard, {{44, 3}}, receipt) && receipt,
+              "abandoned event receipt occupies a shared physical slot");
+    }
+    uint64_t overflow = 0;
+    Check(f.channel.Used() == 64 &&
+              f.channel.Receive(f.settings.token, f.ticket.request.requestId, f.Attack("overflow"), overflow) ==
+                  ChannelError::Capacity &&
+              !overflow,
+          "64 published command/query/watch/event receipts exhaust physical "
+          "capacity");
+    f.Advance(WorldLivenessMs - 1);
+    Check(f.channel.Used() == 64 && f.probe.calls == 1, "unexpired receipts survive empty ticks without effects");
+    auto held = f.Take(command);
+    Check(Json::parse(held->body)["outcome"] == "applied" && f.channel.Used() == 64,
+          "unexpired completion remains consumable and transfer retains its lease");
+    f.Advance(1);
+    Check(f.channel.Used() == 1 && !f.channel.Drained() && f.probe.calls == 1,
+          "empty tick at exact expiry disposes all abandoned receipts but not "
+          "the consumer's packet");
+    held.reset();
+    Check(f.channel.Drained(), "consumer disposal releases the final physical slot");
+    Check(f.Result(f.Send(f.Attack("abandoned-command")), "abandoned-command") == "duplicate" && f.probe.calls == 1,
+          "receipt cleanup never clears command replay history and new packets "
+          "admit");
+
+    for (unsigned clock = 0; clock < 3; ++clock)
+    {
+        Fixture boundary;
+        auto const lost = boundary.Send(boundary.Attack("boundary"));
+        if (clock == 0)
+            boundary.now.unixMs += WorldLivenessMs;
+        else
+        {
+            boundary.now.steadyMs += WorldLivenessMs;
+            if (clock == 2)
+                boundary.now.unixMs -= 10000;
+        }
+        Check(boundary.channel.Update(&phase) == 0 && boundary.channel.Drained() && boundary.probe.calls == 1,
+              "empty sweep uses either clock at equality, including wall-clock "
+              "rollback");
+        std::unique_ptr<ChannelPacket> packet;
+        Check(boundary.channel.Take(boundary.settings.token, lost, packet) == ChannelError::Unknown && !packet,
+              "a swept receipt is absent without a consumer polling it");
+    }
+
+    Fixture retired;
+    auto const old = retired.Send(retired.Attack("old-serial"));
+    retired.channel.Retire();
+    retired.world.Configured(true, retired.settings, "epoch-2");
+    Check(retired.channel.Drained() &&
+              retired.world.ObserveDrain(retired.channel.Drained(), RetirementProof::NoLiveCaptures) &&
+              retired.channel.Activate(),
+          "retirement disposes the old serial's receipts before the new epoch activates");
+    Check(retired.channel.Update(&phase) == 0, "newly activated serial has no old work");
+    std::unique_ptr<ChannelPacket> packet;
+    Check(retired.channel.Take(retired.settings.token, old, packet) == ChannelError::Unknown && !packet &&
+              retired.probe.calls == 1,
+          "retired receipt cannot revive on a later serial");
+
+    Fixture unswept;
+    auto const stale = unswept.Send(unswept.Attack("unswept"));
+    unswept.now.steadyMs += WorldLivenessMs;
+    Check(unswept.channel.Take(unswept.settings.token, stale, packet) == ChannelError::Stale && !packet &&
+              unswept.channel.Drained(),
+          "Take still reports stale when no world sweep ran");
 }
 }  // namespace
 
@@ -1018,6 +1106,7 @@ int main()
         PostEffectJoin();
         ActedRoutes();
         TransportLoss();
+        AbandonedReceipts();
         std::cout << "PASS " << checks << " typed command dispatch checks\n";
     }
     catch (std::exception const& e)

@@ -324,6 +324,14 @@ bool WorldChannel::ReceiptCurrent(WorldTicket const& ticket, Clock now) const
 
 std::size_t WorldChannel::Update(EffectPhase const* phase)
 {
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto const now = _clock();
+        // Published packets share the 64 physical slots, including abandoned native event receipts.
+        // Sweep even with no incoming work; a packet transferred by Take remains its consumer's lease.
+        std::erase_if(_done, [&](auto const& pair)
+                      { return pair.second->_serial != _serial || Expired(pair.second->_until, now); });
+    }
     if (!_enabled || !Activate())
         return 0;
     // Scope count is bounded at 64; ObserveScope does not scan the replay ledger on healthy heartbeats.
