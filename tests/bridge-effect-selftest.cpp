@@ -277,6 +277,11 @@ ChannelCommand ValidCmd(ChannelIntent intent)
             return Cmd(intent, Pos());
         case ChannelIntent::DungeonClear:
             return Cmd(intent, ChannelMode::On);
+        case ChannelIntent::GoTo:
+        case ChannelIntent::MeetAt:
+            return Cmd(intent, ChannelPlace{"Goldshire"});
+        case ChannelIntent::Quest:
+            return Cmd(intent, ChannelQuestId{4242});
         default:
             return Cmd(intent);
     }
@@ -296,7 +301,16 @@ Verb const kVerbs[] = {{ChannelIntent::AttackOwnTarget, PlayerbotBridge::Intent:
                        {ChannelIntent::Position, PlayerbotBridge::Intent::Position, "position"},
                        {ChannelIntent::Formation, PlayerbotBridge::Intent::Formation, "formation"},
                        {ChannelIntent::SaveMana, PlayerbotBridge::Intent::SaveMana, "save_mana"},
-                       {ChannelIntent::FocusHealing, PlayerbotBridge::Intent::FocusHealing, "focus_healing"}};
+                       {ChannelIntent::FocusHealing, PlayerbotBridge::Intent::FocusHealing, "focus_healing"},
+                       {ChannelIntent::GoTo, PlayerbotBridge::Intent::GoTo, "go_to"},
+                       {ChannelIntent::Quest, PlayerbotBridge::Intent::Quest, "quest"},
+                       {ChannelIntent::Errands, PlayerbotBridge::Intent::Errands, "errands"},
+                       {ChannelIntent::SetHearth, PlayerbotBridge::Intent::SetHearth, "set_hearth"},
+                       {ChannelIntent::GrindHere, PlayerbotBridge::Intent::GrindHere, "grind_here"},
+                       {ChannelIntent::GatherHere, PlayerbotBridge::Intent::GatherHere, "gather_here"},
+                       {ChannelIntent::MeetAt, PlayerbotBridge::Intent::MeetAt, "meet_at"},
+                       {ChannelIntent::PausePlan, PlayerbotBridge::Intent::PausePlan, "pause_plan"},
+                       {ChannelIntent::ResumePlan, PlayerbotBridge::Intent::ResumePlan, "resume_plan"}};
 
 // Nothing reached playerbots and no game read happened.
 bool Untouched()
@@ -337,6 +351,9 @@ void VerbSwitch()
                   pb.order.Y == (position ? 200.25 : 0.0) && pb.order.Z == (position ? 300.125 : 0.0),
               "destination only for position");
         Check(pb.reaches == (position ? 1u : 0u), "reachability query only for position");
+        bool const placed = verb.intent == ChannelIntent::GoTo || verb.intent == ChannelIntent::MeetAt;
+        Check(pb.order.PlaceName == (placed ? "Goldshire" : ""), "WT18b: place name only for go_to and meet_at");
+        Check(pb.order.QuestId == (verb.intent == ChannelIntent::Quest ? 4242u : 0u), "WT18b: quest id only for quest");
         Check(game.targetReads == (verb.intent == ChannelIntent::AttackOwnTarget ? 1u : 0u),
               "own target read only for attack");
         Check(game.unitLookups == (targeted ? 1u : 0u), "target unit resolved only for attack, mark and focus heal");
@@ -346,7 +363,7 @@ void VerbSwitch()
 
 void OtherVerbs()
 {
-    for (uint8_t raw = 0; raw <= static_cast<uint8_t>(ChannelIntent::DungeonClear); ++raw)
+    for (uint8_t raw = 0; raw <= static_cast<uint8_t>(ChannelIntent::ResumePlan); ++raw)
     {
         auto const intent = static_cast<ChannelIntent>(raw);
         bool supported = false;
@@ -995,6 +1012,13 @@ void ResultMapping()
                               {PlayerbotBridge::Refusal::TargetNotVisible, CommandRefusal::TargetNotVisible},
                               {PlayerbotBridge::Refusal::NoTarget, CommandRefusal::NoTarget},
                               {PlayerbotBridge::Refusal::CannotNow, CommandRefusal::CannotNow},
+                              {PlayerbotBridge::Refusal::NotPlanner, CommandRefusal::NotPlanner},
+                              {PlayerbotBridge::Refusal::GoalHeld, CommandRefusal::GoalHeld},
+                              {PlayerbotBridge::Refusal::UnknownPlace, CommandRefusal::UnknownPlace},
+                              {PlayerbotBridge::Refusal::NoRoute, CommandRefusal::NoRoute},
+                              {PlayerbotBridge::Refusal::NoSuchQuest, CommandRefusal::NoSuchQuest},
+                              {PlayerbotBridge::Refusal::NothingHere, CommandRefusal::NothingHere},
+                              {PlayerbotBridge::Refusal::AlreadyThere, CommandRefusal::AlreadyThere},
                               {static_cast<PlayerbotBridge::Refusal>(99), CommandRefusal::None}};
     for (Reason const& reason : reasons)
     {

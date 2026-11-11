@@ -32,13 +32,18 @@ enum class EffectResult : uint8_t
 // DS.3: only verbs with an accepted typed game effect reach an executor. Every other verb (regroup, pull,
 // assign_role, dungeon_clear: no safe playerbots effect, DS.9) gets the fixed refusal here, before any game read.
 // Attack, mark, flee and position are one-time; follow, stay, formation, save_mana and focus_healing are lasting
-// plans (J12): the executor captures the bot's state first and the plan ledger restores it later.
+// plans (J12): the executor captures the bot's state first and the plan ledger restores it later. WT18b: the goal
+// verbs hand the planner a goal; it carries the goal out, so they have no lasting part and no restore.
 inline bool EffectSupported(ChannelIntent intent)
 {
     return intent == ChannelIntent::AttackOwnTarget || intent == ChannelIntent::Mark ||
            intent == ChannelIntent::Follow || intent == ChannelIntent::Stay || intent == ChannelIntent::Flee ||
            intent == ChannelIntent::Position || intent == ChannelIntent::Formation ||
-           intent == ChannelIntent::SaveMana || intent == ChannelIntent::FocusHealing;
+           intent == ChannelIntent::SaveMana || intent == ChannelIntent::FocusHealing ||
+           intent == ChannelIntent::GoTo || intent == ChannelIntent::Quest || intent == ChannelIntent::Errands ||
+           intent == ChannelIntent::SetHearth || intent == ChannelIntent::GrindHere ||
+           intent == ChannelIntent::GatherHere || intent == ChannelIntent::MeetAt ||
+           intent == ChannelIntent::PausePlan || intent == ChannelIntent::ResumePlan;
 }
 
 // Rejected and Unavailable promise no mutation. Only an attempt the channel authorized can be applied; any other
@@ -62,6 +67,8 @@ struct EffectOrder
     ChannelPosition position;           // Position only: the destination MapIntent matched against the pathable fact.
     std::optional<ChannelShape> shape;  // Formation only.
     bool enabled = false;               // SaveMana only.
+    std::string place;                  // GoTo and MeetAt only: the place name.
+    uint32_t questId = 0;               // Quest only.
 };
 
 // The one unit an executor resolves for visibility: the bot's current own target for an attack, the payload's
@@ -112,6 +119,10 @@ inline std::optional<EffectOrder> BuildEffectOrder(ChannelCommand const& command
         order.shape = *shape;
     else if (auto const* enabled = std::get_if<bool>(&mapped->params))
         order.enabled = *enabled;
+    else if (auto const* place = std::get_if<ChannelPlace>(&mapped->params))
+        order.place = place->name;
+    else if (auto const* quest = std::get_if<ChannelQuestId>(&mapped->params))
+        order.questId = quest->id;
     bool const targeted = order.intent == ChannelIntent::AttackOwnTarget || order.intent == ChannelIntent::Mark ||
                           order.intent == ChannelIntent::FocusHealing;
     if (targeted ? !order.targetGuid : order.targetGuid != 0)

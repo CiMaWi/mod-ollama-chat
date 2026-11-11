@@ -161,7 +161,7 @@ QueryWorldSource& OllamaChat_BridgeQuerySource();
 bool OllamaChat_BridgeObserve(WorldTicket const&, DispatchGuard&);
 void OllamaChat_BridgeRefresh();
 // J5f-b: the topic reader (playerbots, outside the extract) is not part of these checks.
-bool BridgeBotStateTopic(uint64_t, StateTopic, std::vector<StateEntry>& entries)
+bool BridgeBotStateTopic(uint64_t, StateTopic, std::string const&, std::vector<StateEntry>& entries)
 {
     entries.clear();
     return false;

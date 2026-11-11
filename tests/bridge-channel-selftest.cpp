@@ -243,6 +243,11 @@ void Schemas()
                                                    {"save_mana", {{"enabled", 1}}},
                                                    {"formation", {{"shape", "circle"}}},
                                                    {"dungeon_clear", {{"mode", "restart"}}},
+                                                   {"go_to", {{"place", ""}}},
+                                                   {"meet_at", {{"questId", 1}}},
+                                                   {"quest", {{"questId", 0}}},
+                                                   {"quest", {{"place", "Goldshire"}}},
+                                                   {"errands", {{"place", "Goldshire"}}},
                                                    {"position", {{"x", 1}, {"y", 2}, {"z", 3}, {"mapId", -1}}},
                                                    {"position", {{"x", "1"}, {"y", 2}, {"z", 3}, {"mapId", 0}}}})
     {
@@ -275,7 +280,16 @@ void Schemas()
                                                    {"save_mana", {{"enabled", false}}},
                                                    {"formation", {{"shape", "spread"}}},
                                                    {"position", {{"x", 1.5}, {"y", -2}, {"z", 3}, {"mapId", 0}}},
-                                                   {"dungeon_clear", {{"mode", "pause"}}}})
+                                                   {"dungeon_clear", {{"mode", "pause"}}},
+                                                   {"go_to", {{"place", "Goldshire"}}},
+                                                   {"quest", {{"questId", 4294967295ULL}}},
+                                                   {"errands", Json::object()},
+                                                   {"set_hearth", Json::object()},
+                                                   {"grind_here", Json::object()},
+                                                   {"gather_here", Json::object()},
+                                                   {"meet_at", {{"place", std::string(64, 'm')}}},
+                                                   {"pause_plan", Json::object()},
+                                                   {"resume_plan", Json::object()}})
     {
         auto good = f.Command("effect-" + std::to_string(++sequence));
         good["intent"] = pair.first;
@@ -436,11 +450,15 @@ Json StateQuery(Fixture const& f, std::string const& id, Json topic)
 Json Topic(Fixture& f, std::string const& id, StateTopic topic, std::vector<StateEntry> const& entries)
 {
     ChannelMessage message;
-    Check(f.policy.Receive(bearer, StateQuery(f, id, StateTopicName(topic)).dump(), f.scope, now, message, "work") ==
-              ChannelError::None,
+    auto wire = StateQuery(f, id, StateTopicName(topic));
+    if (topic == StateTopic::Route)
+        wire["place"] = "Goldshire";  // WT18b: route names its place.
+    Check(f.policy.Receive(bearer, wire.dump(), f.scope, now, message, "work") == ChannelError::None,
           "bot_state query admitted");
     auto const& query = std::get<ChannelQuery>(message.payload);
-    Check(query.kind == QueryKind::BotState && query.topic == topic, "typed bot_state topic");
+    Check(query.kind == QueryKind::BotState && query.topic == topic &&
+              query.place == (topic == StateTopic::Route ? "Goldshire" : ""),
+          "typed bot_state topic");
     std::string body;
     Check(f.policy.FinishTopic(message.envelope, f.scope, topic, entries, now, body) == ChannelError::None,
           "topic result encoded");
@@ -464,8 +482,8 @@ bool Keys(Json const& entry, std::set<std::string> const& keys)
 void Topics()
 {
     Fixture f;
-    // Parse: the five topics, nothing else.
-    for (std::string bad : {"bank", "", "Inventory", "talents"})
+    // Parse: the eleven topics, nothing else.
+    for (std::string bad : {"bank", "", "Inventory", "talents", "Plan", "quest plan", "questplan", "place"})
         Check(f.Receive(StateQuery(f, "bad-" + bad, bad)) == ChannelError::Invalid, "unknown topic invalid_input");
     Check(f.Receive(StateQuery(f, "bad-number", 1)) == ChannelError::Invalid, "topic must be a string");
     auto missing = StateQuery(f, "missing", "inventory");
@@ -483,6 +501,34 @@ void Topics()
     auto other = StateQuery(f, "other-bot", "spells");
     other["botGuid"] = "5";
     Check(f.Receive(other) == ChannelError::Stale, "bot_state only for the route's own bot");
+    // WT18b: route, and only route, names its place: text of 1..64 bytes, not blank, no control characters.
+    Check(f.Receive(StateQuery(f, "route-bare", "route")) == ChannelError::Invalid, "route needs its place");
+    for (Json const& place : {Json(""), Json(std::string(65, 'p')), Json("   "), Json("Gold\nshire"),
+                              Json(std::string("Gold\x7Fshire")), Json(12), Json::object()})
+    {
+        auto bad = StateQuery(f, "route-bad", "route");
+        bad["place"] = place;
+        Check(f.Receive(bad) == ChannelError::Invalid, "a route place is bounded text");
+    }
+    for (std::size_t t = 0; t < StateTopicCount; ++t)
+        if (static_cast<StateTopic>(t) != StateTopic::Route)
+        {
+            auto placed = StateQuery(f, "placed-" + std::to_string(t), StateTopicName(static_cast<StateTopic>(t)));
+            placed["place"] = "Goldshire";
+            Check(f.Receive(placed) == ChannelError::Invalid, "only route takes a place");
+        }
+    std::string widest;
+    for (int i = 0; i < 32; ++i)
+        widest += "\xC3\xA9";
+    auto longest = StateQuery(f, "route-64", "route");
+    longest["place"] = widest;
+    ChannelMessage routed;
+    Check(f.policy.Receive(bearer, longest.dump(), f.scope, now, routed, "work") == ChannelError::None &&
+              std::get<ChannelQuery>(routed.payload).place == widest,
+          "a place of 64 bytes is carried as given");
+    longest = StateQuery(f, "route-66", "route");
+    longest["place"] = widest + "\xC3\xA9";
+    Check(f.Receive(longest) == ChannelError::Invalid, "a place over 64 bytes is refused");
     Check(f.Receive(StateQuery(f, "state-1", "quests")) == ChannelError::None, "bot_state reserves its id");
     Check(f.Receive(StateQuery(f, "state-1", "quests")) == ChannelError::Duplicate, "bot_state id replay refused");
     Check(f.Receive(f.Command("effect-state", "state-1")) == ChannelError::Invalid,
@@ -550,6 +596,64 @@ void Topics()
               entries.at(1).at("rank") == 0 && entries.at(2).at("rank") == 3,
           "spells at most 40, rank bounded");
 
+    // WT18b: the planner's topics share one row shape; the row word comes from StateTopicRow, other rows dropped.
+    struct RowWords
+    {
+        StateTopic topic;
+        std::vector<std::string> words;
+    };
+    RowWords const tables[] = {{StateTopic::Plan, {"goal", "source", "reason", "stop"}},
+                               {StateTopic::Options, {"option", "current"}},
+                               {StateTopic::Route, {"total", "leg", "failed"}},
+                               {StateTopic::QuestPlan, {"take", "task", "turn_in", "carried", "deferred"}},
+                               {StateTopic::Bags, {"free", "sell", "bag"}},
+                               {StateTopic::Places, {"hearth", "flight_here", "flight_elsewhere"}}};
+    for (auto const& table : tables)
+        for (std::size_t code = 0; code < 8; ++code)
+            Check(std::string(StateTopicRow(table.topic, static_cast<uint8_t>(code))) ==
+                      (code < table.words.size() ? table.words[code] : std::string()),
+                  "each planner row code has its word, an unknown code none");
+    for (std::size_t t = 0; t <= static_cast<std::size_t>(StateTopic::Spells); ++t)
+        Check(!*StateTopicRow(static_cast<StateTopic>(t), 0) && !*StateTopicRow(static_cast<StateTopic>(t), 1),
+              "older topics have no row words");
+    Check(!*StateTopicRow(static_cast<StateTopic>(StateTopicCount), 0), "an unknown topic has no row words");
+    Check(std::string(StateTopicName(StateTopic::Plan)) == "plan" &&
+              std::string(StateTopicName(StateTopic::Options)) == "options" &&
+              std::string(StateTopicName(StateTopic::Route)) == "route" &&
+              std::string(StateTopicName(StateTopic::QuestPlan)) == "quest_plan" &&
+              std::string(StateTopicName(StateTopic::Bags)) == "bags" &&
+              std::string(StateTopicName(StateTopic::Places)) == "places",
+          "planner topic names");
+    Check(StateTopicLimit(StateTopic::Plan) == 8 && StateTopicLimit(StateTopic::Options) == 5 &&
+              StateTopicLimit(StateTopic::Route) == 12 && StateTopicLimit(StateTopic::QuestPlan) == 12 &&
+              StateTopicLimit(StateTopic::Bags) == 6 && StateTopicLimit(StateTopic::Places) == 24,
+          "planner topic limits as playerbots keeps them");
+    entries = Topic(f, "plan", StateTopic::Plan,
+                    {{"rpg_travel", "goal", 120, 600},
+                     {"planner", "source", -5, 5000000000LL},
+                     {"near quests", "reason", 0, 0},
+                     {"Kobold Camp Cleanup", "stop", 3, 250},
+                     {"bogus", "option", 1, 1},
+                     {"none", "", 0, 0},
+                     {"", "goal", 1, 1}});
+    Check(entries.size() == 4 && Keys(entries.at(0), {"row", "name", "value", "extra"}) &&
+              entries.at(0).at("row") == "goal" && entries.at(0).at("name") == "rpg_travel" &&
+              entries.at(0).at("value") == 120 && entries.at(0).at("extra") == 600 &&
+              entries.at(1).at("row") == "source" && entries.at(1).at("value") == 0 &&
+              entries.at(1).at("extra") == 4294967295LL && entries.at(2).at("name") == "near quests" &&
+              entries.at(3).at("row") == "stop" && entries.at(3).at("name") == "Kobold Camp Cleanup",
+          "plan rows: row word, name, value and extra bounded; another topic's row word and an empty name dropped");
+    for (auto const& table : tables)
+    {
+        std::vector<StateEntry> rows;
+        for (int i = 0; i < 30; ++i)
+            rows.push_back({"word " + std::to_string(i), table.words.at(i % table.words.size()), i, i});
+        auto const limited = Topic(f, std::string("limit-") + StateTopicName(table.topic), table.topic, rows);
+        Check(limited.size() == StateTopicLimit(table.topic) &&
+                  limited.at(1).at("row") == table.words.at(1 % table.words.size()),
+              "a planner topic keeps its row words and stops at its limit");
+    }
+
     // Names: cut to 64 bytes on a character boundary; control characters and invalid UTF-8 dropped.
     std::string accented;
     for (int i = 0; i < 40; ++i)
@@ -574,7 +678,7 @@ void Topics()
                              topic == StateTopic::Inventory    ? "equipped"
                              : topic == StateTopic::Quests     ? "complete"
                              : topic == StateTopic::Strategies ? "non_combat"
-                                                               : "",
+                                                               : StateTopicRow(topic, 0),
                              topic == StateTopic::Inventory ? 5 : 604800, 10000});
         auto const result = Topic(f, "worst-" + std::to_string(t), topic, worst);
         Check(result.size() == (topic == StateTopic::Strategies ? 0 : StateTopicLimit(topic)), "worst case count");
@@ -586,7 +690,7 @@ void Topics()
               ChannelError::None,
           "query for terminal check");
     std::string body;
-    Check(f.policy.FinishTopic(message.envelope, f.scope, static_cast<StateTopic>(9), {}, now, body) ==
+    Check(f.policy.FinishTopic(message.envelope, f.scope, static_cast<StateTopic>(StateTopicCount), {}, now, body) ==
                   ChannelError::Invalid &&
               body.empty(),
           "unknown topic value refused");

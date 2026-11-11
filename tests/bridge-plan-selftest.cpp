@@ -62,6 +62,10 @@ void Mapping()
          {ChannelIntent::Flee, ChannelIntent::Regroup, ChannelIntent::AttackOwnTarget, ChannelIntent::Mark,
           ChannelIntent::Pull, ChannelIntent::AssignRole, ChannelIntent::Position, ChannelIntent::DungeonClear})
         Check(!PlanKindFor(intent), "one-shot verbs (marks included) and refused verbs have no plan");
+    for (ChannelIntent intent : {ChannelIntent::GoTo, ChannelIntent::Quest, ChannelIntent::Errands,
+                                 ChannelIntent::SetHearth, ChannelIntent::GrindHere, ChannelIntent::GatherHere,
+                                 ChannelIntent::MeetAt, ChannelIntent::PausePlan, ChannelIntent::ResumePlan})
+        Check(!PlanKindFor(intent), "WT18b: a goal verb has no plan (the planner carries it out)");
     Check(!PlanKindFor(static_cast<ChannelIntent>(200)), "an unknown verb has no plan");
 }
 

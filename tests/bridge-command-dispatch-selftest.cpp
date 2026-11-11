@@ -234,14 +234,19 @@ void PureSeam()
 {
     Check(kBridgeEffectsReleased, "typed effects are on since the J6 release join (J6b4)");
     unsigned supported = 0;
-    for (int intent = 0; intent <= static_cast<int>(ChannelIntent::DungeonClear); ++intent)
+    for (int intent = 0; intent <= static_cast<int>(ChannelIntent::ResumePlan); ++intent)
         supported += EffectSupported(static_cast<ChannelIntent>(intent)) ? 1 : 0;
-    Check(supported == 9 && EffectSupported(ChannelIntent::AttackOwnTarget) && EffectSupported(ChannelIntent::Mark) &&
+    Check(supported == 18 && EffectSupported(ChannelIntent::AttackOwnTarget) && EffectSupported(ChannelIntent::Mark) &&
               EffectSupported(ChannelIntent::Follow) && EffectSupported(ChannelIntent::Stay) &&
               EffectSupported(ChannelIntent::Flee) && EffectSupported(ChannelIntent::Position) &&
               EffectSupported(ChannelIntent::Formation) && EffectSupported(ChannelIntent::SaveMana) &&
               EffectSupported(ChannelIntent::FocusHealing),
-          "only the nine PB-backed verbs reach an executor (J12 adds the three lasting settings)");
+          "only the PB-backed verbs reach an executor (J12 adds the three lasting settings, WT18b the goal verbs)");
+    for (auto const intent : {ChannelIntent::GoTo, ChannelIntent::Quest, ChannelIntent::Errands,
+                              ChannelIntent::SetHearth, ChannelIntent::GrindHere, ChannelIntent::GatherHere,
+                              ChannelIntent::MeetAt, ChannelIntent::PausePlan, ChannelIntent::ResumePlan})
+        Check(EffectSupported(intent) && !IntentNeedsGroup(intent) && !IntentNeedsPartnerInGroup(intent),
+              "WT18b: every goal verb reaches its executor and needs no group");
     Check(EffectOutcome(EffectResult::Applied, true) == ChannelOutcome::Applied &&
               EffectOutcome(EffectResult::Failed, true) == ChannelOutcome::Failed &&
               EffectOutcome(EffectResult::Rejected, true) == ChannelOutcome::Rejected &&
@@ -411,7 +416,7 @@ void EffectOrders()
     Check(MapIntent(pull, facts) && !BuildEffectOrder(pull, facts) && EffectTargetGuid(pull, 44) == 0,
           "a mappable verb without an accepted effect builds no order");
     unsigned orders = 0;
-    for (int intent = 0; intent <= static_cast<int>(ChannelIntent::DungeonClear); ++intent)
+    for (int intent = 0; intent <= static_cast<int>(ChannelIntent::ResumePlan); ++intent)
     {
         ChannelCommand other = attack;
         other.intent = static_cast<ChannelIntent>(intent);
@@ -569,7 +574,7 @@ void FixedRefusals()
           "a phase-less refusal spends no rate interval");
 }
 
-// The J6 action matrix: each of the 13 wire verbs ends as exactly one of a delivered effect (one executor call, one
+// The J6 action matrix: each of the 22 wire verbs ends as exactly one of a delivered effect (one executor call, one
 // authorized mutation, an applied receipt, the bot's rate interval spent) or its fixed refusal (a rejected receipt, no
 // executor call, nothing attempted, no rate interval spent). A fresh channel per verb keeps the rows independent.
 void VerbMatrix()
@@ -593,8 +598,17 @@ void VerbMatrix()
                         {"save_mana", Json{{"enabled", true}}, true},
                         {"focus_healing", Json{{"targetGuid", "44"}}, true},
                         {"assign_role", Json{{"role", "tank"}}, false},
-                        {"dungeon_clear", Json{{"mode", "on"}}, false}};
-    Check(std::size(rows) == static_cast<size_t>(ChannelIntent::DungeonClear) + 1, "the matrix names every wire verb");
+                        {"dungeon_clear", Json{{"mode", "on"}}, false},
+                        {"go_to", Json{{"place", "Goldshire"}}, true},
+                        {"quest", Json{{"questId", 42}}, true},
+                        {"errands", Json::object(), true},
+                        {"set_hearth", Json::object(), true},
+                        {"grind_here", Json::object(), true},
+                        {"gather_here", Json::object(), true},
+                        {"meet_at", Json{{"place", "Goldshire"}}, true},
+                        {"pause_plan", Json::object(), true},
+                        {"resume_plan", Json::object(), true}};
+    Check(std::size(rows) == static_cast<size_t>(ChannelIntent::ResumePlan) + 1, "the matrix names every wire verb");
     unsigned delivered = 0;
     unsigned refusals = 0;
     for (auto const& row : rows)
@@ -627,7 +641,7 @@ void VerbMatrix()
                   "a fixed refusal spends no rate interval");
         }
     }
-    Check(delivered == 9 && refusals == 4, "nine delivered verbs and four fixed refusals");
+    Check(delivered == 18 && refusals == 4, "eighteen delivered verbs and four fixed refusals");
     // Standing follow and stay (a duration or a standing flag) have no wire shape: the exact parameter check refuses
     // the packet as invalid input before any command exists, so nothing is admitted, attempted or executed.
     // J5e: the refusal is the Standing error, which the listener words as invalid_input with reason

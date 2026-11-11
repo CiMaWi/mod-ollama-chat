@@ -22,7 +22,7 @@ work replies must preserve the original wall deadline exactly. Wall-clock rollba
 
 | Type | Additional exact fields | Owner/direction |
 | --- | --- | --- |
-| query | controllerGuid, botGuid, query:"observable_group" | Authenticated native to game |
+| query | controllerGuid, botGuid, query:"observable_group", or query:"bot_state" with topic (route: and place) | Authenticated native to game |
 | command | commandId, issuerGuid, botGuid, intent, params | Authenticated native to game; staged typed proposal |
 | generation.result | text (1..4096 bytes, usable text, no NUL) | Authenticated native to game |
 | events.result | none | Authenticated native to game |
@@ -41,7 +41,9 @@ provenance before supplying units or marks; typed shape alone does not prove per
 Command intent/parameter shapes match J2 exactly: follow/stay/flee/regroup/attack_own_target `{}`;
 pull/focus_healing `{targetGuid}`; mark `{targetGuid,icon}`; assign_role `{role:tank|healer|damage}`;
 save_mana `{enabled:boolean}`; formation `{shape:close|spread|line}`; position `{x,y,z,mapId}` (finite numbers,
-uint32 map id); dungeon_clear `{mode:on|off|pause}`. Parsing emits enums and variant values only. No literal command
+uint32 map id); dungeon_clear `{mode:on|off|pause}`; WT18b's goal verbs go_to/meet_at `{place}` (1..64 bytes of
+text, not blank, no control characters), quest `{questId}` (uint32, nonzero) and
+errands/set_hearth/grind_here/gather_here/pause_plan/resume_plan `{}`. Parsing emits enums and variant values only. No literal command
 syntax is built. A staged proposal reserves its effect id before any possible later attempt, including failure.
 `Receive` is NEVER an execution grant. The world executor re-resolves GUIDs, actual current controller/group, target
 observation/eligibility, map/phase/pathability/rate and activation/deadline at the actual execution seam. Proposed text
@@ -55,7 +57,12 @@ playerbots itself; a change that leaves the part as the bridge set it (the same 
 logged-out bot's plan is dropped unrestored, and playerbots' own logout save can keep the bridge-set state in its
 database for the next login, as it does for its own commands. An attempt that may have changed the bot but left no
 plan (unreachable today) is counted as `unrecorded` in the "Bridge plans:" log line. regroup, pull, assign_role
-and dungeon_clear have no safe playerbots effect and stay a fixed refusal (DS.9).
+and dungeon_clear have no safe playerbots effect and stay a fixed refusal (DS.9). The goal verbs (WT18b) hand the
+bot's planner a goal through playerbots' plausibility gate; they need no group, have no lasting part (no capture, no
+plan, no restore) and are refused with not_planner, goal_held, unknown_place, no_route, no_such_quest, nothing_here or
+already_there. A bot_state query names one topic; route, and only route, also names its place (WT18b), which the
+world thread hands to playerbots' topic reader as a value. The planner topics (plan, options, route, quest_plan, bags,
+places) share one entry shape: row (a fixed word per topic, from `StateTopicRow`), name, value and extra.
 Retirement selects no new epoch until every retired plan is restored or dropped.
 
 The single world owner calls `Bind` only AFTER the existing activation owner has selected a fresh epoch and proved

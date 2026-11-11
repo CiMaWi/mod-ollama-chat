@@ -23,7 +23,16 @@ enum class ChannelIntent : uint8_t
     SaveMana,
     Formation,
     Position,
-    DungeonClear
+    DungeonClear,
+    GoTo,  // WT18b: the planner's goal verbs; the planner carries them out (no group, no lasting part).
+    Quest,
+    Errands,
+    SetHearth,
+    GrindHere,
+    GatherHere,
+    MeetAt,
+    PausePlan,
+    ResumePlan
 };
 
 enum class ChannelRole : uint8_t
@@ -63,8 +72,18 @@ struct ChannelPosition
 
     bool operator==(ChannelPosition const&) const = default;
 };
+// WT18b: a place the planner knows by name (go_to, meet_at); the channel checked it is text, not blank.
+constexpr std::size_t ChannelMaxPlaceName = 64;
+struct ChannelPlace
+{
+    std::string name;
+};
+struct ChannelQuestId  // quest: a quest in the bot's log, by id.
+{
+    uint32_t id = 0;
+};
 using ChannelParams = std::variant<std::monostate, ChannelTarget, ChannelMark, ChannelRole, bool, ChannelShape,
-                                   ChannelPosition, ChannelMode>;
+                                   ChannelPosition, ChannelMode, ChannelPlace, ChannelQuestId>;
 
 struct ChannelCommand
 {
@@ -105,7 +124,24 @@ inline bool ValidIntentParams(ChannelIntent intent, ChannelParams const& params)
         case ChannelIntent::Flee:
         case ChannelIntent::Regroup:
         case ChannelIntent::AttackOwnTarget:
+        case ChannelIntent::Errands:
+        case ChannelIntent::SetHearth:
+        case ChannelIntent::GrindHere:
+        case ChannelIntent::GatherHere:
+        case ChannelIntent::PausePlan:
+        case ChannelIntent::ResumePlan:
             return std::holds_alternative<std::monostate>(params);
+        case ChannelIntent::GoTo:
+        case ChannelIntent::MeetAt:
+        {
+            auto const* place = std::get_if<ChannelPlace>(&params);
+            return place && !place->name.empty() && place->name.size() <= ChannelMaxPlaceName;
+        }
+        case ChannelIntent::Quest:
+        {
+            auto const* quest = std::get_if<ChannelQuestId>(&params);
+            return quest && quest->id != 0;
+        }
         case ChannelIntent::Pull:
         case ChannelIntent::FocusHealing:
         {
@@ -169,7 +205,14 @@ enum class CommandRefusal : uint8_t
     WaitTooLong,
     PutOff,
     CannotNow,
-    Failed
+    Failed,
+    NotPlanner,  // WT18b: the planner's refusals of a goal verb.
+    GoalHeld,
+    UnknownPlace,
+    NoRoute,
+    NoSuchQuest,
+    NothingHere,
+    AlreadyThere
 };
 
 struct CommandRefusalWords
@@ -227,12 +270,27 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
             return {"cannot_now", "I cannot do that right now."};
         case CommandRefusal::Failed:
             return {"failed", "I tried, but it did not work."};
+        case CommandRefusal::NotPlanner:
+            return {"not_planner", "My own plans are not mine to change right now."};
+        case CommandRefusal::GoalHeld:
+            return {"goal_held", "My group has a goal I am holding to."};
+        case CommandRefusal::UnknownPlace:
+            return {"unknown_place", "I do not know that place."};
+        case CommandRefusal::NoRoute:
+            return {"no_route", "I cannot find a way there."};
+        case CommandRefusal::NoSuchQuest:
+            return {"no_such_quest", "That quest is not in my log."};
+        case CommandRefusal::NothingHere:
+            return {"nothing_here", "There is nothing for me to do here."};
+        case CommandRefusal::AlreadyThere:
+            return {"already_there", "I am already there."};
     }
     return {"cannot_now", "I cannot do that right now."};
 }
 
 // DS.14: group play needs a group. Follow, formation and save_mana also need the partner in the bot's group; a mark
-// and a focus heal need only the bot's group (playerbots checks the rest of each verb's rule).
+// and a focus heal need only the bot's group (playerbots checks the rest of each verb's rule). WT18b: the goal verbs
+// need none (the planner checks a group's held goal).
 inline bool IntentNeedsGroup(ChannelIntent intent)
 {
     return intent == ChannelIntent::Follow || intent == ChannelIntent::Mark || intent == ChannelIntent::Formation ||

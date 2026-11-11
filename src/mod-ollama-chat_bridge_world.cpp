@@ -368,7 +368,7 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
                     {
                         // J5f-b: the bot's own state, read now on the world thread; it names no other unit, so
                         // there is no observation to recheck before publication (the route checks still apply).
-                        if (_source && _source->ReadTopic(binding.ticket, query->topic, entries))
+                        if (_source && _source->ReadTopic(binding.ticket, query->topic, query->place, entries))
                             packet->error = _policy.FinishTopic(message.envelope, binding.ticket.scope, query->topic,
                                                                 entries, _clock(), packet->body);
                         else

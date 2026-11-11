@@ -94,11 +94,14 @@ struct Source : QueryWorldSource
     unsigned topicReads = 0;
     uint64_t topicBot = 0;
     StateTopic topicAsked = StateTopic::Inventory;
-    bool ReadTopic(WorldTicket const& ticket, StateTopic topic, std::vector<StateEntry>& entries) override
+    std::string topicPlace = "unread";
+    bool ReadTopic(WorldTicket const& ticket, StateTopic topic, std::string const& place,
+                   std::vector<StateEntry>& entries) override
     {
         ++topicReads;
         topicBot = ticket.scope.botGuid;
         topicAsked = topic;
+        topicPlace = place;
         entries = topicEntries;
         return topicReadable;
     }
@@ -383,11 +386,13 @@ void TopicPublication()
                          { return f.source.Observe(ticket, guard); }, [&f] { return f.now; }, &f.source};
     channel.Configure(true);
     Check(channel.Activate() && channel.Register(f.ticket, f.source.guard), "topic channel route");
-    auto const ask = [&](std::string const& id, std::string const& topic)
+    auto const ask = [&](std::string const& id, std::string const& topic, std::string const& place = {})
     {
         Json wire = {{"version", 1},    {"instance", "fixture"},    {"provider", "codex"}, {"epoch", "epoch-1"},
                      {"requestId", id}, {"deadlineUnixMs", 104000}, {"type", "query"},     {"controllerGuid", "22"},
                      {"botGuid", "11"}, {"query", "bot_state"},     {"topic", topic}};
+        if (!place.empty())
+            wire["place"] = place;  // WT18b: route names its place.
         uint64_t receipt = 0;
         Check(channel.Receive(f.settings.token, f.ticket.request.requestId, wire.dump(), receipt) == ChannelError::None,
               "topic query received");
@@ -403,8 +408,9 @@ void TopicPublication()
     Check(json.at("type") == "query.result" && json.at("topic") == "cooldowns" && json.at("entries").size() == 1 &&
               json.at("entries").at(0).at("seconds") == 1800,
           "source entries filtered into the topic result");
-    Check(f.source.topicReads == 1 && f.source.topicBot == 11 && f.source.topicAsked == StateTopic::Cooldowns,
-          "the route's own bot read once for the asked topic");
+    Check(f.source.topicReads == 1 && f.source.topicBot == 11 && f.source.topicAsked == StateTopic::Cooldowns &&
+              f.source.topicPlace.empty(),
+          "the route's own bot read once for the asked topic, with no place");
     Check(f.source.resolves == 0, "a topic reads no other unit");
     f.source.topicReadable = false;
     packet = ask("topic-2", "spells");
@@ -413,9 +419,22 @@ void TopicPublication()
     packet = ask("topic-3", "bank");
     Check(packet && packet->error == ChannelError::Invalid && packet->body.empty() && f.source.topicReads == 2,
           "unknown topic invalid_input without a read");
+    // WT18b: a route query hands its place to the source; the planner rows come back with their row words.
+    f.source.topicEntries = {{"goldshire", "total", 95, 10}, {"walk", "leg", 95, 0}, {"walk", "", 1, 1}};
+    packet = ask("topic-5", "route", "Goldshire");
+    json = packet ? Json::parse(packet->body) : Json();
+    Check(packet && packet->error == ChannelError::None && json.at("topic") == "route" &&
+              json.at("entries").size() == 2 && json.at("entries").at(0).at("row") == "total" &&
+              json.at("entries").at(1).at("row") == "leg" && json.at("entries").at(0).at("value") == 95,
+          "a route result carries its rows");
+    Check(f.source.topicReads == 3 && f.source.topicAsked == StateTopic::Route && f.source.topicPlace == "Goldshire",
+          "the route place reaches the source read");
+    packet = ask("topic-6", "route");
+    Check(packet && packet->error == ChannelError::Invalid && f.source.topicReads == 3,
+          "a route without its place is invalid_input without a read");
     f.source.authority = false;
     packet = ask("topic-4", "quests");
-    Check(!packet && f.source.topicReads == 2, "a stale route reads nothing and publishes nothing");
+    Check(!packet && f.source.topicReads == 3, "a stale route reads nothing and publishes nothing");
 }
 
 // J6e-c (DS.14 (c)): a watch on a real generation route: admitted on the world thread with the phase, from the

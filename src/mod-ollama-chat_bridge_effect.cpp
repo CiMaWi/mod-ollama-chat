@@ -151,6 +151,20 @@ private:
                 return CommandRefusal::NoTarget;
             case PlayerbotBridge::Refusal::CannotNow:
                 return CommandRefusal::CannotNow;
+            case PlayerbotBridge::Refusal::NotPlanner:
+                return CommandRefusal::NotPlanner;
+            case PlayerbotBridge::Refusal::GoalHeld:
+                return CommandRefusal::GoalHeld;
+            case PlayerbotBridge::Refusal::UnknownPlace:
+                return CommandRefusal::UnknownPlace;
+            case PlayerbotBridge::Refusal::NoRoute:
+                return CommandRefusal::NoRoute;
+            case PlayerbotBridge::Refusal::NoSuchQuest:
+                return CommandRefusal::NoSuchQuest;
+            case PlayerbotBridge::Refusal::NothingHere:
+                return CommandRefusal::NothingHere;
+            case PlayerbotBridge::Refusal::AlreadyThere:
+                return CommandRefusal::AlreadyThere;
             case PlayerbotBridge::Refusal::None:
                 break;
         }
@@ -247,6 +261,36 @@ private:
                 break;
             case ChannelIntent::FocusHealing:
                 order.Operation = PlayerbotBridge::Intent::FocusHealing;
+                break;
+            case ChannelIntent::GoTo:  // WT18b: the goal verbs; the planner checks the place, quest or spot.
+                order.Operation = PlayerbotBridge::Intent::GoTo;
+                order.PlaceName = effect->place;
+                break;
+            case ChannelIntent::Quest:
+                order.Operation = PlayerbotBridge::Intent::Quest;
+                order.QuestId = effect->questId;
+                break;
+            case ChannelIntent::Errands:
+                order.Operation = PlayerbotBridge::Intent::Errands;
+                break;
+            case ChannelIntent::SetHearth:
+                order.Operation = PlayerbotBridge::Intent::SetHearth;
+                break;
+            case ChannelIntent::GrindHere:
+                order.Operation = PlayerbotBridge::Intent::GrindHere;
+                break;
+            case ChannelIntent::GatherHere:
+                order.Operation = PlayerbotBridge::Intent::GatherHere;
+                break;
+            case ChannelIntent::MeetAt:
+                order.Operation = PlayerbotBridge::Intent::MeetAt;
+                order.PlaceName = effect->place;
+                break;
+            case ChannelIntent::PausePlan:
+                order.Operation = PlayerbotBridge::Intent::PausePlan;
+                break;
+            case ChannelIntent::ResumePlan:
+                order.Operation = PlayerbotBridge::Intent::ResumePlan;
                 break;
             default:
                 why = CommandRefusal::NotSupported;

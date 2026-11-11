@@ -92,6 +92,17 @@ bool Text(std::string const& text, std::size_t max)
            std::any_of(text.begin(), text.end(), [](unsigned char c) { return c > ' '; });
 }
 
+// WT18b: a place name (route query, go_to, meet_at): text of 1..64 bytes, not blank, no control characters (the
+// parser already refused invalid UTF-8). It is a value the planner looks up, never command syntax.
+std::string Place(Json const& value)
+{
+    auto const text = String(value);
+    if (!Text(text, ChannelMaxPlaceName) ||
+        std::any_of(text.begin(), text.end(), [](unsigned char c) { return c < 0x20 || c == 0x7F; }))
+        throw std::runtime_error("invalid");
+    return text;
+}
+
 // J5e: a standing follow/stay shape (any params) is refused with its own reason, still invalid_input on the wire.
 struct StandingShape : std::runtime_error
 {
@@ -123,7 +134,16 @@ ChannelCommand Command(Json const& body)
                                                                  {"save_mana", ChannelIntent::SaveMana},
                                                                  {"formation", ChannelIntent::Formation},
                                                                  {"position", ChannelIntent::Position},
-                                                                 {"dungeon_clear", ChannelIntent::DungeonClear}};
+                                                                 {"dungeon_clear", ChannelIntent::DungeonClear},
+                                                                 {"go_to", ChannelIntent::GoTo},
+                                                                 {"quest", ChannelIntent::Quest},
+                                                                 {"errands", ChannelIntent::Errands},
+                                                                 {"set_hearth", ChannelIntent::SetHearth},
+                                                                 {"grind_here", ChannelIntent::GrindHere},
+                                                                 {"gather_here", ChannelIntent::GatherHere},
+                                                                 {"meet_at", ChannelIntent::MeetAt},
+                                                                 {"pause_plan", ChannelIntent::PausePlan},
+                                                                 {"resume_plan", ChannelIntent::ResumePlan}};
     auto const found =
         std::find_if(std::begin(intents), std::end(intents), [&](auto const& entry) { return intent == entry.first; });
     if (found == std::end(intents))
@@ -144,8 +164,25 @@ ChannelCommand Command(Json const& body)
         case ChannelIntent::Flee:
         case ChannelIntent::Regroup:
         case ChannelIntent::AttackOwnTarget:
+        case ChannelIntent::Errands:
+        case ChannelIntent::SetHearth:
+        case ChannelIntent::GrindHere:
+        case ChannelIntent::GatherHere:
+        case ChannelIntent::PausePlan:
+        case ChannelIntent::ResumePlan:
             if (!Exact(params, {}))
                 throw std::runtime_error("invalid");
+            break;
+        case ChannelIntent::GoTo:  // WT18b: the planner looks the place up and refuses an unknown one.
+        case ChannelIntent::MeetAt:
+            if (!Exact(params, {"place"}))
+                throw std::runtime_error("invalid");
+            command.params = ChannelPlace{Place(params.at("place"))};
+            break;
+        case ChannelIntent::Quest:  // WT18b: a quest id; zero is refused by ValidIntentParams.
+            if (!Exact(params, {"questId"}))
+                throw std::runtime_error("invalid");
+            command.params = ChannelQuestId{static_cast<uint32_t>(Integer(params.at("questId"), UINT32_MAX))};
             break;
         case ChannelIntent::Pull:
         case ChannelIntent::FocusHealing:
@@ -260,6 +297,18 @@ std::string TopicText(std::string const& text, std::size_t max)
     return Text(result, max) ? result : std::string();
 }
 
+// WT18b: a planner topic's row word, as StateTopicRow names it.
+bool PlannerRow(StateTopic topic, std::string const& kind)
+{
+    for (uint8_t code = 0; code < 8; ++code)
+    {
+        std::string const word = StateTopicRow(topic, code);
+        if (!word.empty() && word == kind)
+            return true;
+    }
+    return false;
+}
+
 // Gameplay strategies the bot can talk about; every other playerbots strategy name is dropped.
 bool StrategyAllowed(std::string const& name)
 {
@@ -359,6 +408,19 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
         case StateTopic::Spells:
             value = {{"name", name}, {"rank", std::clamp<int64_t>(entry.first, 0, 99)}};
             return true;
+        case StateTopic::Plan:  // WT18b: one shape for the planner's topics; the row word says what a row is.
+        case StateTopic::Options:
+        case StateTopic::Route:
+        case StateTopic::QuestPlan:
+        case StateTopic::Bags:
+        case StateTopic::Places:
+            if (!PlannerRow(topic, entry.kind))
+                return false;
+            value = {{"row", entry.kind},
+                     {"name", name},
+                     {"value", std::clamp<int64_t>(entry.first, 0, UINT32_MAX)},
+                     {"extra", std::clamp<int64_t>(entry.second, 0, UINT32_MAX)}};
+            return true;
     }
     return false;
 }
@@ -378,6 +440,51 @@ char const* StateTopicName(StateTopic topic)
             return "strategies";
         case StateTopic::Spells:
             return "spells";
+        case StateTopic::Plan:
+            return "plan";
+        case StateTopic::Options:
+            return "options";
+        case StateTopic::Route:
+            return "route";
+        case StateTopic::QuestPlan:
+            return "quest_plan";
+        case StateTopic::Bags:
+            return "bags";
+        case StateTopic::Places:
+            return "places";
+    }
+    return "";
+}
+
+char const* StateTopicRow(StateTopic topic, uint8_t code)
+{
+    static constexpr char const* plan[] = {"goal", "source", "reason", "stop"};
+    static constexpr char const* options[] = {"option", "current"};
+    static constexpr char const* route[] = {"total", "leg", "failed"};
+    static constexpr char const* questPlan[] = {"take", "task", "turn_in", "carried", "deferred"};
+    static constexpr char const* bags[] = {"free", "sell", "bag"};
+    static constexpr char const* places[] = {"hearth", "flight_here", "flight_elsewhere"};
+    auto const pick = [code](auto const& words) -> char const* { return code < std::size(words) ? words[code] : ""; };
+    switch (topic)
+    {
+        case StateTopic::Plan:
+            return pick(plan);
+        case StateTopic::Options:
+            return pick(options);
+        case StateTopic::Route:
+            return pick(route);
+        case StateTopic::QuestPlan:
+            return pick(questPlan);
+        case StateTopic::Bags:
+            return pick(bags);
+        case StateTopic::Places:
+            return pick(places);
+        case StateTopic::Inventory:
+        case StateTopic::Quests:
+        case StateTopic::Cooldowns:
+        case StateTopic::Strategies:
+        case StateTopic::Spells:
+            break;
     }
     return "";
 }
@@ -396,6 +503,18 @@ std::size_t StateTopicLimit(StateTopic topic)
             return 40;
         case StateTopic::Spells:
             return 40;
+        case StateTopic::Plan:  // WT18b: the limits playerbots' topic readers keep.
+            return 8;
+        case StateTopic::Options:
+            return 5;
+        case StateTopic::Route:
+            return 12;
+        case StateTopic::QuestPlan:
+            return 12;
+        case StateTopic::Bags:
+            return 6;
+        case StateTopic::Places:
+            return 24;
     }
     return 0;
 }
@@ -647,11 +766,18 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
             ChannelQuery query;
             if (kind == "bot_state")
             {
-                // J5f-b: one topic of the bot's own state; an unknown topic is invalid_input.
-                if (!Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
-                                  "controllerGuid", "botGuid", "query", "topic"}) ||
-                    !ParseTopic(String(json.at("topic")), query.topic))
+                // J5f-b: one topic of the bot's own state; an unknown topic is invalid_input. WT18b: route, and
+                // only route, names the place it goes to.
+                if (!ParseTopic(String(json.at("topic")), query.topic))
                     return ChannelError::Invalid;
+                if (query.topic != StateTopic::Route
+                        ? !Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs",
+                                        "type", "controllerGuid", "botGuid", "query", "topic"})
+                        : !Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs",
+                                        "type", "controllerGuid", "botGuid", "query", "topic", "place"}))
+                    return ChannelError::Invalid;
+                if (query.topic == StateTopic::Route)
+                    query.place = Place(json.at("place"));
                 query.kind = QueryKind::BotState;
             }
             else if (kind != "observable_group" ||

@@ -1195,17 +1195,30 @@ void BridgeBotStateFacts(Player* bot, Player* partner, OllamaBridge::BotState& s
 
 static_assert(static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Spells) ==
                   static_cast<uint8_t>(OllamaBridge::StateTopic::Spells) &&
-              OllamaBridge::StateTopicCount == 5);
+              static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Plan) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::Plan) &&
+              static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Options) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::Options) &&
+              static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Route) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::Route) &&
+              static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::QuestPlan) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::QuestPlan) &&
+              static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Bags) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::Bags) &&
+              static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Places) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::Places) &&
+              OllamaBridge::StateTopicCount == 11);
 
 // J5f-b: one topic of the bot's own state for a bot_state query, read by playerbots on world (WorldChannel::Update,
-// map threads idle) and copied as raw entries; the channel filters, bounds and names them.
-bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic,
+// map threads idle) and copied as raw entries; the channel filters, bounds and names them. WT18b: place is the route
+// topic's argument (a value from the staged query).
+bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic, std::string const& place,
                          std::vector<OllamaBridge::StateEntry>& entries)
 {
     entries.clear();
     std::vector<PlayerbotBridge::BotStateItem> items;
     if (!PlayerbotBridge::ReadBotStateTopic(ObjectGuid(botGuid), static_cast<PlayerbotBridge::BotStateTopic>(topic),
-                                            items))
+                                            place, items))
         return false;
     for (auto& item : items)
     {
@@ -1216,6 +1229,8 @@ bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic,
             entry.kind = item.code == 1 ? "complete" : item.code == 2 ? "failed" : "active";
         else if (topic == OllamaBridge::StateTopic::Strategies)
             entry.kind = item.code ? "combat" : "non_combat";
+        else
+            entry.kind = OllamaBridge::StateTopicRow(topic, item.code);  // WT18b: empty for cooldowns and spells.
         entries.push_back(std::move(entry));
     }
     return true;
@@ -1373,10 +1388,10 @@ public:
         return targetGuid != 0;
     }
 
-    bool ReadTopic(OllamaBridge::WorldTicket const& ticket, OllamaBridge::StateTopic topic,
+    bool ReadTopic(OllamaBridge::WorldTicket const& ticket, OllamaBridge::StateTopic topic, std::string const& place,
                    std::vector<OllamaBridge::StateEntry>& entries) override
     {
-        return BridgeBotStateTopic(ticket.scope.botGuid, topic, entries);
+        return BridgeBotStateTopic(ticket.scope.botGuid, topic, place, entries);
     }
 
     bool ReadWatch(uint64_t botGuid, uint64_t partnerGuid, OllamaBridge::WatchFacts& facts) override

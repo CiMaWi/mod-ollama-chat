@@ -106,7 +106,16 @@ void Mapping()
         {"position", ChannelIntent::Position, {{"x", 17.25}, {"y", -36.5}, {"z", 7}, {"mapId", 571}}},
         {"dungeon_clear", ChannelIntent::DungeonClear, {{"mode", "on"}}},
         {"dungeon_clear", ChannelIntent::DungeonClear, {{"mode", "off"}}},
-        {"dungeon_clear", ChannelIntent::DungeonClear, {{"mode", "pause"}}}};
+        {"dungeon_clear", ChannelIntent::DungeonClear, {{"mode", "pause"}}},
+        {"go_to", ChannelIntent::GoTo, {{"place", "Goldshire"}}},
+        {"quest", ChannelIntent::Quest, {{"questId", 4294967295ULL}}},
+        {"errands", ChannelIntent::Errands, empty},
+        {"set_hearth", ChannelIntent::SetHearth, empty},
+        {"grind_here", ChannelIntent::GrindHere, empty},
+        {"gather_here", ChannelIntent::GatherHere, empty},
+        {"meet_at", ChannelIntent::MeetAt, {{"place", "Lion's Pride Inn"}}},
+        {"pause_plan", ChannelIntent::PausePlan, empty},
+        {"resume_plan", ChannelIntent::ResumePlan, empty}};
     Fixture fixture;
     unsigned id = 0;
     for (auto const& example : examples)
@@ -121,7 +130,21 @@ void Mapping()
             case ChannelIntent::Stay:
             case ChannelIntent::Flee:
             case ChannelIntent::Regroup:
+            case ChannelIntent::Errands:
+            case ChannelIntent::SetHearth:
+            case ChannelIntent::GrindHere:
+            case ChannelIntent::GatherHere:
+            case ChannelIntent::PausePlan:
+            case ChannelIntent::ResumePlan:
                 Check(std::holds_alternative<std::monostate>(order->params), "zero arguments");
+                break;
+            case ChannelIntent::GoTo:
+            case ChannelIntent::MeetAt:
+                Check(std::get<ChannelPlace>(order->params).name == example.params.at("place").get<std::string>(),
+                      "exact place name");
+                break;
+            case ChannelIntent::Quest:
+                Check(std::get<ChannelQuestId>(order->params).id == 4294967295U, "exact quest id");
                 break;
             case ChannelIntent::AttackOwnTarget:
             case ChannelIntent::Pull:
@@ -198,6 +221,30 @@ void WireRefusals()
     invalid(fixture.Wire("dungeon_clear", {{"mode", "on\nstay"}}));
     invalid(fixture.Wire("save_mana", {{"enabled", 1}}));
     invalid(fixture.Wire("save_mana", {{"enabled", "true"}}));
+    // WT18b: a goal verb takes exactly its own field; a place is text of 1..64 bytes, a quest id a nonzero uint32.
+    for (char const* verb : {"go_to", "meet_at"})
+    {
+        for (Json const& place : {Json(""), Json(std::string(65, 'p')), Json("   "), Json("Gold\nshire"),
+                                  Json("Gold\tshire"), Json(std::string("Gold\x7Fshire")), Json(12), Json::array()})
+            invalid(fixture.Wire(verb, {{"place", place}}));
+        invalid(fixture.Wire(verb, empty));
+        invalid(fixture.Wire(verb, {{"questId", 12}}));
+        invalid(fixture.Wire(verb, {{"place", "Goldshire"}, {"questId", 12}}));
+        invalid(fixture.Wire(verb, {{"name", "Goldshire"}}));
+    }
+    for (Json const& quest : {Json(0), Json(-1), Json(4294967296ULL), Json(12.0), Json("12")})
+        invalid(fixture.Wire("quest", {{"questId", quest}}));
+    invalid(fixture.Wire("quest", empty));
+    invalid(fixture.Wire("quest", {{"place", "Goldshire"}}));
+    invalid(fixture.Wire("quest", {{"questId", 12}, {"place", "Goldshire"}}));
+    for (char const* verb : {"errands", "set_hearth", "grind_here", "gather_here", "pause_plan", "resume_plan"})
+    {
+        invalid(fixture.Wire(verb, {{"place", "Goldshire"}}));
+        invalid(fixture.Wire(verb, {{"questId", 12}}));
+        invalid(fixture.Wire(verb, Json::array()));
+    }
+    for (char const* verb : {"Go_to", "goto", "go to", "quest ", "set_hearth;stay", "pause", "resume"})
+        invalid(fixture.Wire(verb, empty));
     for (Json const& map : {Json(-1), Json(4294967296ULL), Json(1.5), Json("571")})
         invalid(fixture.Wire("position", {{"x", 1}, {"y", 2}, {"z", 3}, {"mapId", map}}));
     invalid(fixture.Wire("position", {{"x", "1"}, {"y", 2}, {"z", 3}, {"mapId", 571}}));
@@ -306,6 +353,26 @@ void TypedRefusals()
     invalid(ChannelIntent::SaveMana, {});
     invalid(ChannelIntent::Formation, static_cast<ChannelShape>(255));
     invalid(ChannelIntent::DungeonClear, static_cast<ChannelMode>(255));
+    invalid(ChannelIntent::GoTo, {});
+    invalid(ChannelIntent::GoTo, ChannelPlace{});
+    invalid(ChannelIntent::GoTo, ChannelPlace{std::string(65, 'p')});
+    invalid(ChannelIntent::GoTo, ChannelQuestId{12});
+    invalid(ChannelIntent::MeetAt, ChannelPlace{});
+    invalid(ChannelIntent::MeetAt, ChannelPlace{std::string(65, 'p')});
+    invalid(ChannelIntent::MeetAt, ChannelQuestId{12});
+    invalid(ChannelIntent::Quest, ChannelQuestId{0});
+    invalid(ChannelIntent::Quest, ChannelPlace{"Goldshire"});
+    invalid(ChannelIntent::Quest, {});
+    for (auto const verb : {ChannelIntent::Errands, ChannelIntent::SetHearth, ChannelIntent::GrindHere,
+                            ChannelIntent::GatherHere, ChannelIntent::PausePlan, ChannelIntent::ResumePlan})
+    {
+        invalid(verb, ChannelPlace{"Goldshire"});
+        invalid(verb, ChannelQuestId{12});
+    }
+    Check(ValidIntentParams(ChannelIntent::GoTo, ChannelPlace{std::string(64, 'p')}) &&
+              ValidIntentParams(ChannelIntent::MeetAt, ChannelPlace{"p"}) &&
+              ValidIntentParams(ChannelIntent::Quest, ChannelQuestId{1}),
+          "WT18b: a place of 1..64 bytes and a nonzero quest id are valid");
     for (double value : {std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
                          std::numeric_limits<double>::quiet_NaN()})
     {
@@ -337,7 +404,16 @@ void PartnerRules()
                           {"flee", empty, false, false},
                           {"attack_own_target", empty, false, false},
                           {"pull", {{"targetGuid", guid}}, false, false},
-                          {"position", {{"x", 17.25}, {"y", -36.5}, {"z", 7}, {"mapId", 571}}, false, false}};
+                          {"position", {{"x", 17.25}, {"y", -36.5}, {"z", 7}, {"mapId", 571}}, false, false},
+                          {"go_to", {{"place", "Goldshire"}}, false, false},
+                          {"quest", {{"questId", 12}}, false, false},
+                          {"errands", empty, false, false},
+                          {"set_hearth", empty, false, false},
+                          {"grind_here", empty, false, false},
+                          {"gather_here", empty, false, false},
+                          {"meet_at", {{"place", "Goldshire"}}, false, false},
+                          {"pause_plan", empty, false, false},
+                          {"resume_plan", empty, false, false}};
     auto const outcome = [](ChannelCommand const& command,
                             IntentContext const& current) -> std::optional<CommandRefusal>
     {
@@ -376,7 +452,7 @@ void PartnerRules()
 void RefusalWords()
 {
     std::set<std::string> codes;
-    for (unsigned value = 1; value <= static_cast<unsigned>(CommandRefusal::Failed); ++value)
+    for (unsigned value = 1; value <= static_cast<unsigned>(CommandRefusal::AlreadyThere); ++value)
     {
         auto const words = DescribeRefusal(static_cast<CommandRefusal>(value));
         std::string const code = words.code;
@@ -406,6 +482,17 @@ void RefusalWords()
           "travelling sentence");
     Check(said(CommandRefusal::NotWithYou, "not_with_you", "We are not travelling together."), "not_with_you sentence");
     Check(said(CommandRefusal::TooFar, "too_far", "You are too far away for me to reach."), "too_far sentence");
+    // WT18b: the planner's refusals of a goal verb.
+    Check(said(CommandRefusal::NotPlanner, "not_planner", "My own plans are not mine to change right now."),
+          "not_planner sentence");
+    Check(said(CommandRefusal::GoalHeld, "goal_held", "My group has a goal I am holding to."), "goal_held sentence");
+    Check(said(CommandRefusal::UnknownPlace, "unknown_place", "I do not know that place."), "unknown_place sentence");
+    Check(said(CommandRefusal::NoRoute, "no_route", "I cannot find a way there."), "no_route sentence");
+    Check(said(CommandRefusal::NoSuchQuest, "no_such_quest", "That quest is not in my log."), "no_such_quest sentence");
+    Check(said(CommandRefusal::NothingHere, "nothing_here", "There is nothing for me to do here."),
+          "nothing_here sentence");
+    Check(said(CommandRefusal::AlreadyThere, "already_there", "I am already there."), "already_there sentence");
+    Check(said(CommandRefusal::Failed, "failed", "I tried, but it did not work."), "failed sentence");
 }
 
 void StagedCommandCurrentness()

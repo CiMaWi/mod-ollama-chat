@@ -78,12 +78,20 @@ enum class StateTopic : uint8_t
     Quests,
     Cooldowns,
     Strategies,
-    Spells
+    Spells,
+    Plan,  // WT18b: the planner's topics (append only; the wire index).
+    Options,
+    Route,
+    QuestPlan,
+    Bags,
+    Places
 };
-constexpr std::size_t StateTopicCount = 5;
+constexpr std::size_t StateTopicCount = 11;
 
 char const* StateTopicName(StateTopic topic);
 std::size_t StateTopicLimit(StateTopic topic);  // Most entries a topic result carries.
+// WT18b: the row word of a planner topic's raw code ("" for an unknown code or an older topic).
+char const* StateTopicRow(StateTopic topic, uint8_t code);
 
 // One raw entry of a bot_state topic, as the game read it; FinishTopic filters, bounds and names the keys.
 //   inventory:  name, kind "equipped"/"bag", first = item quality 0..7, second = stack count
@@ -91,6 +99,8 @@ std::size_t StateTopicLimit(StateTopic topic);  // Most entries a topic result c
 //   cooldowns:  name, first = seconds left
 //   strategies: name (whitelisted), kind "combat"/"non_combat"
 //   spells:     name, first = rank (0 = none)
+//   plan, options, route, quest_plan, bags, places (WT18b): kind = the row word (StateTopicRow), name (words, or a
+//               quest title or bind area), first = value, second = extra (0..4294967295 each)
 struct StateEntry
 {
     std::string name;
@@ -105,6 +115,7 @@ struct ChannelQuery
     uint64_t botGuid = 0;
     QueryKind kind = QueryKind::ObservableGroup;
     StateTopic topic = StateTopic::Inventory;  // Only for QueryKind::BotState.
+    std::string place;                         // WT18b: route only, the place the route goes to.
 };
 struct ChannelText
 {

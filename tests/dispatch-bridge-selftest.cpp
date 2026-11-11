@@ -319,7 +319,8 @@ void BridgeBotStateFacts(Player*, Player*, OllamaBridge::BotState& state)
     state.zone = "MARKERZONE";
 }
 // J5f-b: the topic reader (playerbots, outside the extract); not exercised here.
-bool BridgeBotStateTopic(uint64_t, OllamaBridge::StateTopic, std::vector<OllamaBridge::StateEntry>& entries)
+bool BridgeBotStateTopic(uint64_t, OllamaBridge::StateTopic, std::string const&,
+                         std::vector<OllamaBridge::StateEntry>& entries)
 {
     entries.clear();
     return false;

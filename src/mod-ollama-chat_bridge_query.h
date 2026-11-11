@@ -25,8 +25,9 @@ public:
     virtual bool ResolveVisible(WorldTicket const& ticket, uint64_t guid, VisibleUnit& unit) = 0;
     virtual bool ReadMark(WorldTicket const& ticket, uint8_t icon, uint64_t& targetGuid) = 0;
     // J5f-b: one bot_state topic of the ticket's own bot, raw (FinishTopic filters and bounds it); false when the
-    // bot cannot be read. Never another unit's state.
-    virtual bool ReadTopic(WorldTicket const& /*ticket*/, StateTopic /*topic*/, std::vector<StateEntry>& entries)
+    // bot cannot be read. Never another unit's state. WT18b: place is the route topic's place ("" for the others).
+    virtual bool ReadTopic(WorldTicket const& /*ticket*/, StateTopic /*topic*/, std::string const& /*place*/,
+                           std::vector<StateEntry>& entries)
     {
         entries.clear();
         return false;
