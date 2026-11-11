@@ -22,13 +22,13 @@ work replies must preserve the original wall deadline exactly. Wall-clock rollba
 
 | Type | Additional exact fields | Owner/direction |
 | --- | --- | --- |
-| query | controllerGuid, botGuid, query:"observable_group", or query:"bot_state" with topic (route: and place) | Authenticated native to game |
+| query | controllerGuid, botGuid, query:"observable_group" or "catalogue", or query:"bot_state" with topic (route: and place) | Authenticated native to game |
 | command | commandId, issuerGuid, botGuid, intent, params | Authenticated native to game; staged typed proposal |
 | generation.result | text (1..4096 bytes, usable text, no NUL) | Authenticated native to game |
 | events.result | none | Authenticated native to game |
 | failure | code: unavailable/timeout/invalid_input/cancelled | Authenticated native to game, or game FinishFailure; terminal |
 | events | controllerGuid, botGuid, events | Game-created by OpenEvents |
-| query.result | units | Game-created by FinishQuery |
+| query.result | units; a catalogue query: catalogue | Game-created by FinishQuery, FinishCatalogue |
 | command.result | commandId, outcome: applied/rejected/failed | Game-created by FinishCommand |
 
 Generation encoding remains the existing J4 builder; `OpenGeneration` registers its exact game-owned id/scope/deadline
@@ -64,6 +64,25 @@ already_there. A bot_state query names one topic; route, and only route, also na
 world thread hands to playerbots' topic reader as a value. The planner topics (plan, options, route, quest_plan, bags,
 places) share one entry shape: row (a fixed word per topic, from `StateTopicRow`), name, value and extra.
 Retirement selects no new epoch until every retired plan is restored or dropped.
+
+LC3: the verbs and the topic words are playerbots' (`PlayerbotBridge::IntentWord`/`FindIntent` and `TopicRows`).
+The game adapter hands them to the channel once, on the world thread at startup (`OllamaDispatch_Start` calls
+`OllamaChat_BridgeInstallAbilities`), as a plain-data `AbilityIndex`: the catalogue rows, the 22 verbs and the
+hash. The module keeps no word list of its own; the 22 verbs and 11 topic words of the old wire are unchanged.
+A new topic still needs its `StateTopic` value and entry shape here (playerbots' `.agents/docs/ai-engine.md`).
+The install is fail-closed. An index whose verbs, row names, act/verb pairs or topic codes disagree, text that is
+not UTF-8, or a catalogue over 24576 encoded bytes installs nothing, and the module then takes no command and no
+bot_state query; the log says `Bridge ability catalogue refused` (error), otherwise `Bridge ability catalogue:
+N rows, hash H, B bytes.` (info). A `catalogue` query carries observable_group's exact keys and is route-bound
+like every query. Its result is the envelope plus `catalogue`: `hash` (FNV-1a 64 of playerbots' `CatalogueText`
+as 16 lowercase hex digits, compared as a string, never recomputed), `version` (the catalogue format, 1),
+`abilities` (what this module takes beyond the old wire, `["catalogue"]` today; not hashed), `maxSteps` and
+`rows`. Each row has kind (act or topic), name, sentence, params (name, kind, sentence, choices), refusals (word,
+sentence), effect, done, state, event and limit. The answer is built once at install and stays under 24 KB of
+the 32768-byte response limit (selftested; 15187 bytes for the 29 rows of LC3); a later step pages it when the
+rows outgrow that. Without an installed index the query fails `unavailable`; a module older than LC3 answers it
+`invalid_input`. An order that names a unit or quest the bot cannot find is refused `unknown_name` ("I do not know
+what you mean by that.").
 
 The single world owner calls `Bind` only AFTER the existing activation owner has selected a fresh epoch and proved
 actual old-work drain and strategy restoration. Bind itself proves neither. Every bind retires the prior helper

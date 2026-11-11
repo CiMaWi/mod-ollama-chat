@@ -1019,6 +1019,7 @@ void ResultMapping()
                               {PlayerbotBridge::Refusal::NoSuchQuest, CommandRefusal::NoSuchQuest},
                               {PlayerbotBridge::Refusal::NothingHere, CommandRefusal::NothingHere},
                               {PlayerbotBridge::Refusal::AlreadyThere, CommandRefusal::AlreadyThere},
+                              {PlayerbotBridge::Refusal::UnknownName, CommandRefusal::UnknownName},
                               {static_cast<PlayerbotBridge::Refusal>(99), CommandRefusal::None}};
     for (Reason const& reason : reasons)
     {

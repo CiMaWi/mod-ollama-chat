@@ -165,6 +165,8 @@ private:
                 return CommandRefusal::NothingHere;
             case PlayerbotBridge::Refusal::AlreadyThere:
                 return CommandRefusal::AlreadyThere;
+            case PlayerbotBridge::Refusal::UnknownName:
+                return CommandRefusal::UnknownName;
             case PlayerbotBridge::Refusal::None:
                 break;
         }

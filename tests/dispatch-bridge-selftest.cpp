@@ -362,6 +362,7 @@ bool Observe(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard& guar
 
 #include "dispatch-helpers.inc"
 #include "handler-bridge.inc"
+#include "bridge-ability-double.h"
 
 namespace
 {
@@ -1730,6 +1731,11 @@ void WakeTests()
 
 int main()
 {
+    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    {
+        std::cerr << "FAIL: the ability double was refused\n";
+        return 1;
+    }
     try
     {
         GuardTests();

@@ -69,7 +69,8 @@ enum class ChannelOutcome : uint8_t
 enum class QueryKind : uint8_t
 {
     ObservableGroup,
-    BotState  // DS.14 (d), J5f-b: one topic of the bot's own state.
+    BotState,  // DS.14 (d), J5f-b: one topic of the bot's own state.
+    Catalogue  // LC3: the ability catalogue; plain data, it names no unit.
 };
 
 enum class StateTopic : uint8_t
@@ -92,6 +93,78 @@ char const* StateTopicName(StateTopic topic);
 std::size_t StateTopicLimit(StateTopic topic);  // Most entries a topic result carries.
 // WT18b: the row word of a planner topic's raw code ("" for an unknown code or an older topic).
 char const* StateTopicRow(StateTopic topic, uint8_t code);
+
+// LC3: the ability catalogue as plain data, mod-playerbots' one table of acts and topics (PlayerbotBridge::Catalogue)
+// with its hash. The game adapter installs it once on the world thread before the channel takes requests; a selftest
+// installs a double. Commands and bot_state queries read their verbs and topic names from it and query: catalogue
+// answers with it, so the channel keeps no word list of its own.
+enum class AbilityField : uint8_t  // PlayerbotBridge::OrderField: the order field an act's parameter fills.
+{
+    Target,
+    Icon,
+    PlaceName,
+    Position,
+    QuestId,
+    Shape,
+    Enabled
+};
+
+struct AbilityParam
+{
+    std::string name;
+    std::string kind;  // unit, place, item, spell, quest, choice or flag
+    std::string sentence;
+    std::vector<std::string> choices;
+    AbilityField field = AbilityField::Target;  // An act's; a topic's argument leaves it unread.
+};
+
+struct AbilityRefusal
+{
+    std::string word;
+    std::string sentence;
+};
+
+// One catalogue row, its parts in PlayerbotBridge::AbilityData's order.
+struct AbilityRow
+{
+    bool topic = false;
+    uint8_t code = 0;  // An act's ChannelIntent, a topic's StateTopic.
+    std::string name;
+    std::string sentence;
+    std::vector<AbilityParam> params;
+    std::vector<AbilityRefusal> refusals;
+    std::string effect;  // The word of the lasting part the act changes.
+    std::string done;    // The word of when it is done.
+    std::string state;
+    std::string event;
+    std::size_t limit = 0;
+};
+
+// A verb of the old command form: every ChannelIntent's word, the acts' and those of the four without a row.
+struct AbilityVerb
+{
+    std::string name;
+    ChannelIntent intent = ChannelIntent::Stay;
+};
+
+struct AbilityIndex
+{
+    uint64_t hash = 0;             // The catalogue text's FNV-1a 64; the wire sends it as 16 lowercase hex digits.
+    uint32_t version = 0;          // The catalogue text's format.
+    std::size_t maxSteps = 0;      // The most steps one order takes.
+    std::vector<AbilityRow> rows;  // The acts, then the topics, in the table's order.
+    std::vector<AbilityVerb> verbs;
+};
+
+// The bytes the encoded catalogue may take; the bridge reads it whole (MaxResponseBytes is the transport's bound).
+constexpr std::size_t ChannelMaxCatalogueBytes = 24576;
+
+// Installs the index and returns the bytes its catalogue encodes to (0 when refused before encoding). An index with a
+// missing, duplicate or unknown verb, topic or row, text that is not UTF-8, or a catalogue over
+// ChannelMaxCatalogueBytes is refused: the channel then holds an empty index (every verb and topic unknown, no
+// catalogue). World thread only, once at startup.
+std::size_t SetAbilityIndex(AbilityIndex index);
+AbilityIndex const& Abilities();
 
 // One raw entry of a bot_state topic, as the game read it; FinishTopic filters, bounds and names the keys.
 //   inventory:  name, kind "equipped"/"bag", first = item quality 0..7, second = stack count
@@ -178,6 +251,9 @@ public:
     // J5f-b: a bot_state result (`topic`, `entries`); a query id still never authorizes a command.
     ChannelError FinishTopic(ChannelEnvelope const& envelope, WorldScope const& current, StateTopic topic,
                              std::vector<StateEntry> const& entries, Clock now, std::string& body);
+    // LC3: a catalogue result (`catalogue`: hash, version, abilities, maxSteps, rows), the installed index's.
+    ChannelError FinishCatalogue(ChannelEnvelope const& envelope, WorldScope const& current, Clock now,
+                                 std::string& body);
     ChannelError FinishFailure(ChannelEnvelope const& envelope, ChannelFailure failure, WorldScope const& current,
                                Clock now, std::string& body);
     // J5e: a rejected or failed outcome carries `reason` and `reasonText` (None words as cannot_now or failed).

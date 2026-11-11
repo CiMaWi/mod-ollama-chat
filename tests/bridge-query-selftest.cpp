@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
+#include "bridge-ability-double.h"
 #include "mod-ollama-chat_bridge_query.h"
 
 // The production phase holds the post-map-join token (game headers); the channel only asks whether one is given.
@@ -437,6 +438,44 @@ void TopicPublication()
     Check(!packet && f.source.topicReads == 3, "a stale route reads nothing and publishes nothing");
 }
 
+// LC3: a catalogue query on the real channel answers the installed index on the world update and reads no unit;
+// without an index it answers unavailable.
+void CataloguePublication()
+{
+    Fixture f;
+    WorldChannel channel{f.world, [&f](WorldTicket const& ticket, DispatchGuard& guard)
+                         { return f.source.Observe(ticket, guard); }, [&f] { return f.now; }, &f.source};
+    channel.Configure(true);
+    Check(channel.Activate() && channel.Register(f.ticket, f.source.guard), "catalogue channel route");
+    auto const ask = [&](std::string const& id)
+    {
+        Json wire = {{"version", 1},    {"instance", "fixture"},    {"provider", "codex"}, {"epoch", "epoch-1"},
+                     {"requestId", id}, {"deadlineUnixMs", 104000}, {"type", "query"},     {"controllerGuid", "22"},
+                     {"botGuid", "11"}, {"query", "catalogue"}};
+        uint64_t receipt = 0;
+        Check(channel.Receive(f.settings.token, f.ticket.request.requestId, wire.dump(), receipt) == ChannelError::None,
+              "catalogue query received");
+        channel.Update();
+        std::unique_ptr<ChannelPacket> packet;
+        channel.Take(f.settings.token, receipt, packet);
+        return packet;
+    };
+    auto packet = ask("catalogue-1");
+    auto json = packet ? Json::parse(packet->body) : Json();
+    Check(packet && packet->error == ChannelError::None && json.at("type") == "query.result" &&
+              json.at("catalogue").at("hash") == "0a1b2c3d4e5f6071" && json.at("catalogue").at("rows").size() == 14,
+          "the installed catalogue published");
+    Check(f.source.topicReads == 0 && f.source.resolves == 0, "a catalogue reads no bot and no unit");
+    SetAbilityIndex({});
+    packet = ask("catalogue-2");
+    Check(packet && packet->error == ChannelError::None && Json::parse(packet->body).at("code") == "unavailable",
+          "without an index the catalogue is unavailable");
+    Check(InstallTestAbilities(), "the double installs again");
+    f.source.authority = false;
+    packet = ask("catalogue-3");
+    Check(!packet && f.source.topicReads == 0, "a stale route publishes no catalogue");
+}
+
 // J6e-c (DS.14 (c)): a watch on a real generation route: admitted on the world thread with the phase, from the
 // route's own binding; an armed watch counts as acting on the route (a silent answer may stand), a refused or cleared
 // one does not; epoch retirement ends it.
@@ -562,6 +601,11 @@ void WatchArming()
 
 int main()
 {
+    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    {
+        std::cerr << "FAIL: the ability double was refused\n";
+        return 1;
+    }
     try
     {
         QueryEncoding();
@@ -569,6 +613,7 @@ int main()
         Bounds();
         MarkPublication();
         TopicPublication();
+        CataloguePublication();
         WatchArming();
         std::cout << "PASS " << checks << " production filtered query/event helper checks\n";
     }

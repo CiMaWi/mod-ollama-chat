@@ -364,7 +364,17 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
                 {
                     QueryObservation capture;
                     std::vector<StateEntry> entries;
-                    if (query->kind == QueryKind::BotState)
+                    if (query->kind == QueryKind::Catalogue)
+                    {
+                        // LC3: plain data installed at startup; it names no unit, so there is no observation to
+                        // recheck (the route checks still apply). Without an index the module has no catalogue.
+                        packet->error = Abilities().rows.empty()
+                                            ? _policy.FinishFailure(message.envelope, ChannelFailure::Unavailable,
+                                                                    binding.ticket.scope, _clock(), packet->body)
+                                            : _policy.FinishCatalogue(message.envelope, binding.ticket.scope, _clock(),
+                                                                      packet->body);
+                    }
+                    else if (query->kind == QueryKind::BotState)
                     {
                         // J5f-b: the bot's own state, read now on the world thread; it names no other unit, so
                         // there is no observation to recheck before publication (the route checks still apply).

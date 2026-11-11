@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
+#include "bridge-ability-double.h"
 #include "mod-ollama-chat_bridge_world.h"
 
 namespace OllamaBridge
@@ -1016,6 +1017,11 @@ void TransportLoss()
 
 int main()
 {
+    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    {
+        std::cerr << "FAIL: the ability double was refused\n";
+        return 1;
+    }
     try
     {
         PureSeam();

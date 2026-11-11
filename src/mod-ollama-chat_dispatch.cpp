@@ -818,6 +818,7 @@ void OllamaDispatch_Start()
     if (g_nativeSelected)
         g_nativeObserver.Start();
     g_bridgeObserver = OllamaChat_BridgeObserve;
+    OllamaChat_BridgeInstallAbilities();
 
     uint32_t count = g_DispatchWorkerThreads;
     if (count == 0)

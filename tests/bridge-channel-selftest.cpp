@@ -4,6 +4,7 @@
 #include <set>
 #include <stdexcept>
 
+#include "bridge-ability-double.h"
 #include "mod-ollama-chat_bridge_channel.h"
 
 namespace
@@ -718,6 +719,174 @@ Json WatchWire(Fixture const& f, std::string const& id, Json condition = "combat
     return json;
 }
 
+// LC3: the installed ability index is the channel's only word list; query: catalogue answers with it.
+Json CatalogueQuery(Fixture const& f, std::string const& id)
+{
+    auto json = f.Query(id);
+    json["query"] = "catalogue";
+    return json;
+}
+
+void Catalogue()
+{
+    auto const bytes = SetAbilityIndex(TestAbilityIndex());
+    Check(bytes > 0 && bytes <= ChannelMaxCatalogueBytes && Abilities().rows.size() == 14 &&
+              Abilities().verbs.size() == 22,
+          "the double installs");
+    Check(ChannelMaxCatalogueBytes == 24576 && ChannelMaxCatalogueBytes + 4096 < MaxResponseBytes,
+          "the catalogue's budget leaves the transport headroom");
+
+    // A refused index leaves the channel none: no verb, no topic, no catalogue.
+    using Change = void (*)(AbilityIndex&);
+    Change const refused[] = {
+        [](AbilityIndex& index) { index.verbs.pop_back(); },
+        [](AbilityIndex& index) { index.verbs[1].name = index.verbs[0].name; },
+        [](AbilityIndex& index) { index.verbs[1].intent = ChannelIntent::Follow; },
+        [](AbilityIndex& index) { index.verbs[0].name = "Follow"; },
+        [](AbilityIndex& index) { index.verbs[0].intent = static_cast<ChannelIntent>(22); },
+        [](AbilityIndex& index) { index.verbs[3].name = "Regroup"; },
+        [](AbilityIndex& index) { index.verbs[3].intent = static_cast<ChannelIntent>(22); },
+        [](AbilityIndex& index) { index.rows[0].name = "chase"; },
+        [](AbilityIndex& index) { index.rows[1].code = static_cast<uint8_t>(ChannelIntent::Stay); },
+        [](AbilityIndex& index) { index.rows[4].name = index.rows[3].name; },
+        [](AbilityIndex& index) { index.rows[4].code = index.rows[3].code; },
+        [](AbilityIndex& index) { index.rows.back().code = static_cast<uint8_t>(StateTopicCount); },
+        [](AbilityIndex& index) { index.rows[3].name = "inventory items"; },
+        [](AbilityIndex& index) { index.rows[0].sentence = "\xC3"; },
+        [](AbilityIndex& index) { index.rows.clear(); },
+        [](AbilityIndex& index) { index.version = 0; },
+        [](AbilityIndex& index) { index.maxSteps = 0; },
+    };
+    for (Change change : refused)
+    {
+        auto index = TestAbilityIndex();
+        change(index);
+        Check(SetAbilityIndex(std::move(index)) == 0, "a malformed index is refused before it is encoded");
+        Fixture f;
+        f.Open();
+        Check(Abilities().rows.empty() && Abilities().verbs.empty() &&
+                  f.Receive(f.Command()) == ChannelError::Invalid &&
+                  f.Receive(StateQuery(f, "refused-topic", "quests")) == ChannelError::Invalid &&
+                  !*StateTopicName(StateTopic::Quests) && f.policy.CommandReservations() == 0,
+              "a refused index leaves no verb, no topic and no topic name");
+    }
+    auto large = TestAbilityIndex();
+    large.rows[0].sentence = std::string(ChannelMaxCatalogueBytes, 'x');
+    Check(SetAbilityIndex(std::move(large)) > ChannelMaxCatalogueBytes && Abilities().rows.empty(),
+          "a catalogue over its budget is refused, with its size");
+
+    // The words are the index's: a renamed verb or topic is taken under its new word only.
+    auto renamed = TestAbilityIndex();
+    renamed.verbs[1].name = "hold";
+    renamed.rows[8].name = "plans";
+    renamed.rows.erase(renamed.rows.begin() + 4);
+    Check(SetAbilityIndex(std::move(renamed)) > 0, "a renamed double installs");
+    {
+        Fixture f;
+        f.Open();
+        auto stay = f.Command("renamed");
+        Check(f.Receive(stay) == ChannelError::Invalid, "the old word is no verb once the index renames it");
+        stay["intent"] = "hold";
+        ChannelMessage result;
+        Check(f.policy.Receive(bearer, stay.dump(), f.scope, now, result, "work") == ChannelError::None &&
+                  std::get<ChannelCommand>(result.payload).intent == ChannelIntent::Stay,
+              "the index's word decodes to its intent");
+        Check(f.Receive(StateQuery(f, "old-topic", "plan")) == ChannelError::Invalid &&
+                  f.Receive(StateQuery(f, "gone-topic", "quests")) == ChannelError::Invalid &&
+                  f.Receive(StateQuery(f, "kept-topic", "inventory")) == ChannelError::None,
+              "only a topic the index lists is taken");
+        auto const plans = Topic(f, "new-topic", StateTopic::Plan, {{"rpg_travel", "goal", 1, 2}});
+        Check(plans.size() == 1 && std::string(StateTopicName(StateTopic::Plan)) == "plans",
+              "a topic is answered under the index's word");
+    }
+    Check(InstallTestAbilities(), "the double installs again");
+    {
+        Fixture f;
+        f.Open();
+        Check(f.Receive(StateQuery(f, "act-topic", "follow")) == ChannelError::Invalid, "an act is no bot_state topic");
+        auto verb = f.Command("topic-verb");
+        verb["intent"] = "inventory";
+        Check(f.Receive(verb) == ChannelError::Invalid, "a topic is no verb");
+    }
+
+    // The query: observable_group's keys, the route's own bot, an id of its own.
+    Fixture f;
+    f.Open();
+    auto extra = CatalogueQuery(f, "cat-extra");
+    extra["topic"] = "plan";
+    Check(f.Receive(extra) == ChannelError::Invalid, "catalogue takes no topic");
+    auto missing = CatalogueQuery(f, "cat-missing");
+    missing.erase("botGuid");
+    Check(f.Receive(missing) == ChannelError::Invalid, "catalogue takes the route's keys");
+    auto other = CatalogueQuery(f, "cat-other");
+    other["botGuid"] = "12";
+    Check(f.Receive(other) == ChannelError::Stale, "catalogue only for the route's own bot");
+    auto upper = CatalogueQuery(f, "cat-upper");
+    upper["query"] = "Catalogue";
+    Check(f.Receive(upper) == ChannelError::Invalid, "an unknown query stays invalid");
+    ChannelMessage message;
+    Check(f.policy.Receive(bearer, CatalogueQuery(f, "cat").dump(), f.scope, now, message, "work") ==
+                  ChannelError::None &&
+              std::get<ChannelQuery>(message.payload).kind == QueryKind::Catalogue,
+          "a catalogue query admitted, typed");
+    Check(f.Receive(CatalogueQuery(f, "cat")) == ChannelError::Duplicate, "catalogue id replay refused");
+    Check(f.Receive(f.Command("effect-catalogue", "cat")) == ChannelError::Invalid,
+          "a catalogue query id never authorizes a command");
+
+    // The answer: the installed index field for field, hash as 16 lowercase hex digits, within its budget.
+    std::string body;
+    Check(f.policy.FinishCatalogue(message.envelope, f.scope, now, body) == ChannelError::None, "catalogue answered");
+    auto const json = Json::parse(body);
+    Check(json.size() == 8 && json.at("type") == "query.result" && json.at("version") == 1 &&
+              json.at("requestId") == "cat",
+          "a query.result envelope that holds the catalogue");
+    auto const& catalogue = json.at("catalogue");
+    Check(catalogue.size() == 5 && catalogue.at("hash") == "0a1b2c3d4e5f6071" && catalogue.at("version") == 1 &&
+              catalogue.at("maxSteps") == 3 && catalogue.at("abilities") == Json::array({"catalogue"}) &&
+              catalogue.at("rows").size() == 14,
+          "hash, version, abilities, the most steps and every row");
+    Check(catalogue.at("rows").at(1) == Json::parse(R"({"kind":"act","name":"mark",
+              "sentence":"Put a raid icon on a unit you can see.",
+              "params":[{"name":"target","kind":"unit","sentence":"The unit to mark, by name.","choices":[]},
+                        {"name":"icon","kind":"choice","sentence":"The raid icon to put on it.",
+                         "choices":["star","circle","diamond","triangle","moon","square","cross","skull"]}],
+              "refusals":[{"word":"battleground","sentence":"Not here; I have my own fight to see to."},
+                          {"word":"travelling","sentence":"I cannot do that while I am in flight."},
+                          {"word":"dead","sentence":"I am in no state to do anything right now."},
+                          {"word":"not_in_group","sentence":"We are not in the same group."},
+                          {"word":"unknown_name","sentence":"I do not know what you mean by that."}],
+              "effect":"none","done":"at_once","state":"marking {target}","event":"BridgeAct","limit":0})"),
+          "an act row, field for field");
+    Check(catalogue.at("rows").at(10) == Json::parse(R"({"kind":"topic","name":"route","sentence":"Your route.",
+              "params":[{"name":"place","kind":"place","sentence":"A known place's name.","choices":[]}],
+              "refusals":[],"effect":"none","done":"at_once","state":"","event":"","limit":12})"),
+          "a topic row, field for field");
+    Check(catalogue.at("rows").at(0).at("name") == "follow" && catalogue.at("rows").at(2).at("name") == "go_to" &&
+              catalogue.at("rows").at(3).at("name") == "inventory" &&
+              catalogue.at("rows").at(13).at("name") == "places",
+          "the rows in the index's order");
+    Check(body.size() < ChannelMaxCatalogueBytes, "the answer is below its budget");
+    Check(f.policy.FinishCatalogue(message.envelope, f.scope, now, body) == ChannelError::Stale && body.empty(),
+          "a catalogue is answered once");
+    f.Open("gen-catalogue");
+    ChannelEnvelope generation{f.scope.instance, f.scope.provider, f.scope.epoch, "gen-catalogue", deadline.unixMs};
+    Check(f.policy.FinishCatalogue(generation, f.scope, now, body) == ChannelError::Stale && body.empty(),
+          "a generation route never carries a catalogue");
+
+    // Without an index the query is still admitted, and no catalogue is answered.
+    SetAbilityIndex({});
+    Fixture none;
+    none.Open();
+    ChannelMessage asked;
+    std::string empty;
+    Check(none.policy.Receive(bearer, CatalogueQuery(none, "cat-none").dump(), none.scope, now, asked, "work") ==
+                  ChannelError::None &&
+              none.policy.FinishCatalogue(asked.envelope, none.scope, now, empty) == ChannelError::Invalid &&
+              empty.empty(),
+          "no catalogue without an index");
+    Check(InstallTestAbilities(), "the double installs once more");
+}
+
 void Watches()
 {
     Fixture f;
@@ -838,6 +1007,11 @@ void Watches()
 
 int main()
 {
+    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    {
+        std::cerr << "FAIL: the ability double was refused\n";
+        return 1;
+    }
     try
     {
         IdentityAndTerminal();
@@ -846,6 +1020,7 @@ int main()
         QueriesEventsAndCapacity();
         Topics();
         Watches();
+        Catalogue();
         std::cout << "PASS " << checks << " production channel checks\n";
         return 0;
     }

@@ -115,6 +115,8 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
 // World-thread game adapter and bounded, audience-scoped conversation memory. No legacy memory is imported.
 bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard);
 OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource();
+// LC3: installs the channel's ability index from playerbots' table (world thread, once at dispatcher start).
+void OllamaChat_BridgeInstallAbilities();
 // World-only typed effect adapter (bridge_effect.cpp).
 OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor();
 // J12 lasting plans of that executor, world thread only: Open after each activation with its generation; Retire

@@ -5,6 +5,7 @@
 #include "Channel.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
+#include "BridgeAbilities.h"
 #include "BridgeBotState.h"
 #include "BridgeBotTraits.h"
 #include "mod-ollama-chat_trait_words.h"
@@ -1207,7 +1208,57 @@ static_assert(static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Spells) ==
                   static_cast<uint8_t>(OllamaBridge::StateTopic::Bags) &&
               static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Places) ==
                   static_cast<uint8_t>(OllamaBridge::StateTopic::Places) &&
-              OllamaBridge::StateTopicCount == 11);
+              OllamaBridge::StateTopicCount == PlayerbotBridge::TopicRows().size());
+
+// LC3: the channel takes an act's intent and a parameter's field as playerbots' values; each pair is one value.
+template <typename Pairs>
+constexpr bool BridgeValuesAgree(Pairs const& pairs)
+{
+    std::size_t index = 0;
+    for (auto const& [bot, wire] : pairs)
+    {
+        if (static_cast<std::size_t>(bot) != index || static_cast<std::size_t>(wire) != index)
+            return false;
+        ++index;
+    }
+    return true;
+}
+
+constexpr std::pair<PlayerbotBridge::Intent, OllamaBridge::ChannelIntent> BridgeIntentPairs[] = {
+    {PlayerbotBridge::Intent::Follow, OllamaBridge::ChannelIntent::Follow},
+    {PlayerbotBridge::Intent::Stay, OllamaBridge::ChannelIntent::Stay},
+    {PlayerbotBridge::Intent::Flee, OllamaBridge::ChannelIntent::Flee},
+    {PlayerbotBridge::Intent::Regroup, OllamaBridge::ChannelIntent::Regroup},
+    {PlayerbotBridge::Intent::AttackOwnTarget, OllamaBridge::ChannelIntent::AttackOwnTarget},
+    {PlayerbotBridge::Intent::Pull, OllamaBridge::ChannelIntent::Pull},
+    {PlayerbotBridge::Intent::Mark, OllamaBridge::ChannelIntent::Mark},
+    {PlayerbotBridge::Intent::FocusHealing, OllamaBridge::ChannelIntent::FocusHealing},
+    {PlayerbotBridge::Intent::AssignRole, OllamaBridge::ChannelIntent::AssignRole},
+    {PlayerbotBridge::Intent::SaveMana, OllamaBridge::ChannelIntent::SaveMana},
+    {PlayerbotBridge::Intent::Formation, OllamaBridge::ChannelIntent::Formation},
+    {PlayerbotBridge::Intent::Position, OllamaBridge::ChannelIntent::Position},
+    {PlayerbotBridge::Intent::DungeonClear, OllamaBridge::ChannelIntent::DungeonClear},
+    {PlayerbotBridge::Intent::GoTo, OllamaBridge::ChannelIntent::GoTo},
+    {PlayerbotBridge::Intent::Quest, OllamaBridge::ChannelIntent::Quest},
+    {PlayerbotBridge::Intent::Errands, OllamaBridge::ChannelIntent::Errands},
+    {PlayerbotBridge::Intent::SetHearth, OllamaBridge::ChannelIntent::SetHearth},
+    {PlayerbotBridge::Intent::GrindHere, OllamaBridge::ChannelIntent::GrindHere},
+    {PlayerbotBridge::Intent::GatherHere, OllamaBridge::ChannelIntent::GatherHere},
+    {PlayerbotBridge::Intent::MeetAt, OllamaBridge::ChannelIntent::MeetAt},
+    {PlayerbotBridge::Intent::PausePlan, OllamaBridge::ChannelIntent::PausePlan},
+    {PlayerbotBridge::Intent::ResumePlan, OllamaBridge::ChannelIntent::ResumePlan}};
+static_assert(BridgeValuesAgree(BridgeIntentPairs) &&
+              std::size(BridgeIntentPairs) == static_cast<std::size_t>(PlayerbotBridge::Intent::ResumePlan) + 1);
+
+constexpr std::pair<PlayerbotBridge::OrderField, OllamaBridge::AbilityField> BridgeFieldPairs[] = {
+    {PlayerbotBridge::OrderField::Target, OllamaBridge::AbilityField::Target},
+    {PlayerbotBridge::OrderField::Icon, OllamaBridge::AbilityField::Icon},
+    {PlayerbotBridge::OrderField::PlaceName, OllamaBridge::AbilityField::PlaceName},
+    {PlayerbotBridge::OrderField::Position, OllamaBridge::AbilityField::Position},
+    {PlayerbotBridge::OrderField::QuestId, OllamaBridge::AbilityField::QuestId},
+    {PlayerbotBridge::OrderField::Shape, OllamaBridge::AbilityField::Shape},
+    {PlayerbotBridge::OrderField::Enabled, OllamaBridge::AbilityField::Enabled}};
+static_assert(BridgeValuesAgree(BridgeFieldPairs));
 
 // J5f-b: one topic of the bot's own state for a bot_state query, read by playerbots on world (WorldChannel::Update,
 // map threads idle) and copied as raw entries; the channel filters, bounds and names them. WT18b: place is the route
@@ -1234,6 +1285,74 @@ bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic, std::
         entries.push_back(std::move(entry));
     }
     return true;
+}
+
+// LC3: the channel's ability index from playerbots' table: the catalogue with its hash, each row's intent or topic and
+// parameter fields, and every intent's wire word. Empty (refused by the channel) when the catalogue and the table
+// disagree.
+static OllamaBridge::AbilityIndex BridgeAbilityIndex()
+{
+    std::vector<PlayerbotBridge::AbilityData> const catalogue = PlayerbotBridge::Catalogue();
+    std::span<PlayerbotBridge::AbilityRow const> const acts = PlayerbotBridge::AbilityRows();
+    std::span<PlayerbotBridge::TopicRow const> const topics = PlayerbotBridge::TopicRows();
+    if (catalogue.size() != acts.size() + topics.size())
+        return {};
+    OllamaBridge::AbilityIndex index;
+    index.hash = PlayerbotBridge::CatalogueHash(catalogue);
+    index.version = PlayerbotBridge::CatalogueVersion;
+    index.maxSteps = PlayerbotBridge::MaxSteps;
+    for (std::size_t position = 0; position < catalogue.size(); ++position)
+    {
+        PlayerbotBridge::AbilityData const& data = catalogue[position];
+        bool const topic = position >= acts.size();
+        PlayerbotBridge::TopicRow const* const topicRow = topic ? &topics[position - acts.size()] : nullptr;
+        PlayerbotBridge::AbilityRow const* const actRow = topic ? nullptr : &acts[position];
+        std::span<PlayerbotBridge::ParamRow const> const params = topic ? topicRow->Params : actRow->Params;
+        if ((data.Kind == PlayerbotBridge::AbilityKind::Topic) != topic ||
+            data.Name != (topic ? topicRow->Name : actRow->Name) || data.Params.size() != params.size())
+            return {};
+        OllamaBridge::AbilityRow& row = index.rows.emplace_back();
+        row.topic = topic;
+        row.code = topic ? static_cast<uint8_t>(topicRow->Topic) : static_cast<uint8_t>(actRow->Operation);
+        row.name = data.Name;
+        row.sentence = data.Sentence;
+        for (std::size_t param = 0; param < params.size(); ++param)
+            row.params.push_back({data.Params[param].Name, PlayerbotBridge::KindWord(data.Params[param].Kind),
+                                  data.Params[param].Sentence, data.Params[param].Choices,
+                                  static_cast<OllamaBridge::AbilityField>(params[param].Field)});
+        for (PlayerbotBridge::RefusalData const& refusal : data.Refusals)
+            row.refusals.push_back({refusal.Word, refusal.Sentence});
+        row.effect = PlayerbotBridge::PartWord(data.Lasting);
+        row.done = PlayerbotBridge::CompletionWord(data.Done);
+        row.state = data.StatePhrase;
+        row.event = data.Event;
+        row.limit = data.Limit;
+    }
+    for (std::size_t value = 0; value < std::size(BridgeIntentPairs); ++value)
+    {
+        auto const operation = static_cast<PlayerbotBridge::Intent>(value);
+        char const* const word = PlayerbotBridge::IntentWord(operation);
+        if (PlayerbotBridge::FindIntent(word) != operation)
+            return {};
+        index.verbs.push_back({word, static_cast<OllamaBridge::ChannelIntent>(value)});
+    }
+    return index;
+}
+
+void OllamaChat_BridgeInstallAbilities()
+{
+    OllamaBridge::AbilityIndex index = BridgeAbilityIndex();
+    std::size_t const rows = index.rows.size();
+    uint64_t const hash = index.hash;
+    std::size_t const bytes = OllamaBridge::SetAbilityIndex(std::move(index));
+    if (OllamaBridge::Abilities().rows.empty())
+        LOG_ERROR("module.ollamachat",
+                  "[Ollama Chat] Bridge ability catalogue refused ({} rows, {} of {} bytes): the bridge channel takes "
+                  "no command and no bot_state query.",
+                  rows, bytes, OllamaBridge::ChannelMaxCatalogueBytes);
+    else
+        LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge ability catalogue: {} rows, hash {:016x}, {} bytes.", rows,
+                 hash, bytes);
 }
 
 // DS.14 (c), J6e-c: what a watch needs of its bot, read on world (admission in the channel's post-map-join update and

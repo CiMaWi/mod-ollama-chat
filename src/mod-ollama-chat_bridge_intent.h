@@ -212,7 +212,8 @@ enum class CommandRefusal : uint8_t
     NoRoute,
     NoSuchQuest,
     NothingHere,
-    AlreadyThere
+    AlreadyThere,
+    UnknownName  // LC3: nothing of that name the bot sees or has in its log (a named order).
 };
 
 struct CommandRefusalWords
@@ -284,6 +285,8 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
             return {"nothing_here", "There is nothing for me to do here."};
         case CommandRefusal::AlreadyThere:
             return {"already_there", "I am already there."};
+        case CommandRefusal::UnknownName:
+            return {"unknown_name", "I do not know what you mean by that."};
     }
     return {"cannot_now", "I cannot do that right now."};
 }
