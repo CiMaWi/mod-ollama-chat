@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace OllamaBridge
 {
@@ -34,6 +35,9 @@ enum class ChannelIntent : uint8_t
     PausePlan,
     ResumePlan
 };
+// LC3: the number of verbs; handler.cpp asserts it equals PlayerbotBridge::IntentCount, so a verb playerbots appends
+// fails the build until it has a value here.
+constexpr std::size_t ChannelIntentCount = static_cast<std::size_t>(ChannelIntent::ResumePlan) + 1;
 
 enum class ChannelRole : uint8_t
 {
@@ -85,13 +89,31 @@ struct ChannelQuestId  // quest: a quest in the bot's log, by id.
 using ChannelParams = std::variant<std::monostate, ChannelTarget, ChannelMark, ChannelRole, bool, ChannelShape,
                                    ChannelPosition, ChannelMode, ChannelPlace, ChannelQuestId>;
 
+// LC3: one step of a stepped command, its parameters by the catalogue's names. The act is a row of the installed
+// catalogue; a unit and a quest come as an id or a name (exactly one when the act takes it), a place as given, a
+// position as the spot "x,y,z,map" names, a choice as its index among the act's choices. playerbots checks the rest.
+struct ChannelStep
+{
+    ChannelIntent intent = ChannelIntent::Stay;
+    uint64_t targetGuid = 0;
+    std::string targetName;
+    uint32_t questId = 0;
+    std::string questName;
+    std::string place;                        // go_to, meet_at: a place's name or "x,y,z,map", as given
+    std::optional<ChannelPosition> position;  // position
+    std::optional<uint8_t> icon;              // mark
+    std::optional<uint8_t> shape;             // formation
+    std::optional<bool> enabled;              // save_mana
+};
+
 struct ChannelCommand
 {
     std::string commandId;
     uint64_t issuerGuid = 0;
     uint64_t botGuid = 0;
-    ChannelIntent intent = ChannelIntent::Stay;
+    ChannelIntent intent = ChannelIntent::Stay;  // The old form's verb and parameters; unread for a stepped command.
     ChannelParams params;
+    std::vector<ChannelStep> steps;  // LC3: a stepped command's 1..maxSteps steps, run as one order; empty: old form.
 };
 
 // Only the game adapter supplies these facts. A missing fact leaves the associated check closed.

@@ -1,6 +1,7 @@
 #ifndef MOD_OLLAMA_CHAT_BRIDGE_CHANNEL_H
 #define MOD_OLLAMA_CHAT_BRIDGE_CHANNEL_H
 
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
@@ -64,6 +65,15 @@ enum class ChannelOutcome : uint8_t
     Applied,
     Rejected,
     Failed
+};
+
+// LC3: what one step of a stepped command came to, worded by the executor: a refusal of playerbots' table in its word
+// and sentence (the catalogue's), any other reason in DescribeRefusal's. Applied leaves both empty.
+struct ChannelStepResult
+{
+    ChannelOutcome outcome = ChannelOutcome::Rejected;
+    std::string reason;
+    std::string reasonText;
 };
 
 enum class QueryKind : uint8_t
@@ -159,12 +169,14 @@ struct AbilityIndex
 // The bytes the encoded catalogue may take; the bridge reads it whole (MaxResponseBytes is the transport's bound).
 constexpr std::size_t ChannelMaxCatalogueBytes = 24576;
 
-// Installs the index and returns the bytes its catalogue encodes to (0 when refused before encoding). An index with a
-// missing, duplicate or unknown verb, topic or row, text that is not UTF-8, or a catalogue over
-// ChannelMaxCatalogueBytes is refused: the channel then holds an empty index (every verb and topic unknown, no
-// catalogue). World thread only, once at startup.
+// Installs the index and returns the bytes its catalogue encodes to (0 when the index is refused or its text is not
+// UTF-8). An index with a missing, duplicate or unknown verb, topic or row is refused: the channel then holds an empty
+// index (every verb and topic unknown, no catalogue). A catalogue that is not UTF-8 or over ChannelMaxCatalogueBytes
+// drops only the catalogue answer: the verbs and topics stand, so the old wire keeps working (LC.23). World thread
+// only, once at startup.
 std::size_t SetAbilityIndex(AbilityIndex index);
 AbilityIndex const& Abilities();
+bool CatalogueInstalled();  // Whether a catalogue query has an answer.
 
 // One raw entry of a bot_state topic, as the game read it; FinishTopic filters, bounds and names the keys.
 //   inventory:  name, kind "equipped"/"bag", first = item quality 0..7, second = stack count
@@ -257,9 +269,13 @@ public:
     ChannelError FinishFailure(ChannelEnvelope const& envelope, ChannelFailure failure, WorldScope const& current,
                                Clock now, std::string& body);
     // J5e: a rejected or failed outcome carries `reason` and `reasonText` (None words as cannot_now or failed).
+    // LC3: a stepped command (steps, as submitted) also carries `steps`, one entry per step: the ones that ran (ran,
+    // each but the last applied) with their outcome, the others skipped. Its outcome is applied only when every step
+    // applied, and a step that ran and ended the order gives the order its reason. The old form has no `steps`.
     ChannelError FinishCommand(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
                                WorldScope const& current, Clock now, std::string& body,
-                               CommandRefusal refusal = CommandRefusal::None);
+                               CommandRefusal refusal = CommandRefusal::None, std::span<ChannelStep const> steps = {},
+                               std::span<ChannelStepResult const> ran = {});
     // J6e-c: `watch.result` with outcome armed, cleared or rejected (rejected also `reason` and `reasonText`).
     ChannelError FinishWatch(ChannelEnvelope const& envelope, std::string const& commandId, WatchOutcome outcome,
                              WorldScope const& current, Clock now, std::string& body,

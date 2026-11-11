@@ -1,5 +1,6 @@
 #include "mod-ollama-chat_bridge_effect.h"
 
+#include "BridgeAbilities.h"
 #include "BridgeIntentEffect.h"
 #include "Group.h"
 #include "ObjectAccessor.h"
@@ -28,16 +29,20 @@ public:
     {
         // Release gate (open since J6b4): closed, it refuses before any game read, authorization or playerbots call.
         _refusal = CommandRefusal::None;
+        _steps.clear();
         if constexpr (!kBridgeEffectsReleased)
         {
             _refusal = CommandRefusal::NotSupported;
             return EffectResult::Rejected;
         }
+        else if (!command.steps.empty())
+            return Stepped(phase, ticket, guard, command, authorize, _refusal, _steps);
         else
             return Effect(phase, ticket, guard, command, authorize, _refusal);
     }
 
     CommandRefusal Refusal() const override { return _refusal; }
+    std::vector<ChannelStepResult> Steps() const override { return _steps; }
 
     // World thread only; memory only (a restart forgets it). One ledger for the one executor.
     static BridgePlans& Plans()
@@ -362,7 +367,169 @@ private:
         return EffectResult::Failed;  // Failed or unknown after a possible attempt: never applied, never replayed.
     }
 
+    // LC3: a step's outcome in the words of playerbots' table (the catalogue's); a refusal without a reason, an
+    // unavailable verb and a failure in the module's (DescribeRefusal), as the old form words them.
+    static ChannelStepResult StepResult(PlayerbotBridge::StepOutcome const& step)
+    {
+        auto const module = [](ChannelOutcome outcome, CommandRefusal refusal)
+        {
+            auto const words = DescribeRefusal(refusal);
+            return ChannelStepResult{outcome, words.code, words.text};
+        };
+        switch (step.Outcome)
+        {
+            case PlayerbotBridge::Result::Applied:
+                return {ChannelOutcome::Applied, "", ""};
+            case PlayerbotBridge::Result::Failed:
+                return module(ChannelOutcome::Failed, CommandRefusal::Failed);
+            case PlayerbotBridge::Result::Unavailable:
+                return module(ChannelOutcome::Rejected, CommandRefusal::Unavailable);
+            case PlayerbotBridge::Result::Rejected:
+                break;
+        }
+        if (step.Why == PlayerbotBridge::Refusal::None)
+            return module(ChannelOutcome::Rejected, CommandRefusal::CannotNow);
+        auto const& words = PlayerbotBridge::RefusalWords(step.Why);
+        return {ChannelOutcome::Rejected, words.Word, words.Sentence};
+    }
+
+    // LC3: a stepped command as one playerbots order of its steps: one Execute and so one authorize, with playerbots'
+    // gate on every step (the group, a named or given unit or quest seen or held, the row's check; a position's path).
+    // The module's MapIntent facts are not read again here. It keeps the scope (authorize), the captured group and the
+    // plan ledger: every lasting step is admitted and its part captured before Execute, and each one that ran and may
+    // have written is recorded after it. Two steps of one lasting part are refused before anything runs: the second's
+    // baseline would be the first one's work. `ran` receives one worded entry per step that ran.
+    static EffectResult Stepped(EffectPhase const& phase, WorldTicket const& ticket, DispatchGuard const& guard,
+                                ChannelCommand const& command, std::function<bool()> const& authorize,
+                                CommandRefusal& why, std::vector<ChannelStepResult>& ran)
+    {
+        if (!phase.join.Current())
+        {
+            why = CommandRefusal::Unavailable;
+            return EffectResult::Rejected;
+        }
+        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.botGuid));
+        Player* partner = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.controllerGuid));
+        if (!bot || !bot->IsInWorld() || !partner)
+        {
+            why = CommandRefusal::Unavailable;
+            return EffectResult::Rejected;
+        }
+        struct Lasting
+        {
+            std::size_t step = 0;
+            PlanKey key;
+            PlanOwner owner;
+            PlayerbotBridge::Part part = PlayerbotBridge::Part::None;
+            PlayerbotBridge::Baseline before;
+        };
+        std::vector<PlayerbotBridge::Order> orders;
+        std::vector<Lasting> lasting;
+        for (std::size_t index = 0; index < command.steps.size(); ++index)
+        {
+            ChannelStep const& step = command.steps[index];
+            PlayerbotBridge::Order order;
+            order.Operation = static_cast<PlayerbotBridge::Intent>(step.intent);  // Equal values: handler.cpp asserts.
+            order.Bot = ticket.scope.botGuid;
+            order.Controller = ticket.scope.controllerGuid;
+            order.Group = guard.groupGuid;
+            order.VisibilityDistance = g_SayDistance;  // The whisper/party radius BridgeCapture uses.
+            order.Target = step.targetGuid;
+            order.TargetName = step.targetName;
+            order.QuestId = step.questId;
+            order.QuestName = step.questName;
+            order.PlaceName = step.place;
+            if (step.position)
+            {
+                order.MapId = step.position->mapId;
+                order.X = step.position->x;
+                order.Y = step.position->y;
+                order.Z = step.position->z;
+            }
+            order.Icon = step.icon.value_or(0);
+            // OrderField::Shape: the index of the choice plus one (None without a shape).
+            order.Shape = step.shape ? static_cast<PlayerbotBridge::FormationShape>(*step.shape + 1)
+                                     : PlayerbotBridge::FormationShape::None;
+            order.Enabled = step.enabled.value_or(false);
+            auto const part = PlayerbotBridge::LastingPart(order.Operation);
+            auto const kind = PlanKindFor(step.intent);
+            orders.push_back(std::move(order));
+            if (part == PlayerbotBridge::Part::None && !kind)
+                continue;
+            // A lasting part needs a ledger kind to be restored, and one step per part.
+            if (part == PlayerbotBridge::Part::None || !kind ||
+                std::any_of(lasting.begin(), lasting.end(),
+                            [&](Lasting const& entry) { return entry.key.kind == *kind; }))
+            {
+                why = CommandRefusal::CannotNow;
+                return EffectResult::Rejected;
+            }
+            lasting.push_back({index,
+                               {ticket.scope.botGuid, *kind},
+                               {guard.groupGuid, ticket.scope.controllerGuid, ticket.generation,
+                                IntentNeedsPartnerInGroup(step.intent)},
+                               part,
+                               {}});
+        }
+        // J12 per lasting step: every admission first, then every capture; no admission or no capture, no mutation.
+        // One clock reading serves admission and record.
+        int64_t const nowMs = Now().steadyMs;
+        for (Lasting const& entry : lasting)
+            if (Plans().Admit(entry.key, entry.owner, nowMs) == PlanAdmission::Refused)
+            {
+                why = CommandRefusal::Busy;
+                return EffectResult::Rejected;
+            }
+        for (Lasting& entry : lasting)
+            if (!PlayerbotBridge::Capture(phase.join, ticket.scope.botGuid, entry.part, entry.before))
+            {
+                why = CommandRefusal::CannotNow;
+                return EffectResult::Rejected;
+            }
+        std::vector<PlayerbotBridge::StepOutcome> outcomes;
+        auto const result =
+            PlayerbotBridge::Execute(phase.join, std::span<PlayerbotBridge::Order const>(orders), authorize, &outcomes);
+        auto const wrote = [&outcomes](std::size_t index)
+        {
+            return index < outcomes.size() && (outcomes[index].Outcome == PlayerbotBridge::Result::Applied ||
+                                               outcomes[index].Outcome == PlayerbotBridge::Result::Failed);
+        };
+        // A lasting step that ran and may have written is recorded with the part as the order left it; a step that
+        // did not run, or was refused, records nothing.
+        for (Lasting const& entry : lasting)
+        {
+            if (!wrote(entry.step))
+                continue;
+            PlayerbotBridge::Baseline applied;
+            if (!PlayerbotBridge::Capture(phase.join, ticket.scope.botGuid, entry.before.Held, applied) ||
+                !Plans().Record(entry.key, entry.owner, entry.before, applied, nowMs))
+                Plans().NoteUnrecorded();
+        }
+        for (std::size_t index = 0; index < outcomes.size(); ++index)
+        {
+            // DS.10: a mark that applied or may have applied re-baselines this bot's stored marks.
+            if (command.steps[index].intent == ChannelIntent::Mark && wrote(index))
+                OllamaChat_BridgeNoteOwnMark(ticket.scope.botGuid);
+            ran.push_back(StepResult(outcomes[index]));
+        }
+        switch (result)
+        {
+            case PlayerbotBridge::Result::Rejected:
+                why = outcomes.empty() ? CommandRefusal::None : OrderRefusal(outcomes.back().Why);
+                return EffectResult::Rejected;
+            case PlayerbotBridge::Result::Unavailable:
+                why = CommandRefusal::Unavailable;
+                return EffectResult::Unavailable;
+            case PlayerbotBridge::Result::Applied:
+                return EffectResult::Applied;
+            case PlayerbotBridge::Result::Failed:
+                break;
+        }
+        return EffectResult::Failed;  // Failed or unknown after a possible attempt: never applied, never replayed.
+    }
+
     CommandRefusal _refusal = CommandRefusal::None;
+    std::vector<ChannelStepResult> _steps;
 };
 }  // namespace
 }  // namespace OllamaBridge

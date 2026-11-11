@@ -340,7 +340,7 @@ void TypedRefusals()
 {
     auto invalid = [](ChannelIntent intent, ChannelParams params)
     {
-        Check(!MapIntent({"order", Controller, Bot, intent, params}, Current()),
+        Check(!MapIntent({"order", Controller, Bot, intent, params, {}}, Current()),
               "typed callers cannot bypass enum/variant or value constraints");
     };
     invalid(static_cast<ChannelIntent>(255), {});

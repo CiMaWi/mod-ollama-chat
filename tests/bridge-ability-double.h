@@ -98,6 +98,43 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
     return index;
 }
 
+// LC3b: the double with the acts a stepped command needs for every parameter form, inserted after go_to (rows 3-9;
+// the topics follow from row 10): stay, quest, position, formation, save_mana, focus_healing, attack_own_target.
+// TestAbilityIndex stays as it is: the selftests pin its fourteen rows by position.
+inline OllamaBridge::AbilityIndex TestStepAbilityIndex()
+{
+    using namespace OllamaBridge;
+    auto index = TestAbilityIndex();
+    auto const act = [](ChannelIntent intent, char const* name, std::vector<AbilityParam> params)
+    {
+        return AbilityRow{.topic = false,
+                          .code = static_cast<uint8_t>(intent),
+                          .name = name,
+                          .sentence = std::string("Do ") + name + ".",
+                          .params = std::move(params),
+                          .refusals = {},
+                          .effect = "none",
+                          .done = "at_once",
+                          .state = "",
+                          .event = "BridgeAct",
+                          .limit = 0};
+    };
+    AbilityRow const acts[] = {
+        act(ChannelIntent::Stay, "stay", {}),
+        act(ChannelIntent::Quest, "quest", {{"quest", "quest", "The quest, by its title.", {}, AbilityField::QuestId}}),
+        act(ChannelIntent::Position, "position", {{"place", "place", "Where to stand.", {}, AbilityField::Position}}),
+        act(ChannelIntent::Formation, "formation",
+            {{"shape", "choice", "The formation.", {"close", "spread", "line"}, AbilityField::Shape}}),
+        act(ChannelIntent::SaveMana, "save_mana", {{"enabled", "flag", "On or off.", {}, AbilityField::Enabled}}),
+        act(ChannelIntent::FocusHealing, "focus_healing",
+            {{"target", "unit", "Whom to heal first.", {}, AbilityField::Target}}),
+        act(ChannelIntent::AttackOwnTarget, "attack_own_target",
+            {{"target", "unit", "What to attack.", {}, AbilityField::Target}}),
+    };
+    index.rows.insert(index.rows.begin() + 3, std::begin(acts), std::end(acts));
+    return index;
+}
+
 // Installs the double; false when the channel refused it.
 inline bool InstallTestAbilities()
 {

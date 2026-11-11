@@ -1247,8 +1247,10 @@ constexpr std::pair<PlayerbotBridge::Intent, OllamaBridge::ChannelIntent> Bridge
     {PlayerbotBridge::Intent::MeetAt, OllamaBridge::ChannelIntent::MeetAt},
     {PlayerbotBridge::Intent::PausePlan, OllamaBridge::ChannelIntent::PausePlan},
     {PlayerbotBridge::Intent::ResumePlan, OllamaBridge::ChannelIntent::ResumePlan}};
-static_assert(BridgeValuesAgree(BridgeIntentPairs) &&
-              std::size(BridgeIntentPairs) == static_cast<std::size_t>(PlayerbotBridge::Intent::ResumePlan) + 1);
+// Every playerbots verb has a ChannelIntent of the same value (IntentCount counts the table, BridgeAbilities.cpp), so
+// an appended verb fails here until the channel has its value; a stepped order casts one to the other.
+static_assert(BridgeValuesAgree(BridgeIntentPairs) && std::size(BridgeIntentPairs) == PlayerbotBridge::IntentCount &&
+              OllamaBridge::ChannelIntentCount == PlayerbotBridge::IntentCount);
 
 constexpr std::pair<PlayerbotBridge::OrderField, OllamaBridge::AbilityField> BridgeFieldPairs[] = {
     {PlayerbotBridge::OrderField::Target, OllamaBridge::AbilityField::Target},
@@ -1349,6 +1351,11 @@ void OllamaChat_BridgeInstallAbilities()
         LOG_ERROR("module.ollamachat",
                   "[Ollama Chat] Bridge ability catalogue refused ({} rows, {} of {} bytes): the bridge channel takes "
                   "no command and no bot_state query.",
+                  rows, bytes, OllamaBridge::ChannelMaxCatalogueBytes);
+    else if (!OllamaBridge::CatalogueInstalled())
+        LOG_ERROR("module.ollamachat",
+                  "[Ollama Chat] Bridge ability catalogue not sent ({} rows, {} of {} bytes, or not UTF-8): commands "
+                  "and bot_state queries stand, the catalogue query answers unavailable.",
                   rows, bytes, OllamaBridge::ChannelMaxCatalogueBytes);
     else
         LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge ability catalogue: {} rows, hash {:016x}, {} bytes.", rows,

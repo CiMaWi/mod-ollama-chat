@@ -141,6 +141,8 @@ public:
                                  ChannelCommand const& command, std::function<bool()> const& authorize) = 0;
     // J5e: the reason of the last Execute's refusal (None when unknown); read right after Execute, world thread.
     virtual CommandRefusal Refusal() const { return CommandRefusal::None; }
+    // LC3: the last Execute's steps that ran, in order and worded (empty for the old form or when none ran).
+    virtual std::vector<ChannelStepResult> Steps() const { return {}; }
 };
 
 // Bounded per-bot gate on the game-owned lane, independent of request and command ids and of channel epochs.
