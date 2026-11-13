@@ -73,6 +73,8 @@ void CheckFormatters()
     Check(FormatCardTraits(words) == "careful, devout, bookish", "three words without adverbs");
     Check(FormatCardTraits({"a loner", "fiercely loyal"}) == "loner, loyal", "article and adverb stripped");
     Check(FormatCardTraits({"very careful"}) == "careful", "one word");
+    Check(FormatCardTraits({"extremely curious", "somewhat practical"}) == "curious, practical",
+          "the four grades' adverbs stripped (LC9)");
     Check(FormatCardTraits({}).empty(), "empty card words");
     std::string const longWord(30, 'x');
     std::string const cut = FormatCardTraits({"very " + longWord, "very " + longWord, "very " + longWord});
@@ -108,6 +110,9 @@ std::string Sample()
         std::string const card = FormatCardTraits(TraitRules::Describe(traits));
         Check(!HasDigit(prompt) && !HasDigit(card), "no digits in a sample bot");
         Check(prompt.find("  ") == std::string::npos && card.size() <= 64, "clean sample bot");
+        Check(card.find("extremely") == std::string::npos && card.find("somewhat") == std::string::npos &&
+                  card.find("very ") == std::string::npos && card.find("rather ") == std::string::npos,
+              "card traits without intensity");
         out << "#" << guid << " " << RaceName(bot.Race) << " " << ClassName(bot.Class) << " | " << prompt << " | "
             << card << "\n";
         ++guid;
