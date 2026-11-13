@@ -483,7 +483,7 @@ bool Keys(Json const& entry, std::set<std::string> const& keys)
 void Topics()
 {
     Fixture f;
-    // Parse: the eleven topics, nothing else.
+    // Parse: the fourteen topics, nothing else.
     for (std::string bad : {"bank", "", "Inventory", "talents", "Plan", "quest plan", "questplan", "place"})
         Check(f.Receive(StateQuery(f, "bad-" + bad, bad)) == ChannelError::Invalid, "unknown topic invalid_input");
     Check(f.Receive(StateQuery(f, "bad-number", 1)) == ChannelError::Invalid, "topic must be a string");
@@ -608,7 +608,10 @@ void Topics()
                                {StateTopic::Route, {"total", "leg", "failed"}},
                                {StateTopic::QuestPlan, {"take", "task", "turn_in", "carried", "deferred"}},
                                {StateTopic::Bags, {"free", "sell", "bag"}},
-                               {StateTopic::Places, {"hearth", "flight_here", "flight_elsewhere"}}};
+                               {StateTopic::Places, {"hearth", "flight_here", "flight_elsewhere"}},
+                               {StateTopic::History, {"event", "zone", "dungeon", "boss"}},
+                               {StateTopic::Lately, {"deed"}},
+                               {StateTopic::Known, {"bot"}}};
     for (auto const& table : tables)
         for (std::size_t code = 0; code < 8; ++code)
             Check(std::string(StateTopicRow(table.topic, static_cast<uint8_t>(code))) ==
@@ -629,6 +632,12 @@ void Topics()
               StateTopicLimit(StateTopic::Route) == 12 && StateTopicLimit(StateTopic::QuestPlan) == 12 &&
               StateTopicLimit(StateTopic::Bags) == 6 && StateTopicLimit(StateTopic::Places) == 24,
           "planner topic limits as playerbots keeps them");
+    Check(std::string(StateTopicName(StateTopic::History)) == "history" &&
+              std::string(StateTopicName(StateTopic::Lately)) == "lately" &&
+              std::string(StateTopicName(StateTopic::Known)) == "known" &&
+              StateTopicLimit(StateTopic::History) == 24 && StateTopicLimit(StateTopic::Lately) == 12 &&
+              StateTopicLimit(StateTopic::Known) == 12,
+          "LC7: record topic names and limits as playerbots keeps them");
     entries = Topic(f, "plan", StateTopic::Plan,
                     {{"rpg_travel", "goal", 120, 600},
                      {"planner", "source", -5, 5000000000LL},
@@ -648,12 +657,30 @@ void Topics()
     {
         std::vector<StateEntry> rows;
         for (int i = 0; i < 30; ++i)
-            rows.push_back({"word " + std::to_string(i), table.words.at(i % table.words.size()), i, i});
+            rows.push_back({"word " + std::to_string(i), table.words.at(i % table.words.size()), i, i, "Words."});
         auto const limited = Topic(f, std::string("limit-") + StateTopicName(table.topic), table.topic, rows);
         Check(limited.size() == StateTopicLimit(table.topic) &&
                   limited.at(1).at("row") == table.words.at(1 % table.words.size()),
               "a planner topic keeps its row words and stops at its limit");
     }
+
+    // LC7: a record topic's entry carries its sentence in its own field, cut at its own cap; no sentence, no entry.
+    entries = Topic(f, "history", StateTopic::History,
+                    {{"kill", "event", 3, 0, "You slew Hogger, an elite foe, in Elwynn Forest."},
+                     {"Westfall", "zone", 2, 0, "You have spent time in Westfall."},
+                     {"kill", "deed", 1, 0, "A row word of another topic."},
+                     {"quest", "event", 1, 0, ""},
+                     {"level", "event", 1, 0, "Bad\nline"},
+                     {"spell", "event", 0, 0, std::string(300, 's')}});
+    Check(entries.size() == 3 && Keys(entries.at(0), {"row", "name", "text", "value", "extra"}) &&
+              entries.at(0).at("text") == "You slew Hogger, an elite foe, in Elwynn Forest." &&
+              entries.at(0).at("name") == "kill" && entries.at(1).at("row") == "zone" &&
+              entries.at(2).at("text") == std::string(ChannelMaxTopicText, 's'),
+          "history rows: row, name, text, value, extra; a missing or bad sentence drops the entry, a long one is cut");
+    entries = Topic(f, "known", StateTopic::Known,
+                    {{"Aldric", "bot", 0, 2, "Aldric, a human paladin, fought beside you."}, {"Brug", "bot", 1, 1, ""}});
+    Check(entries.size() == 1 && entries.at(0).at("name") == "Aldric" && entries.at(0).at("extra") == 2,
+          "known rows: the bot by name with the events shared");
 
     // Names: cut to 64 bytes on a character boundary; control characters and invalid UTF-8 dropped.
     std::string accented;
@@ -680,7 +707,8 @@ void Topics()
                              : topic == StateTopic::Quests     ? "complete"
                              : topic == StateTopic::Strategies ? "non_combat"
                                                                : StateTopicRow(topic, 0),
-                             topic == StateTopic::Inventory ? 5 : 604800, 10000});
+                             topic == StateTopic::Inventory ? 5 : 604800, 10000,
+                             std::string(ChannelMaxTopicText, 'w')});
         auto const result = Topic(f, "worst-" + std::to_string(t), topic, worst);
         Check(result.size() == (topic == StateTopic::Strategies ? 0 : StateTopicLimit(topic)), "worst case count");
     }
@@ -730,7 +758,7 @@ Json CatalogueQuery(Fixture const& f, std::string const& id)
 void Catalogue()
 {
     auto const bytes = SetAbilityIndex(TestAbilityIndex());
-    Check(bytes > 0 && bytes <= ChannelMaxCatalogueBytes && Abilities().rows.size() == 14 &&
+    Check(bytes > 0 && bytes <= ChannelMaxCatalogueBytes && Abilities().rows.size() == 17 &&
               Abilities().verbs.size() == 22 && CatalogueInstalled(),
           "the double installs");
     Check(ChannelMaxCatalogueBytes == 24576 && ChannelMaxCatalogueBytes + 4096 < MaxResponseBytes,
@@ -775,7 +803,7 @@ void Catalogue()
     {
         Fixture f;
         f.Open();
-        Check(Abilities().rows.size() == 14 && Abilities().verbs.size() == 22 && !CatalogueInstalled() &&
+        Check(Abilities().rows.size() == 17 && Abilities().verbs.size() == 22 && !CatalogueInstalled() &&
                   f.Receive(f.Command("standing")) == ChannelError::None &&
                   f.Receive(StateQuery(f, "standing-topic", "quests")) == ChannelError::None &&
                   std::string(StateTopicName(StateTopic::Quests)) == "quests",
@@ -859,7 +887,7 @@ void Catalogue()
     Check(catalogue.size() == 5 && catalogue.at("hash") == "0a1b2c3d4e5f6071" && catalogue.at("version") == 1 &&
               catalogue.at("maxSteps") == 3 &&
               catalogue.at("abilities") == Json::array({"catalogue", "names", "steps"}) &&
-              catalogue.at("rows").size() == 14,
+              catalogue.at("rows").size() == 17,
           "hash, version, abilities, the most steps and every row");
     Check(catalogue.at("rows").at(1) == Json::parse(R"({"kind":"act","name":"mark",
               "sentence":"Put a raid icon on a unit you can see.",
@@ -1048,7 +1076,7 @@ std::vector<ChannelStep> Decoded(Json steps, char const* label)
 
 void Stepped()
 {
-    Check(SetAbilityIndex(TestStepAbilityIndex()) > 0 && Abilities().rows.size() == 21, "the stepped double installs");
+    Check(SetAbilityIndex(TestStepAbilityIndex()) > 0 && Abilities().rows.size() == 24, "the stepped double installs");
     auto const three =
         Decoded(Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
                              Step("go_to", {{"place", "Goldshire"}}), Step("position", {{"place", "1.5,-2.25,30,0"}})}),

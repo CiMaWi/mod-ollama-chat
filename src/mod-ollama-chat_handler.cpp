@@ -1208,6 +1208,12 @@ static_assert(static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Spells) ==
                   static_cast<uint8_t>(OllamaBridge::StateTopic::Bags) &&
               static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Places) ==
                   static_cast<uint8_t>(OllamaBridge::StateTopic::Places) &&
+              static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::History) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::History) &&
+              static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Lately) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::Lately) &&
+              static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Known) ==
+                  static_cast<uint8_t>(OllamaBridge::StateTopic::Known) &&
               OllamaBridge::StateTopicCount == PlayerbotBridge::TopicRows().size());
 
 // LC3: the channel takes an act's intent and a parameter's field as playerbots' values; each pair is one value.
@@ -1275,7 +1281,7 @@ bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic, std::
         return false;
     for (auto& item : items)
     {
-        OllamaBridge::StateEntry entry{std::move(item.name), {}, item.value, item.extra};
+        OllamaBridge::StateEntry entry{std::move(item.name), {}, item.value, item.extra, std::move(item.text)};
         if (topic == OllamaBridge::StateTopic::Inventory)
             entry.kind = item.code ? "equipped" : "bag";
         else if (topic == OllamaBridge::StateTopic::Quests)
@@ -1283,7 +1289,7 @@ bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic, std::
         else if (topic == OllamaBridge::StateTopic::Strategies)
             entry.kind = item.code ? "combat" : "non_combat";
         else
-            entry.kind = OllamaBridge::StateTopicRow(topic, item.code);  // WT18b: empty for cooldowns and spells.
+            entry.kind = OllamaBridge::StateTopicRow(topic, item.code);  // Empty for cooldowns and spells.
         entries.push_back(std::move(entry));
     }
     return true;

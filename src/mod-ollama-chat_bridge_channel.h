@@ -19,6 +19,7 @@ constexpr std::size_t ChannelMaxEvents = 32;
 constexpr std::size_t ChannelMaxUnits = 40;
 constexpr std::size_t ChannelMaxTopicBytes = 8192;  // DS.14 (d): one bot_state topic's entries, encoded.
 constexpr std::size_t ChannelMaxTopicName = 64;     // Bytes of one entry's name, cut on a character boundary.
+constexpr std::size_t ChannelMaxTopicText = 200;    // LC7: bytes of a record topic entry's sentence, cut the same.
 
 enum class ChannelError : uint8_t
 {
@@ -95,13 +96,16 @@ enum class StateTopic : uint8_t
     Route,
     QuestPlan,
     Bags,
-    Places
+    Places,
+    History,  // LC7: the bot's record (playerbots RecordWords.h); each entry carries a sentence.
+    Lately,
+    Known
 };
-constexpr std::size_t StateTopicCount = 11;
+constexpr std::size_t StateTopicCount = 14;
 
 char const* StateTopicName(StateTopic topic);
 std::size_t StateTopicLimit(StateTopic topic);  // Most entries a topic result carries.
-// WT18b: the row word of a planner topic's raw code ("" for an unknown code or an older topic).
+// WT18b: the row word of a planner or record topic's raw code ("" for an unknown code or an older topic).
 char const* StateTopicRow(StateTopic topic, uint8_t code);
 
 // LC3: the ability catalogue as plain data, mod-playerbots' one table of acts and topics (PlayerbotBridge::Catalogue)
@@ -186,12 +190,14 @@ bool CatalogueInstalled();  // Whether a catalogue query has an answer.
 //   spells:     name, first = rank (0 = none)
 //   plan, options, route, quest_plan, bags, places (WT18b): kind = the row word (StateTopicRow), name (words, or a
 //               quest title or bind area), first = value, second = extra (0..4294967295 each)
+//   history, lately, known (LC7): the planner shape and text = one sentence (1..ChannelMaxTopicText bytes)
 struct StateEntry
 {
     std::string name;
     std::string kind;
     int64_t first = 0;
     int64_t second = 0;
+    std::string text = {};  // A default, so older brace inits stay complete.
 };
 
 struct ChannelQuery

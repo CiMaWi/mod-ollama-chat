@@ -463,7 +463,7 @@ void CataloguePublication()
     auto packet = ask("catalogue-1");
     auto json = packet ? Json::parse(packet->body) : Json();
     Check(packet && packet->error == ChannelError::None && json.at("type") == "query.result" &&
-              json.at("catalogue").at("hash") == "0a1b2c3d4e5f6071" && json.at("catalogue").at("rows").size() == 14,
+              json.at("catalogue").at("hash") == "0a1b2c3d4e5f6071" && json.at("catalogue").at("rows").size() == 17,
           "the installed catalogue published");
     Check(f.source.topicReads == 0 && f.source.resolves == 0, "a catalogue reads no bot and no unit");
     SetAbilityIndex({});
