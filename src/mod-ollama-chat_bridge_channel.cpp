@@ -1,6 +1,7 @@
 #include "mod-ollama-chat_bridge_channel.h"
 
 #include <algorithm>
+#include <charconv>
 #include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -103,16 +104,134 @@ std::string Place(Json const& value)
     return text;
 }
 
+// LC3: the installed ability index and its encoded catalogue (null while none is installed).
+struct InstalledAbilities
+{
+    AbilityIndex index;
+    Json catalogue;
+};
+
+InstalledAbilities& Installed()
+{
+    static InstalledAbilities installed;
+    return installed;
+}
+
 // J5e: a standing follow/stay shape (any params) is refused with its own reason, still invalid_input on the wire.
 struct StandingShape : std::runtime_error
 {
     StandingShape() : std::runtime_error("standing") {}
 };
 
+// LC3: a choice parameter's value, one of the act's choice words, as its index.
+uint8_t Choice(Json const& value, AbilityParam const& param)
+{
+    auto const word = String(value);
+    auto const found = std::find(param.choices.begin(), param.choices.end(), word);
+    if (found == param.choices.end() || found - param.choices.begin() > UINT8_MAX)
+        throw std::runtime_error("invalid");
+    return static_cast<uint8_t>(found - param.choices.begin());
+}
+
+// LC3: a position's spot "x,y,z,map": three finite decimal numbers and a map id, comma-separated, nothing else.
+ChannelPosition Spot(Json const& value)
+{
+    auto const text = Place(value);
+    ChannelPosition spot;
+    char const* at = text.data();
+    char const* const end = text.data() + text.size();
+    for (double* coordinate : {&spot.x, &spot.y, &spot.z})
+    {
+        auto const [next, error] = std::from_chars(at, end, *coordinate);
+        if (error != std::errc() || next == end || *next != ',' || !std::isfinite(*coordinate))
+            throw std::runtime_error("invalid");
+        at = next + 1;
+    }
+    auto const [next, error] = std::from_chars(at, end, spot.mapId);
+    if (error != std::errc() || next != end)
+        throw std::runtime_error("invalid");
+    return spot;
+}
+
+// LC3: the steps of a stepped command, 1..maxSteps acts of the installed catalogue. Each is {act, params} with exactly
+// the act's parameters by their catalogue names: a unit as `name` (its name) or `nameGuid`, a quest as `name` (its
+// title) or `nameId`, exactly one of the two; names and places have Place's text rules. A topic, a verb without a row
+// and an unknown word are no act.
+std::vector<ChannelStep> Steps(Json const& value)
+{
+    auto const& index = Installed().index;
+    if (!value.is_array() || value.empty() || value.size() > index.maxSteps)
+        throw std::runtime_error("invalid");
+    std::vector<ChannelStep> steps;
+    for (auto const& entry : value)
+    {
+        if (!Exact(entry, {"act", "params"}) || !entry.at("params").is_object())
+            throw std::runtime_error("invalid");
+        auto const act = String(entry.at("act"));
+        auto const row = std::find_if(index.rows.begin(), index.rows.end(), [&act](AbilityRow const& candidate)
+                                      { return !candidate.topic && candidate.name == act; });
+        if (row == index.rows.end())
+            throw std::runtime_error("invalid");
+        auto const& params = entry.at("params");
+        ChannelStep step;
+        step.intent = static_cast<ChannelIntent>(row->code);
+        for (auto const& param : row->params)
+        {
+            std::string const id = param.field == AbilityField::Target    ? param.name + "Guid"
+                                   : param.field == AbilityField::QuestId ? param.name + "Id"
+                                                                          : std::string();
+            bool const named = params.contains(param.name);
+            if (named == (!id.empty() && params.contains(id)))
+                throw std::runtime_error("invalid");  // Neither form given, or both.
+            auto const& given = params.at(named ? param.name : id);
+            switch (param.field)
+            {
+                case AbilityField::Target:
+                    if (named)
+                        step.targetName = Place(given);
+                    else
+                        step.targetGuid = Guid(given);
+                    break;
+                case AbilityField::QuestId:
+                    if (named)
+                        step.questName = Place(given);
+                    else if (!(step.questId = static_cast<uint32_t>(Integer(given, UINT32_MAX))))
+                        throw std::runtime_error("invalid");
+                    break;
+                case AbilityField::PlaceName:
+                    step.place = Place(given);
+                    break;
+                case AbilityField::Position:
+                    step.position = Spot(given);
+                    break;
+                case AbilityField::Icon:
+                    step.icon = Choice(given, param);
+                    break;
+                case AbilityField::Shape:
+                    step.shape = Choice(given, param);
+                    break;
+                case AbilityField::Enabled:
+                    if (!given.is_boolean())
+                        throw std::runtime_error("invalid");
+                    step.enabled = given.get<bool>();
+                    break;
+            }
+        }
+        if (params.size() != row->params.size())
+            throw std::runtime_error("invalid");  // A key the act does not take.
+        steps.push_back(std::move(step));
+    }
+    return steps;
+}
+
 ChannelCommand Command(Json const& body)
 {
-    if (!Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type", "commandId",
-                      "issuerGuid", "botGuid", "intent", "params"}))
+    // LC3: a stepped command carries `steps` in place of `intent` and `params`; both forms at once is neither.
+    bool const stepped = body.contains("steps");
+    if (stepped ? !Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
+                                "commandId", "issuerGuid", "botGuid", "steps"})
+                : !Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
+                                "commandId", "issuerGuid", "botGuid", "intent", "params"}))
         throw std::runtime_error("invalid");
     ChannelCommand command;
     command.commandId = String(body.at("commandId"));
@@ -120,35 +239,20 @@ ChannelCommand Command(Json const& body)
     command.botGuid = Guid(body.at("botGuid"));
     if (!Identifier(command.commandId))
         throw std::runtime_error("invalid");
+    if (stepped)
+    {
+        command.steps = Steps(body.at("steps"));
+        return command;
+    }
     auto const intent = String(body.at("intent"));
     auto const& params = body.at("params");
-    constexpr std::pair<char const*, ChannelIntent> intents[] = {{"follow", ChannelIntent::Follow},
-                                                                 {"stay", ChannelIntent::Stay},
-                                                                 {"flee", ChannelIntent::Flee},
-                                                                 {"regroup", ChannelIntent::Regroup},
-                                                                 {"attack_own_target", ChannelIntent::AttackOwnTarget},
-                                                                 {"pull", ChannelIntent::Pull},
-                                                                 {"mark", ChannelIntent::Mark},
-                                                                 {"focus_healing", ChannelIntent::FocusHealing},
-                                                                 {"assign_role", ChannelIntent::AssignRole},
-                                                                 {"save_mana", ChannelIntent::SaveMana},
-                                                                 {"formation", ChannelIntent::Formation},
-                                                                 {"position", ChannelIntent::Position},
-                                                                 {"dungeon_clear", ChannelIntent::DungeonClear},
-                                                                 {"go_to", ChannelIntent::GoTo},
-                                                                 {"quest", ChannelIntent::Quest},
-                                                                 {"errands", ChannelIntent::Errands},
-                                                                 {"set_hearth", ChannelIntent::SetHearth},
-                                                                 {"grind_here", ChannelIntent::GrindHere},
-                                                                 {"gather_here", ChannelIntent::GatherHere},
-                                                                 {"meet_at", ChannelIntent::MeetAt},
-                                                                 {"pause_plan", ChannelIntent::PausePlan},
-                                                                 {"resume_plan", ChannelIntent::ResumePlan}};
+    // LC3: the verbs are playerbots' (the installed index), the acts' and the four without a row (refused later).
+    auto const& verbs = Installed().index.verbs;
     auto const found =
-        std::find_if(std::begin(intents), std::end(intents), [&](auto const& entry) { return intent == entry.first; });
-    if (found == std::end(intents))
+        std::find_if(verbs.begin(), verbs.end(), [&](AbilityVerb const& verb) { return intent == verb.name; });
+    if (found == verbs.end())
         throw std::runtime_error("invalid");
-    command.intent = found->second;
+    command.intent = found->intent;
     switch (command.intent)
     {
         case ChannelIntent::Follow:
@@ -353,12 +457,13 @@ bool StrategyAllowed(std::string const& name)
     return std::any_of(std::begin(allowed), std::end(allowed), [&](char const* item) { return name == item; });
 }
 
+// LC3: any topic the installed catalogue lists; SetAbilityIndex took only topics with a StateTopic (an entry shape).
 bool ParseTopic(std::string const& name, StateTopic& topic)
 {
-    for (std::size_t i = 0; i < StateTopicCount; ++i)
-        if (name == StateTopicName(static_cast<StateTopic>(i)))
+    for (auto const& row : Installed().index.rows)
+        if (row.topic && row.name == name)
         {
-            topic = static_cast<StateTopic>(i);
+            topic = static_cast<StateTopic>(row.code);
             return true;
         }
     return false;
@@ -424,35 +529,131 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
     }
     return false;
 }
+
+// LC3: what this channel takes beyond the old wire, listed in its catalogue answer (not part of the hash).
+constexpr char const* ChannelAbilities[] = {"catalogue", "names", "steps"};
+
+std::string Hex16(uint64_t value)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string text(16, '0');
+    for (std::size_t i = text.size(); i-- > 0; value >>= 4)
+        text[i] = digits[value & 0xF];
+    return text;
+}
+
+// One row's parts field for field, as PlayerbotBridge::CatalogueText lists them.
+Json CatalogueRow(AbilityRow const& row)
+{
+    Json params = Json::array();
+    for (auto const& param : row.params)
+    {
+        Json value = {
+            {"name", param.name}, {"kind", param.kind}, {"sentence", param.sentence}, {"choices", param.choices}};
+        params.push_back(std::move(value));
+    }
+    Json refusals = Json::array();
+    for (auto const& refusal : row.refusals)
+    {
+        Json value = {{"word", refusal.word}, {"sentence", refusal.sentence}};
+        refusals.push_back(std::move(value));
+    }
+    return {{"kind", row.topic ? "topic" : "act"},
+            {"name", row.name},
+            {"sentence", row.sentence},
+            {"params", std::move(params)},
+            {"refusals", std::move(refusals)},
+            {"effect", row.effect},
+            {"done", row.done},
+            {"state", row.state},
+            {"event", row.event},
+            {"limit", row.limit}};
+}
+
+Json CatalogueJson(AbilityIndex const& index)
+{
+    Json abilities = Json::array();
+    for (char const* ability : ChannelAbilities)
+        abilities.push_back(ability);
+    Json rows = Json::array();
+    for (auto const& row : index.rows)
+        rows.push_back(CatalogueRow(row));
+    return {{"hash", Hex16(index.hash)},
+            {"version", index.version},
+            {"abilities", std::move(abilities)},
+            {"maxSteps", index.maxSteps},
+            {"rows", std::move(rows)}};
+}
+
+// A wire word: 1..64 lower-case letters and underscores.
+bool Word(std::string const& name)
+{
+    return !name.empty() && name.size() <= 64 &&
+           std::all_of(name.begin(), name.end(), [](unsigned char c) { return (c >= 'a' && c <= 'z') || c == '_'; });
+}
+
+// Every ChannelIntent one verb of its own; every row a word of its own, an act one of the verbs (its own intent), a
+// topic one StateTopic.
+bool ValidIndex(AbilityIndex const& index)
+{
+    constexpr std::size_t intents = ChannelIntentCount;
+    if (!index.version || !index.maxSteps || index.rows.empty() || index.verbs.size() != intents)
+        return false;
+    std::set<std::string> verbs;
+    std::set<ChannelIntent> taken;
+    for (auto const& verb : index.verbs)
+        if (!Word(verb.name) || static_cast<std::size_t>(verb.intent) >= intents || !verbs.insert(verb.name).second ||
+            !taken.insert(verb.intent).second)
+            return false;
+    std::set<std::string> names;
+    std::set<uint8_t> topics;
+    for (auto const& row : index.rows)
+    {
+        auto const own = [&row](AbilityVerb const& verb)
+        { return verb.name == row.name && static_cast<uint8_t>(verb.intent) == row.code; };
+        if (!Word(row.name) || !names.insert(row.name).second ||
+            (row.topic ? row.code >= StateTopicCount || !topics.insert(row.code).second
+                       : std::none_of(index.verbs.begin(), index.verbs.end(), own)))
+            return false;
+    }
+    return true;
+}
 }  // namespace
 
+std::size_t SetAbilityIndex(AbilityIndex index)
+{
+    auto& installed = Installed();
+    installed = {};
+    if (!ValidIndex(index))
+        return 0;
+    // Only the catalogue query needs the encoded answer: one it cannot send leaves the verbs and topics standing.
+    std::size_t bytes = 0;
+    Json catalogue;
+    try
+    {
+        Json encoded = CatalogueJson(index);
+        bytes = encoded.dump().size();  // Throws on text that is not UTF-8.
+        if (bytes <= ChannelMaxCatalogueBytes)
+            catalogue = std::move(encoded);
+    }
+    catch (std::exception const&)
+    {
+        bytes = 0;
+    }
+    installed = {std::move(index), std::move(catalogue)};
+    return bytes;
+}
+
+AbilityIndex const& Abilities() { return Installed().index; }
+
+bool CatalogueInstalled() { return Installed().catalogue.is_object(); }
+
+// LC3: the installed catalogue's word for the topic.
 char const* StateTopicName(StateTopic topic)
 {
-    switch (topic)
-    {
-        case StateTopic::Inventory:
-            return "inventory";
-        case StateTopic::Quests:
-            return "quests";
-        case StateTopic::Cooldowns:
-            return "cooldowns";
-        case StateTopic::Strategies:
-            return "strategies";
-        case StateTopic::Spells:
-            return "spells";
-        case StateTopic::Plan:
-            return "plan";
-        case StateTopic::Options:
-            return "options";
-        case StateTopic::Route:
-            return "route";
-        case StateTopic::QuestPlan:
-            return "quest_plan";
-        case StateTopic::Bags:
-            return "bags";
-        case StateTopic::Places:
-            return "places";
-    }
+    for (auto const& row : Installed().index.rows)
+        if (row.topic && row.code == static_cast<uint8_t>(topic))
+            return row.name.c_str();
     return "";
 }
 
@@ -780,10 +981,16 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
                     query.place = Place(json.at("place"));
                 query.kind = QueryKind::BotState;
             }
-            else if (kind != "observable_group" ||
-                     !Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
-                                   "controllerGuid", "botGuid", "query"}))
-                return ChannelError::Invalid;
+            else
+            {
+                // LC3: the catalogue takes observable_group's keys; it is plain data and names no unit.
+                if ((kind != "observable_group" && kind != "catalogue") ||
+                    !Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
+                                  "controllerGuid", "botGuid", "query"}))
+                    return ChannelError::Invalid;
+                if (kind == "catalogue")
+                    query.kind = QueryKind::Catalogue;
+            }
             query.controllerGuid = Guid(json.at("controllerGuid"));
             query.botGuid = Guid(json.at("botGuid"));
             if (query.controllerGuid != current.controllerGuid || query.botGuid != current.botGuid)
@@ -976,6 +1183,32 @@ ChannelError ChannelPolicy::FinishTopic(ChannelEnvelope const& envelope, WorldSc
     }
 }
 
+ChannelError ChannelPolicy::FinishCatalogue(ChannelEnvelope const& envelope, WorldScope const& current, Clock now,
+                                            std::string& body)
+{
+    body.clear();
+    if (!Current(envelope, current, now) || _requests.at(envelope.requestId).work != ChannelWork::Query)
+        return ChannelError::Stale;
+    auto const& catalogue = Installed().catalogue;
+    if (!catalogue.is_object())
+        return ChannelError::Invalid;  // No index installed: the world answers unavailable before this.
+    try
+    {
+        auto json = EnvelopeJson(envelope, "query.result");
+        json["catalogue"] = catalogue;
+        auto encoded = json.dump();
+        if (encoded.size() > MaxResponseBytes)
+            return ChannelError::TooLarge;
+        _requests.at(envelope.requestId).terminal = true;
+        body = std::move(encoded);
+        return ChannelError::None;
+    }
+    catch (std::exception const&)
+    {
+        return ChannelError::Invalid;
+    }
+}
+
 ChannelError ChannelPolicy::FinishFailure(ChannelEnvelope const& envelope, ChannelFailure failure,
                                           WorldScope const& current, Clock now, std::string& body)
 {
@@ -1009,7 +1242,8 @@ ChannelError ChannelPolicy::FinishFailure(ChannelEnvelope const& envelope, Chann
 
 ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::string const& commandId,
                                           ChannelOutcome outcome, WorldScope const& current, Clock now,
-                                          std::string& body, CommandRefusal refusal)
+                                          std::string& body, CommandRefusal refusal, std::span<ChannelStep const> steps,
+                                          std::span<ChannelStepResult const> ran)
 {
     body.clear();
     if (!Current(envelope, current, now, false))
@@ -1021,12 +1255,31 @@ ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::
         return ChannelError::Duplicate;
     if (outcome != ChannelOutcome::Applied && outcome != ChannelOutcome::Rejected && outcome != ChannelOutcome::Failed)
         return ChannelError::Invalid;
+    // LC3: the steps that ran come first, each but the last applied; the order applied exactly when all of them did.
+    auto const applied = [](ChannelStepResult const& step) { return step.outcome == ChannelOutcome::Applied; };
+    if (!steps.empty() &&
+        (ran.size() > steps.size() || !std::all_of(ran.begin(), ran.end() - (ran.empty() ? 0 : 1), applied) ||
+         (outcome == ChannelOutcome::Applied) !=
+             (ran.size() == steps.size() && std::all_of(ran.begin(), ran.end(), applied))))
+        return ChannelError::Invalid;
+    auto const word = [](ChannelOutcome value)
+    {
+        return value == ChannelOutcome::Applied ? "applied" : value == ChannelOutcome::Rejected ? "rejected" : "failed";
+    };
+    // A step's reason as the executor worded it; one it left unworded reads as the old form's cannot_now or failed.
+    auto const reason = [](Json& json, ChannelStepResult const& step)
+    {
+        auto const words = DescribeRefusal(step.outcome == ChannelOutcome::Failed ? CommandRefusal::Failed
+                                                                                  : CommandRefusal::CannotNow);
+        json["reason"] = step.reason.empty() ? std::string(words.code) : step.reason;
+        json["reasonText"] = step.reason.empty() ? std::string(words.text) : step.reasonText;
+    };
     auto json = EnvelopeJson(envelope, "command.result");
     json["commandId"] = commandId;
-    json["outcome"] = outcome == ChannelOutcome::Applied    ? "applied"
-                      : outcome == ChannelOutcome::Rejected ? "rejected"
-                                                            : "failed";
-    if (outcome != ChannelOutcome::Applied)
+    json["outcome"] = word(outcome);
+    if (outcome != ChannelOutcome::Applied && !steps.empty() && !ran.empty() && !applied(ran.back()))
+        reason(json, ran.back());  // The step that ended the order gives it its reason.
+    else if (outcome != ChannelOutcome::Applied)
     {
         if (refusal == CommandRefusal::None)
             refusal = outcome == ChannelOutcome::Failed ? CommandRefusal::Failed : CommandRefusal::CannotNow;
@@ -1034,7 +1287,35 @@ ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::
         json["reason"] = words.code;
         json["reasonText"] = words.text;
     }
-    body = json.dump();
+    if (!steps.empty())
+    {
+        Json list = Json::array();
+        auto const& verbs = Installed().index.verbs;
+        for (std::size_t index = 0; index < steps.size(); ++index)
+        {
+            auto const verb = std::find_if(verbs.begin(), verbs.end(), [&](AbilityVerb const& entry)
+                                           { return entry.intent == steps[index].intent; });
+            Json step = {{"act", verb == verbs.end() ? std::string() : verb->name}};
+            if (index >= ran.size())
+                step["outcome"] = "skipped";  // After the ending step, or the order was refused before any ran.
+            else
+            {
+                step["outcome"] = word(ran[index].outcome);
+                if (!applied(ran[index]))
+                    reason(step, ran[index]);
+            }
+            list.push_back(std::move(step));
+        }
+        json["steps"] = std::move(list);
+    }
+    try
+    {
+        body = json.dump();
+    }
+    catch (std::exception const&)
+    {
+        return ChannelError::Invalid;  // Executor words that are not UTF-8: the command stays unanswered.
+    }
     found->second.terminal = true;
     return ChannelError::None;
 }

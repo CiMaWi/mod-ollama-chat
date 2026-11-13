@@ -4,6 +4,7 @@
 #include <set>
 #include <stdexcept>
 
+#include "bridge-ability-double.h"
 #include "mod-ollama-chat_bridge_channel.h"
 
 namespace
@@ -718,6 +719,190 @@ Json WatchWire(Fixture const& f, std::string const& id, Json condition = "combat
     return json;
 }
 
+// LC3: the installed ability index is the channel's only word list; query: catalogue answers with it.
+Json CatalogueQuery(Fixture const& f, std::string const& id)
+{
+    auto json = f.Query(id);
+    json["query"] = "catalogue";
+    return json;
+}
+
+void Catalogue()
+{
+    auto const bytes = SetAbilityIndex(TestAbilityIndex());
+    Check(bytes > 0 && bytes <= ChannelMaxCatalogueBytes && Abilities().rows.size() == 14 &&
+              Abilities().verbs.size() == 22 && CatalogueInstalled(),
+          "the double installs");
+    Check(ChannelMaxCatalogueBytes == 24576 && ChannelMaxCatalogueBytes + 4096 < MaxResponseBytes,
+          "the catalogue's budget leaves the transport headroom");
+
+    // A refused index leaves the channel none: no verb, no topic, no catalogue.
+    using Change = void (*)(AbilityIndex&);
+    Change const refused[] = {
+        [](AbilityIndex& index) { index.verbs.pop_back(); },
+        [](AbilityIndex& index) { index.verbs[1].name = index.verbs[0].name; },
+        [](AbilityIndex& index) { index.verbs[1].intent = ChannelIntent::Follow; },
+        [](AbilityIndex& index) { index.verbs[0].name = "Follow"; },
+        [](AbilityIndex& index) { index.verbs[0].intent = static_cast<ChannelIntent>(22); },
+        [](AbilityIndex& index) { index.verbs[3].name = "Regroup"; },
+        [](AbilityIndex& index) { index.verbs[3].intent = static_cast<ChannelIntent>(22); },
+        [](AbilityIndex& index) { index.rows[0].name = "chase"; },
+        [](AbilityIndex& index) { index.rows[1].code = static_cast<uint8_t>(ChannelIntent::Stay); },
+        [](AbilityIndex& index) { index.rows[4].name = index.rows[3].name; },
+        [](AbilityIndex& index) { index.rows[4].code = index.rows[3].code; },
+        [](AbilityIndex& index) { index.rows.back().code = static_cast<uint8_t>(StateTopicCount); },
+        [](AbilityIndex& index) { index.rows[3].name = "inventory items"; },
+        [](AbilityIndex& index) { index.rows.clear(); },
+        [](AbilityIndex& index) { index.version = 0; },
+        [](AbilityIndex& index) { index.maxSteps = 0; },
+    };
+    for (Change change : refused)
+    {
+        auto index = TestAbilityIndex();
+        change(index);
+        Check(SetAbilityIndex(std::move(index)) == 0, "a malformed index is refused before it is encoded");
+        Fixture f;
+        f.Open();
+        Check(Abilities().rows.empty() && Abilities().verbs.empty() && !CatalogueInstalled() &&
+                  f.Receive(f.Command()) == ChannelError::Invalid &&
+                  f.Receive(StateQuery(f, "refused-topic", "quests")) == ChannelError::Invalid &&
+                  !*StateTopicName(StateTopic::Quests) && f.policy.CommandReservations() == 0,
+              "a refused index leaves no verb, no topic and no topic name");
+    }
+    // LC3b (LC3a review 1): a catalogue the query cannot send, over its budget or not UTF-8, drops only the
+    // catalogue: the verbs and topics stand.
+    auto const standing = [](char const* label)
+    {
+        Fixture f;
+        f.Open();
+        Check(Abilities().rows.size() == 14 && Abilities().verbs.size() == 22 && !CatalogueInstalled() &&
+                  f.Receive(f.Command("standing")) == ChannelError::None &&
+                  f.Receive(StateQuery(f, "standing-topic", "quests")) == ChannelError::None &&
+                  std::string(StateTopicName(StateTopic::Quests)) == "quests",
+              label);
+    };
+    auto large = TestAbilityIndex();
+    large.rows[0].sentence = std::string(ChannelMaxCatalogueBytes, 'x');
+    Check(SetAbilityIndex(std::move(large)) > ChannelMaxCatalogueBytes, "a catalogue over its budget, with its size");
+    standing("a catalogue over its budget drops only the catalogue");
+    auto broken = TestAbilityIndex();
+    broken.rows[0].sentence = "\xC3";
+    Check(SetAbilityIndex(std::move(broken)) == 0, "a catalogue that is not UTF-8 has no size");
+    standing("a catalogue that is not UTF-8 drops only the catalogue");
+
+    // The words are the index's: a renamed verb or topic is taken under its new word only.
+    auto renamed = TestAbilityIndex();
+    renamed.verbs[1].name = "hold";
+    renamed.rows[8].name = "plans";
+    renamed.rows.erase(renamed.rows.begin() + 4);
+    Check(SetAbilityIndex(std::move(renamed)) > 0, "a renamed double installs");
+    {
+        Fixture f;
+        f.Open();
+        auto stay = f.Command("renamed");
+        Check(f.Receive(stay) == ChannelError::Invalid, "the old word is no verb once the index renames it");
+        stay["intent"] = "hold";
+        ChannelMessage result;
+        Check(f.policy.Receive(bearer, stay.dump(), f.scope, now, result, "work") == ChannelError::None &&
+                  std::get<ChannelCommand>(result.payload).intent == ChannelIntent::Stay,
+              "the index's word decodes to its intent");
+        Check(f.Receive(StateQuery(f, "old-topic", "plan")) == ChannelError::Invalid &&
+                  f.Receive(StateQuery(f, "gone-topic", "quests")) == ChannelError::Invalid &&
+                  f.Receive(StateQuery(f, "kept-topic", "inventory")) == ChannelError::None,
+              "only a topic the index lists is taken");
+        auto const plans = Topic(f, "new-topic", StateTopic::Plan, {{"rpg_travel", "goal", 1, 2}});
+        Check(plans.size() == 1 && std::string(StateTopicName(StateTopic::Plan)) == "plans",
+              "a topic is answered under the index's word");
+    }
+    Check(InstallTestAbilities(), "the double installs again");
+    {
+        Fixture f;
+        f.Open();
+        Check(f.Receive(StateQuery(f, "act-topic", "follow")) == ChannelError::Invalid, "an act is no bot_state topic");
+        auto verb = f.Command("topic-verb");
+        verb["intent"] = "inventory";
+        Check(f.Receive(verb) == ChannelError::Invalid, "a topic is no verb");
+    }
+
+    // The query: observable_group's keys, the route's own bot, an id of its own.
+    Fixture f;
+    f.Open();
+    auto extra = CatalogueQuery(f, "cat-extra");
+    extra["topic"] = "plan";
+    Check(f.Receive(extra) == ChannelError::Invalid, "catalogue takes no topic");
+    auto missing = CatalogueQuery(f, "cat-missing");
+    missing.erase("botGuid");
+    Check(f.Receive(missing) == ChannelError::Invalid, "catalogue takes the route's keys");
+    auto other = CatalogueQuery(f, "cat-other");
+    other["botGuid"] = "12";
+    Check(f.Receive(other) == ChannelError::Stale, "catalogue only for the route's own bot");
+    auto upper = CatalogueQuery(f, "cat-upper");
+    upper["query"] = "Catalogue";
+    Check(f.Receive(upper) == ChannelError::Invalid, "an unknown query stays invalid");
+    ChannelMessage message;
+    Check(f.policy.Receive(bearer, CatalogueQuery(f, "cat").dump(), f.scope, now, message, "work") ==
+                  ChannelError::None &&
+              std::get<ChannelQuery>(message.payload).kind == QueryKind::Catalogue,
+          "a catalogue query admitted, typed");
+    Check(f.Receive(CatalogueQuery(f, "cat")) == ChannelError::Duplicate, "catalogue id replay refused");
+    Check(f.Receive(f.Command("effect-catalogue", "cat")) == ChannelError::Invalid,
+          "a catalogue query id never authorizes a command");
+
+    // The answer: the installed index field for field, hash as 16 lowercase hex digits, within its budget.
+    std::string body;
+    Check(f.policy.FinishCatalogue(message.envelope, f.scope, now, body) == ChannelError::None, "catalogue answered");
+    auto const json = Json::parse(body);
+    Check(json.size() == 8 && json.at("type") == "query.result" && json.at("version") == 1 &&
+              json.at("requestId") == "cat",
+          "a query.result envelope that holds the catalogue");
+    auto const& catalogue = json.at("catalogue");
+    Check(catalogue.size() == 5 && catalogue.at("hash") == "0a1b2c3d4e5f6071" && catalogue.at("version") == 1 &&
+              catalogue.at("maxSteps") == 3 &&
+              catalogue.at("abilities") == Json::array({"catalogue", "names", "steps"}) &&
+              catalogue.at("rows").size() == 14,
+          "hash, version, abilities, the most steps and every row");
+    Check(catalogue.at("rows").at(1) == Json::parse(R"({"kind":"act","name":"mark",
+              "sentence":"Put a raid icon on a unit you can see.",
+              "params":[{"name":"target","kind":"unit","sentence":"The unit to mark, by name.","choices":[]},
+                        {"name":"icon","kind":"choice","sentence":"The raid icon to put on it.",
+                         "choices":["star","circle","diamond","triangle","moon","square","cross","skull"]}],
+              "refusals":[{"word":"battleground","sentence":"Not here; I have my own fight to see to."},
+                          {"word":"travelling","sentence":"I cannot do that while I am in flight."},
+                          {"word":"dead","sentence":"I am in no state to do anything right now."},
+                          {"word":"not_in_group","sentence":"We are not in the same group."},
+                          {"word":"unknown_name","sentence":"I do not know what you mean by that."}],
+              "effect":"none","done":"at_once","state":"marking {target}","event":"BridgeAct","limit":0})"),
+          "an act row, field for field");
+    Check(catalogue.at("rows").at(10) == Json::parse(R"({"kind":"topic","name":"route","sentence":"Your route.",
+              "params":[{"name":"place","kind":"place","sentence":"A known place's name.","choices":[]}],
+              "refusals":[],"effect":"none","done":"at_once","state":"","event":"","limit":12})"),
+          "a topic row, field for field");
+    Check(catalogue.at("rows").at(0).at("name") == "follow" && catalogue.at("rows").at(2).at("name") == "go_to" &&
+              catalogue.at("rows").at(3).at("name") == "inventory" &&
+              catalogue.at("rows").at(13).at("name") == "places",
+          "the rows in the index's order");
+    Check(body.size() < ChannelMaxCatalogueBytes, "the answer is below its budget");
+    Check(f.policy.FinishCatalogue(message.envelope, f.scope, now, body) == ChannelError::Stale && body.empty(),
+          "a catalogue is answered once");
+    f.Open("gen-catalogue");
+    ChannelEnvelope generation{f.scope.instance, f.scope.provider, f.scope.epoch, "gen-catalogue", deadline.unixMs};
+    Check(f.policy.FinishCatalogue(generation, f.scope, now, body) == ChannelError::Stale && body.empty(),
+          "a generation route never carries a catalogue");
+
+    // Without an index the query is still admitted, and no catalogue is answered.
+    SetAbilityIndex({});
+    Fixture none;
+    none.Open();
+    ChannelMessage asked;
+    std::string empty;
+    Check(none.policy.Receive(bearer, CatalogueQuery(none, "cat-none").dump(), none.scope, now, asked, "work") ==
+                  ChannelError::None &&
+              none.policy.FinishCatalogue(asked.envelope, none.scope, now, empty) == ChannelError::Invalid &&
+              empty.empty(),
+          "no catalogue without an index");
+    Check(InstallTestAbilities(), "the double installs once more");
+}
+
 void Watches()
 {
     Fixture f;
@@ -836,8 +1021,277 @@ void Watches()
           "watch: none after the terminal result");
 }
 
+// LC3b: a stepped command, 1..maxSteps acts of the installed catalogue, each with exactly its parameters.
+Json StepWire(Fixture const& f, std::string const& id, Json steps)
+{
+    auto json = f.Command(id);
+    json.erase("intent");
+    json.erase("params");
+    json["steps"] = std::move(steps);
+    return json;
+}
+
+Json Step(char const* act, Json params = Json::object()) { return {{"act", act}, {"params", std::move(params)}}; }
+
+// The steps of one stepped command admitted on a fresh route, as its only reservation.
+std::vector<ChannelStep> Decoded(Json steps, char const* label)
+{
+    Fixture f;
+    f.Open();
+    ChannelMessage message;
+    Check(f.policy.Receive(bearer, StepWire(f, "stepped", std::move(steps)).dump(), f.scope, now, message, "work") ==
+                  ChannelError::None &&
+              f.policy.CommandReservations() == 1,
+          label);
+    return std::get<ChannelCommand>(message.payload).steps;
+}
+
+void Stepped()
+{
+    Check(SetAbilityIndex(TestStepAbilityIndex()) > 0 && Abilities().rows.size() == 21, "the stepped double installs");
+    auto const three =
+        Decoded(Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
+                             Step("go_to", {{"place", "Goldshire"}}), Step("position", {{"place", "1.5,-2.25,30,0"}})}),
+                "three steps decode");
+    Check(three.size() == 3 && three[0].intent == ChannelIntent::Mark && three[0].targetName == "Hogger" &&
+              !three[0].targetGuid && three[0].icon == 7 && three[1].intent == ChannelIntent::GoTo &&
+              three[1].place == "Goldshire" && three[2].intent == ChannelIntent::Position && three[2].position &&
+              three[2].position->x == 1.5 && three[2].position->y == -2.25 && three[2].position->z == 30 &&
+              three[2].position->mapId == 0 && three[2].place.empty(),
+          "each step's act and parameters, in order; a name as given, a choice as its index, a spot parsed");
+    auto const ids =
+        Decoded(Json::array({Step("focus_healing", {{"targetGuid", "44"}}), Step("quest", {{"questId", 42}}),
+                             Step("mark", {{"targetGuid", "45"}, {"icon", "star"}})}),
+                "ids decode");
+    Check(ids[0].intent == ChannelIntent::FocusHealing && ids[0].targetGuid == 44 && ids[0].targetName.empty() &&
+              ids[1].intent == ChannelIntent::Quest && ids[1].questId == 42 && ids[1].questName.empty() &&
+              ids[2].targetGuid == 45 && ids[2].icon == 0,
+          "a unit and a quest by id");
+    auto const named =
+        Decoded(Json::array({Step("quest", {{"quest", "The Collector"}}),
+                             Step("attack_own_target", {{"target", std::string(ChannelMaxPlaceName, 'a')}})}),
+                "names decode");
+    Check(named[0].questName == "The Collector" && !named[0].questId &&
+              named[1].intent == ChannelIntent::AttackOwnTarget && named[1].targetName.size() == ChannelMaxPlaceName,
+          "a quest by title, a unit by a name of the longest length");
+    auto const choices = Decoded(
+        Json::array({Step("formation", {{"shape", "line"}}), Step("save_mana", {{"enabled", false}}), Step("stay")}),
+        "choices and flags decode");
+    Check(choices[0].shape == 2 && choices[1].enabled == false && choices[2].intent == ChannelIntent::Stay &&
+              !choices[2].icon && !choices[2].shape && !choices[2].enabled,
+          "a shape as its choice's index, a flag as given, an act without parameters");
+    {
+        Fixture f;
+        f.Open();
+        auto const wire = StepWire(f, "replayed", Json::array({Step("stay"), Step("stay")}));
+        Check(f.Receive(wire) == ChannelError::None && f.Receive(wire) == ChannelError::Duplicate &&
+                  f.policy.CommandReservations() == 1,
+              "one reservation per stepped order; a replay is a duplicate");
+    }
+    std::string const longName(ChannelMaxPlaceName + 1, 'a');
+    struct Bad
+    {
+        Json steps;
+        char const* label;
+    };
+    Bad const bad[] = {
+        {Json::object(), "steps are an array"},
+        {Json::array(), "no step"},
+        {Json::array({Step("stay"), Step("stay"), Step("stay"), Step("stay")}), "more steps than the catalogue's most"},
+        {Json::array({Step("chase")}), "an unknown act"},
+        {Json::array({Step("inventory")}), "a topic is no act"},
+        {Json::array({Step("regroup")}), "a verb without a row is no act"},
+        {Json::array({Step("Stay")}), "an act is its exact word"},
+        {Json::array({Json{{"act", 3}, {"params", Json::object()}}}), "an act is a word"},
+        {Json::array({Json{{"act", "stay"}}}), "a step without params"},
+        {Json::array({Json{{"act", "stay"}, {"params", Json::object()}, {"why", 1}}}), "a step key the wire lacks"},
+        {Json::array({Json{{"act", "stay"}, {"params", Json::array()}}}), "params are an object"},
+        {Json::array({Step("stay", {{"target", "Hogger"}})}), "a parameter the act does not take"},
+        {Json::array({Step("go_to", {{"place", "Goldshire"}, {"icon", "star"}})}), "an extra parameter"},
+        {Json::array({Step("mark", {{"target", "Hogger"}, {"targetGuid", "44"}, {"icon", "star"}})}),
+         "a unit by name and by id"},
+        {Json::array({Step("mark", {{"icon", "star"}})}), "a unit act without its unit"},
+        {Json::array({Step("mark", {{"target", "Hogger"}})}), "a missing choice"},
+        {Json::array({Step("mark", {{"targetGuid", "abc"}, {"icon", "star"}})}), "a bad guid"},
+        {Json::array({Step("mark", {{"target", "Hogger"}, {"icon", 3}})}), "an icon is a choice word, not a number"},
+        {Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "Skull"}})}), "a choice is its exact word"},
+        {Json::array({Step("formation", {{"shape", "circle"}})}), "a shape not among the choices"},
+        {Json::array({Step("quest", {{"quest", "The Collector"}, {"questId", 42}})}), "a quest by title and by id"},
+        {Json::array({Step("quest")}), "a quest act without its quest"},
+        {Json::array({Step("quest", {{"questId", 0}})}), "quest id zero"},
+        {Json::array({Step("quest", {{"questId", 4294967296LL}})}), "a quest id past 32 bits"},
+        {Json::array({Step("quest", {{"questId", "42"}})}), "a quest id is a number"},
+        {Json::array({Step("focus_healing", {{"target", longName}})}), "a name over 64 bytes"},
+        {Json::array({Step("focus_healing", {{"target", ""}})}), "an empty name"},
+        {Json::array({Step("focus_healing", {{"target", "Hog\tger"}})}), "a control character in a name"},
+        {Json::array({Step("quest", {{"quest", " "}})}), "a blank title"},
+        {Json::array({Step("go_to", {{"place", 7}})}), "a place is text"},
+        {Json::array({Step("save_mana", {{"enabled", "yes"}})}), "a flag is a boolean"},
+        {Json::array({Step("save_mana", {{"enabled", 1}})}), "a flag is no number"},
+        {Json::array({Step("position", {{"place", "1,2,3"}})}), "a spot needs its map"},
+        {Json::array({Step("position", {{"place", "1,2,3,-1"}})}), "a negative map"},
+        {Json::array({Step("position", {{"place", "1,2,3,0.5"}})}), "a fractional map"},
+        {Json::array({Step("position", {{"place", "1,2,3,4294967296"}})}), "a map past 32 bits"},
+        {Json::array({Step("position", {{"place", "inf,1,1,0"}})}), "an infinite coordinate"},
+        {Json::array({Step("position", {{"place", "nan,1,1,0"}})}), "a coordinate that is no number"},
+        {Json::array({Step("position", {{"place", " 1,2,3,0"}})}), "a spot with a space"},
+        {Json::array({Step("position", {{"place", "1,2,3,0,"}})}), "a spot with a trailing comma"},
+        {Json::array({Step("position", {{"place", "1,,3,0"}})}), "an empty coordinate"},
+        {Json::array({Step("position", {{"place", Json::array({1, 2, 3, 0})}})}), "a spot is text"},
+        {Json::array({Step("position", {{"place", "Goldshire"}})}), "a position takes a spot, not a name"},
+        {Json::array({Step("stay"), Step("chase")}), "one bad step refuses the order"},
+    };
+    for (std::size_t at = 0; at < std::size(bad); ++at)
+    {
+        Fixture f;
+        f.Open();
+        Check(f.Receive(StepWire(f, "bad-" + std::to_string(at), bad[at].steps)) == ChannelError::Invalid &&
+                  f.policy.CommandReservations() == 0,
+              bad[at].label);
+    }
+    {
+        Fixture f;
+        f.Open();
+        auto both = StepWire(f, "both", Json::array({Step("stay")}));
+        both["intent"] = "stay";
+        auto withParams = StepWire(f, "with-params", Json::array({Step("stay")}));
+        withParams["params"] = Json::object();
+        auto noBot = StepWire(f, "no-bot", Json::array({Step("stay")}));
+        noBot.erase("botGuid");
+        auto oldNamed = f.Command("old-named");
+        oldNamed["intent"] = "mark";
+        oldNamed["params"] = {{"target", "Hogger"}, {"icon", 3}};
+        Check(f.Receive(both) == ChannelError::Invalid && f.Receive(withParams) == ChannelError::Invalid &&
+                  f.Receive(noBot) == ChannelError::Invalid && f.Receive(oldNamed) == ChannelError::Invalid &&
+                  f.policy.CommandReservations() == 0,
+              "steps beside intent or params, without the scope's keys, or a name in the old form: invalid");
+    }
+    auto two = TestStepAbilityIndex();
+    two.maxSteps = 2;
+    Check(SetAbilityIndex(std::move(two)) > 0, "a two-step double installs");
+    {
+        Fixture f;
+        f.Open();
+        Check(f.Receive(StepWire(f, "two", Json::array({Step("stay"), Step("stay")}))) == ChannelError::None &&
+                  f.Receive(StepWire(f, "three", Json::array({Step("stay"), Step("stay"), Step("stay")}))) ==
+                      ChannelError::Invalid,
+              "the most steps are the installed catalogue's");
+    }
+    Check(InstallTestAbilities(), "the plain double installs again");
+    {
+        Fixture f;
+        f.Open();
+        Check(f.Receive(StepWire(f, "rowless", Json::array({Step("stay")}))) == ChannelError::Invalid &&
+                  f.Receive(StepWire(f, "rowed", Json::array({Step("follow")}))) == ChannelError::None,
+              "an act is a row of the installed catalogue");
+    }
+}
+
+// LC3b: a stepped command's result keeps the old shape and adds one entry per submitted step.
+struct Finished
+{
+    ChannelError error = ChannelError::None;
+    Json json;
+};
+
+// Admits the command (old form when steps is null) on a fresh route and finishes it once, then checks a second
+// finish is refused.
+Finished Finish(Json const& steps, ChannelOutcome outcome, std::vector<ChannelStepResult> const& ran,
+                CommandRefusal refusal)
+{
+    Fixture f;
+    f.Open();
+    ChannelMessage message;
+    auto const wire = steps.is_null() ? f.Command("done") : StepWire(f, "done", steps);
+    Check(f.policy.Receive(bearer, wire.dump(), f.scope, now, message, "work") == ChannelError::None,
+          "the command admitted");
+    auto const& command = std::get<ChannelCommand>(message.payload);
+    std::string body;
+    auto const error =
+        f.policy.FinishCommand(message.envelope, "done", outcome, f.scope, now, body, refusal, command.steps, ran);
+    Check((error == ChannelError::None) != body.empty(), "a body exactly when answered");
+    Finished result{error, body.empty() ? Json() : Json::parse(body)};
+    if (error == ChannelError::None)
+        Check(f.policy.FinishCommand(message.envelope, "done", outcome, f.scope, now, body, refusal, command.steps,
+                                     ran) == ChannelError::Duplicate &&
+                  body.empty(),
+              "a stepped result is answered once");
+    return result;
+}
+
+void SteppedResults()
+{
+    Check(SetAbilityIndex(TestStepAbilityIndex()) > 0, "the stepped double installs");
+    ChannelStepResult const ok{ChannelOutcome::Applied, "", ""};
+    ChannelStepResult const place{ChannelOutcome::Rejected, "unknown_place", "I do not know that place."};
+    Json const three = Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
+                                    Step("go_to", {{"place", "Goldshire"}}), Step("stay")});
+    auto const old = Finish(Json(), ChannelOutcome::Applied, {}, CommandRefusal::None);
+    Check(old.error == ChannelError::None && old.json.at("outcome") == "applied" && !old.json.contains("steps") &&
+              !old.json.contains("reason"),
+          "the old form's result has no steps");
+    auto const applied = Finish(three, ChannelOutcome::Applied, {ok, ok, ok}, CommandRefusal::None);
+    Check(applied.error == ChannelError::None && applied.json.at("outcome") == "applied" &&
+              !applied.json.contains("reason") && applied.json.size() == 10 &&
+              applied.json.at("steps") == Json::parse(R"([{"act":"mark","outcome":"applied"},
+                  {"act":"go_to","outcome":"applied"},{"act":"stay","outcome":"applied"}])"),
+          "every step applied: the order applied, each step listed in order");
+    auto const second = Finish(three, ChannelOutcome::Rejected, {ok, place}, CommandRefusal::CannotNow);
+    Check(second.error == ChannelError::None && second.json.at("outcome") == "rejected" &&
+              second.json.at("reason") == "unknown_place" &&
+              second.json.at("reasonText") == "I do not know that place." &&
+              second.json.at("steps") == Json::parse(R"([{"act":"mark","outcome":"applied"},
+                  {"act":"go_to","outcome":"rejected","reason":"unknown_place",
+                   "reasonText":"I do not know that place."},{"act":"stay","outcome":"skipped"}])"),
+          "a refused step ends the order with its words; the steps after it are skipped");
+    auto const failedWords = DescribeRefusal(CommandRefusal::Failed);
+    auto const failed = Finish(three, ChannelOutcome::Failed, {{ChannelOutcome::Failed, "", ""}}, CommandRefusal::None);
+    Check(failed.json.at("outcome") == "failed" && failed.json.at("reason") == failedWords.code &&
+              failed.json.at("steps").at(0) == Json{{"act", "mark"},
+                                                    {"outcome", "failed"},
+                                                    {"reason", failedWords.code},
+                                                    {"reasonText", failedWords.text}} &&
+              failed.json.at("steps").at(1) == Json{{"act", "go_to"}, {"outcome", "skipped"}},
+          "an unworded failure reads as the old form's failed");
+    auto const cannot = DescribeRefusal(CommandRefusal::CannotNow);
+    auto const unworded =
+        Finish(three, ChannelOutcome::Rejected, {ok, {ChannelOutcome::Rejected, "", ""}}, CommandRefusal::None);
+    Check(unworded.json.at("reason") == cannot.code && unworded.json.at("steps").at(1).at("reason") == cannot.code &&
+              unworded.json.at("steps").at(1).at("reasonText") == cannot.text,
+          "an unworded refusal reads cannot_now");
+    auto const early = Finish(three, ChannelOutcome::Rejected, {}, CommandRefusal::TooSoon);
+    Check(early.json.at("outcome") == "rejected" && early.json.at("reason") == "too_soon" &&
+              early.json.at("steps") == Json::parse(R"([{"act":"mark","outcome":"skipped"},
+                  {"act":"go_to","outcome":"skipped"},{"act":"stay","outcome":"skipped"}])"),
+          "an order refused before any step ran: every step skipped, the order's own reason");
+    struct Guard
+    {
+        ChannelOutcome outcome;
+        std::vector<ChannelStepResult> ran;
+        char const* label;
+    };
+    Guard const guards[] = {
+        {ChannelOutcome::Applied, {ok, ok}, "applied with a step that never ran"},
+        {ChannelOutcome::Applied, {ok, ok, ok, ok}, "more steps ran than were sent"},
+        {ChannelOutcome::Rejected, {place, ok}, "a step ran after a refused one"},
+        {ChannelOutcome::Rejected, {ok, ok, ok}, "refused though every step applied"},
+        {ChannelOutcome::Applied, {ok, place}, "applied though a step was refused"},
+    };
+    for (Guard const& guard : guards)
+    {
+        auto const refused = Finish(three, guard.outcome, guard.ran, CommandRefusal::None);
+        Check(refused.error == ChannelError::Invalid && refused.json.is_null(), guard.label);
+    }
+    Check(InstallTestAbilities(), "the plain double installs again");
+}
+
 int main()
 {
+    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    {
+        std::cerr << "FAIL: the ability double was refused\n";
+        return 1;
+    }
     try
     {
         IdentityAndTerminal();
@@ -846,6 +1300,9 @@ int main()
         QueriesEventsAndCapacity();
         Topics();
         Watches();
+        Catalogue();
+        Stepped();
+        SteppedResults();
         std::cout << "PASS " << checks << " production channel checks\n";
         return 0;
     }

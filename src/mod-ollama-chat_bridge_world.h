@@ -343,7 +343,8 @@ private:
                      EffectPhase const* phase, bool& armed, std::string& body);
     ChannelError Finish(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
                         WorldScope const& scope, Clock now, std::string& body,
-                        CommandRefusal refusal = CommandRefusal::None);
+                        CommandRefusal refusal = CommandRefusal::None, std::span<ChannelStep const> steps = {},
+                        std::span<ChannelStepResult const> ran = {});
     bool ReceiptCurrent(WorldTicket const& ticket, Clock now) const;
     WorldPolicy& _world;
     QueryWorldSource* const _source;   // WORLD ONLY; never copied into a packet or worker task.

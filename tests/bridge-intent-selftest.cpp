@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "bridge-ability-double.h"
 #include "mod-ollama-chat_bridge_channel.h"
 
 namespace
@@ -339,7 +340,7 @@ void TypedRefusals()
 {
     auto invalid = [](ChannelIntent intent, ChannelParams params)
     {
-        Check(!MapIntent({"order", Controller, Bot, intent, params}, Current()),
+        Check(!MapIntent({"order", Controller, Bot, intent, params, {}}, Current()),
               "typed callers cannot bypass enum/variant or value constraints");
     };
     invalid(static_cast<ChannelIntent>(255), {});
@@ -452,7 +453,7 @@ void PartnerRules()
 void RefusalWords()
 {
     std::set<std::string> codes;
-    for (unsigned value = 1; value <= static_cast<unsigned>(CommandRefusal::AlreadyThere); ++value)
+    for (unsigned value = 1; value <= static_cast<unsigned>(CommandRefusal::UnknownName); ++value)
     {
         auto const words = DescribeRefusal(static_cast<CommandRefusal>(value));
         std::string const code = words.code;
@@ -492,6 +493,9 @@ void RefusalWords()
     Check(said(CommandRefusal::NothingHere, "nothing_here", "There is nothing for me to do here."),
           "nothing_here sentence");
     Check(said(CommandRefusal::AlreadyThere, "already_there", "I am already there."), "already_there sentence");
+    // LC3: playerbots' sentence for a name it does not know (a named order).
+    Check(said(CommandRefusal::UnknownName, "unknown_name", "I do not know what you mean by that."),
+          "unknown_name sentence");
     Check(said(CommandRefusal::Failed, "failed", "I tried, but it did not work."), "failed sentence");
 }
 
@@ -520,6 +524,11 @@ void StagedCommandCurrentness()
 
 int main()
 {
+    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    {
+        std::cerr << "FAIL: the ability double was refused\n";
+        return 1;
+    }
     try
     {
         Mapping();

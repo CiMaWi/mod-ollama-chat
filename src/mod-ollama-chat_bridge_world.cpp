@@ -233,12 +233,13 @@ ChannelError WorldChannel::Take(std::string_view bearer, uint64_t receipt, std::
 }
 
 ChannelError WorldChannel::Finish(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
-                                  WorldScope const& scope, Clock now, std::string& body, CommandRefusal refusal)
+                                  WorldScope const& scope, Clock now, std::string& body, CommandRefusal refusal,
+                                  std::span<ChannelStep const> steps, std::span<ChannelStepResult const> ran)
 {
     ++(outcome == ChannelOutcome::Applied  ? _stats.applied
        : outcome == ChannelOutcome::Failed ? _stats.failed
                                            : _stats.refused);
-    return _policy.FinishCommand(envelope, commandId, outcome, scope, now, body, refusal);
+    return _policy.FinishCommand(envelope, commandId, outcome, scope, now, body, refusal, steps, ran);
 }
 
 ChannelError WorldChannel::Command(Binding const& binding, ChannelEnvelope const& envelope,
@@ -249,14 +250,17 @@ ChannelError WorldChannel::Command(Binding const& binding, ChannelEnvelope const
     attempted = false;
     ++_stats.proposed;
     // DS.3 fixed refusal before any game read: unsupported verb, no executor or world phase, or rate denial.
-    // J5e: each refusal names its reason (the rate gate is consulted only when the others pass, as before).
-    CommandRefusal const fixed = !EffectSupported(command.intent)                       ? CommandRefusal::NotSupported
+    // J5e: each refusal names its reason (the rate gate is consulted only when the others pass, as before). LC3: a
+    // stepped command's acts are catalogue rows, each with its effect (Receive takes no other verb in that form), and
+    // the rate gate admits the whole order once: one slot, one authorization, however many steps it holds.
+    bool const supported = !command.steps.empty() || EffectSupported(command.intent);
+    CommandRefusal const fixed = !supported                                             ? CommandRefusal::NotSupported
                                  : !_executor || !phase                                 ? CommandRefusal::Unavailable
                                  : !_rate.Admit(binding.ticket.scope.botGuid, _clock()) ? CommandRefusal::TooSoon
                                                                                         : CommandRefusal::None;
     if (fixed != CommandRefusal::None)
         return Finish(envelope, command.commandId, ChannelOutcome::Rejected, binding.ticket.scope, _clock(), body,
-                      fixed);
+                      fixed, command.steps);
     Binding const bound = binding;  // Executor game code must not depend on map storage it could disturb.
     bool asked = false;
     std::optional<Clock> authorized;
@@ -274,11 +278,16 @@ ChannelError WorldChannel::Command(Binding const& binding, ChannelEnvelope const
     };
     ++_stats.attempts;
     auto const result = _executor->Execute(*phase, bound.ticket, bound.guard, command, authorize);
-    attempted = authorized && (result == EffectResult::Applied || result == EffectResult::Failed);
+    auto const ran = command.steps.empty() ? std::vector<ChannelStepResult>() : _executor->Steps();
+    // LC3: an earlier step of a stepped order may have written although a later one ended it.
+    attempted = authorized && (result == EffectResult::Applied || result == EffectResult::Failed ||
+                               std::any_of(ran.begin(), ran.end(), [](ChannelStepResult const& step)
+                                           { return step.outcome != ChannelOutcome::Rejected; }));
     // The outcome is recorded once at its authorization time; receipt exposure is joined separately afterwards.
     auto const outcome = EffectOutcome(result, authorized.has_value());
     return Finish(envelope, command.commandId, outcome, bound.ticket.scope, authorized.value_or(_clock()), body,
-                  outcome == ChannelOutcome::Rejected ? _executor->Refusal() : CommandRefusal::None);
+                  outcome == ChannelOutcome::Rejected ? _executor->Refusal() : CommandRefusal::None, command.steps,
+                  ran);
 }
 
 ChannelError WorldChannel::Arm(Binding const& binding, ChannelEnvelope const& envelope, ChannelWatch const& watch,
@@ -364,7 +373,18 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
                 {
                     QueryObservation capture;
                     std::vector<StateEntry> entries;
-                    if (query->kind == QueryKind::BotState)
+                    if (query->kind == QueryKind::Catalogue)
+                    {
+                        // LC3: plain data installed at startup; it names no unit, so there is no observation to
+                        // recheck (the route checks still apply). Without an index, or with a catalogue it could not
+                        // send, the module has no catalogue.
+                        packet->error = !CatalogueInstalled()
+                                            ? _policy.FinishFailure(message.envelope, ChannelFailure::Unavailable,
+                                                                    binding.ticket.scope, _clock(), packet->body)
+                                            : _policy.FinishCatalogue(message.envelope, binding.ticket.scope, _clock(),
+                                                                      packet->body);
+                    }
+                    else if (query->kind == QueryKind::BotState)
                     {
                         // J5f-b: the bot's own state, read now on the world thread; it names no other unit, so
                         // there is no observation to recheck before publication (the route checks still apply).

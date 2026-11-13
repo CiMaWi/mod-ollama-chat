@@ -22,14 +22,14 @@ work replies must preserve the original wall deadline exactly. Wall-clock rollba
 
 | Type | Additional exact fields | Owner/direction |
 | --- | --- | --- |
-| query | controllerGuid, botGuid, query:"observable_group", or query:"bot_state" with topic (route: and place) | Authenticated native to game |
-| command | commandId, issuerGuid, botGuid, intent, params | Authenticated native to game; staged typed proposal |
+| query | controllerGuid, botGuid, query:"observable_group" or "catalogue", or query:"bot_state" with topic (route: and place) | Authenticated native to game |
+| command | commandId, issuerGuid, botGuid, and intent, params (the old form) or steps (LC3b) | Authenticated native to game; staged typed proposal |
 | generation.result | text (1..4096 bytes, usable text, no NUL) | Authenticated native to game |
 | events.result | none | Authenticated native to game |
 | failure | code: unavailable/timeout/invalid_input/cancelled | Authenticated native to game, or game FinishFailure; terminal |
 | events | controllerGuid, botGuid, events | Game-created by OpenEvents |
-| query.result | units | Game-created by FinishQuery |
-| command.result | commandId, outcome: applied/rejected/failed | Game-created by FinishCommand |
+| query.result | units; a catalogue query: catalogue | Game-created by FinishQuery, FinishCatalogue |
+| command.result | commandId, outcome: applied/rejected/failed; a stepped command: steps | Game-created by FinishCommand |
 
 Generation encoding remains the existing J4 builder; `OpenGeneration` registers its exact game-owned id/scope/deadline
 without duplicating that builder. Events contain 1..32 typed `observed_mark` entries with exactly kind, targetGuid
@@ -64,6 +64,52 @@ already_there. A bot_state query names one topic; route, and only route, also na
 world thread hands to playerbots' topic reader as a value. The planner topics (plan, options, route, quest_plan, bags,
 places) share one entry shape: row (a fixed word per topic, from `StateTopicRow`), name, value and extra.
 Retirement selects no new epoch until every retired plan is restored or dropped.
+
+LC3: the verbs and the topic words are playerbots' (`PlayerbotBridge::IntentWord`/`FindIntent` and `TopicRows`).
+The game adapter hands them to the channel once, on the world thread at startup (`OllamaDispatch_Start` calls
+`OllamaChat_BridgeInstallAbilities`), as a plain-data `AbilityIndex`: the catalogue rows, the 22 verbs and the
+hash. The module keeps no word list of its own; the 22 verbs and 11 topic words of the old wire are unchanged.
+A new topic still needs its `StateTopic` value and entry shape here (playerbots' `.agents/docs/ai-engine.md`).
+The install is fail-closed. An index whose verbs, row names, act/verb pairs or topic codes disagree installs
+nothing, and the module then takes no command and no bot_state query; the log says `Bridge ability catalogue
+refused` (error). LC3b: an index whose catalogue cannot be sent (text that is not UTF-8, or over 24576 encoded
+bytes) installs without it: commands and bot_state queries stand, the catalogue query answers `unavailable`, and
+the log says `Bridge ability catalogue not sent` (error). Otherwise the log says `Bridge ability catalogue:
+N rows, hash H, B bytes.` (info). The handler's static_assert ties playerbots' `IntentCount` to the module's
+`ChannelIntentCount` and its intent pairs, so a new playerbots act fails the build until the module has its
+`ChannelIntent` value and pair. A `catalogue` query carries observable_group's exact keys and is route-bound
+like every query. Its result is the envelope plus `catalogue`: `hash` (FNV-1a 64 of playerbots' `CatalogueText`
+as 16 lowercase hex digits, compared as a string, never recomputed), `version` (the catalogue format, 1),
+`abilities` (what this module takes beyond the old wire, `["catalogue", "names", "steps"]` today; not hashed), `maxSteps` and
+`rows`. Each row has kind (act or topic), name, sentence, params (name, kind, sentence, choices), refusals (word,
+sentence), effect, done, state, event and limit. The answer is built once at install and stays under 24 KB of
+the 32768-byte response limit (selftested; 15187 bytes for the 29 rows of LC3); a later step pages it when the
+rows outgrow that. Without an installed index the query fails `unavailable`; a module older than LC3 answers it
+`invalid_input`. An order that names a unit or quest the bot cannot find is refused `unknown_name` ("I do not know
+what you mean by that.").
+
+LC3b, the stepped command (abilities `names` and `steps`): a `command` with `steps` in place of `intent` and
+`params`; both forms at once is `invalid_input`. `steps` holds 1..`maxSteps` (3) entries, each exactly
+`{"act": <an act row's name>, "params": {...}}` with exactly that row's parameters by their catalogue names: a
+`unit` parameter as `<name>` (the unit's name) or `<name>Guid` (a guid string), a `quest` parameter as `<name>`
+(its title) or `<name>Id` (1..4294967295), exactly one of the two; a `place` parameter as a place name (go_to,
+meet_at) or, for `position`, the spot `"x,y,z,map"` (three finite decimal numbers and a map id, nothing else); a
+`choice` parameter as one of the row's choice words (an icon by its word, `star` .. `skull`, not 0-7: one
+catalogue-driven rule); a `flag` as a boolean. Names and places are 1..64 bytes without control characters. A
+topic, a verb without a row (regroup, pull, assign_role, dungeon_clear), an unknown word, a missing or an extra key
+are `invalid_input`. The issuer, bot and group are the scope's for every step. The order takes one command id,
+one rate slot and one authorization: the module builds one playerbots order per step and calls the span
+`Execute` once; playerbots' gate resolves each name among what the bot perceives or knows, checks visibility,
+group and the row's check per step (for `position` the same reachable path the old form's pre-check used), and the
+first step not applied ends the order. Before it runs, every lasting step is admitted to the plan ledger and its
+part captured (`busy` when a plan refuses it, `cannot_now` for two steps of one lasting part, both before any step
+runs); each lasting step that ran and applied or failed is recorded after the order. The result keeps the old
+shape: `outcome` is applied only when every step applied, else the ending step's (an unavailable step is
+`rejected` with `unavailable`); `reason`/`reasonText` are the ending step's, in the catalogue's words, or the
+order's own when it was refused before any step ran (`too_soon`, `unavailable`, `busy`, `cannot_now`). It adds
+`steps`: one entry per submitted step in order, `{"act", "outcome": applied/rejected/failed/skipped, "reason",
+"reasonText"}`, the reason only on rejected and failed; a step that did not run is `skipped`, so a fully refused
+order lists every step skipped and carries its own reason. The old form's result has no `steps`.
 
 The single world owner calls `Bind` only AFTER the existing activation owner has selected a fresh epoch and proved
 actual old-work drain and strategy restoration. Bind itself proves neither. Every bind retires the prior helper

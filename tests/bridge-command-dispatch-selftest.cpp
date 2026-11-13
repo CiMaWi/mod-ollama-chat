@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
+#include "bridge-ability-double.h"
 #include "mod-ollama-chat_bridge_world.h"
 
 namespace OllamaBridge
@@ -46,6 +47,10 @@ struct Probe final : CommandExecutor
     uint64_t controller = 0;
     uint64_t group = 0;
     std::optional<IntentOrder> order;
+    std::size_t stepCount = 0;                   // LC3b: the steps of the latest stepped order.
+    std::vector<ChannelStepResult> stepResults;  // LC3b: what a stepped order reports per step that ran.
+
+    std::vector<ChannelStepResult> Steps() const override { return stepResults; }
 
     EffectResult Execute(EffectPhase const&, WorldTicket const& ticket, DispatchGuard const& guard,
                          ChannelCommand const& command, std::function<bool()> const& authorize) override
@@ -57,6 +62,15 @@ struct Probe final : CommandExecutor
             before();
         if (early)
             return *early;
+        if (!command.steps.empty())  // LC3b: one authorize for the whole order, as playerbots' span Execute.
+        {
+            stepCount = command.steps.size();
+            bool const granted = authorize();
+            ++(granted ? grants : denials);
+            if (granted && result != EffectResult::Rejected && result != EffectResult::Unavailable)
+                ++mutations;
+            return granted ? result : EffectResult::Rejected;
+        }
         auto const mapped = MapIntent(command, facts);
         if (!mapped)
             return EffectResult::Rejected;
@@ -164,6 +178,16 @@ struct Fixture
         j["params"] = std::move(params);
         return j.dump();
     }
+    // LC3b: a stepped order.
+    std::string Steps(std::string const& id, Json steps) const
+    {
+        auto j = Wire("command", ticket.request.requestId);
+        j["commandId"] = id;
+        j["issuerGuid"] = "22";
+        j["botGuid"] = "11";
+        j["steps"] = std::move(steps);
+        return j.dump();
+    }
     std::string Attack(std::string const& id) const { return Command(id, "attack_own_target"); }
     std::string Mark(std::string const& id, char const* target = "44") const
     {
@@ -193,12 +217,14 @@ struct Fixture
     // J5e: the last Result's refusal reason and sentence (empty when applied) and its packet error.
     std::string reason;
     std::string reasonText;
+    Json steps;  // LC3b: a stepped result's step list (null for the old form).
     ChannelError packetError = ChannelError::None;
     // The single correlated receipt: its outcome, a fixed error name, or "absent" when withheld or disposed.
     std::string Result(uint64_t receipt, std::string const& id)
     {
         reason.clear();
         reasonText.clear();
+        steps = Json();
         packetError = ChannelError::None;
         std::unique_ptr<ChannelPacket> packet;
         auto const error = channel.Take(settings.token, receipt, packet);
@@ -213,8 +239,11 @@ struct Fixture
         }
         auto const body = Json::parse(packet->body);
         bool const refused = body.value("outcome", "") != "applied";
-        Check(body.size() == (refused ? 11u : 9u) && body["type"] == "command.result" && body["commandId"] == id &&
-                  body["requestId"] == ticket.request.requestId && body["epoch"] == "epoch-1",
+        steps = body.contains("steps") ? body.at("steps") : Json();
+        Check(steps.is_null() || !steps.empty(), "only a stepped order's result lists steps, one per step");
+        Check(body.size() == (refused ? 11u : 9u) + (steps.is_null() ? 0u : 1u) && body["type"] == "command.result" &&
+                  body["commandId"] == id && body["requestId"] == ticket.request.requestId &&
+                  body["epoch"] == "epoch-1",
               "correlated command.result");
         if (refused)
         {
@@ -283,8 +312,8 @@ void PureSeam()
 void EffectOrders()
 {
     IntentContext const facts{22, 11, 33, 33, 33, 44, 44, std::nullopt};
-    ChannelCommand const attack{"a", 22, 11, ChannelIntent::AttackOwnTarget, std::monostate{}};
-    ChannelCommand const mark{"m", 22, 11, ChannelIntent::Mark, ChannelMark{44, 7}};
+    ChannelCommand const attack{"a", 22, 11, ChannelIntent::AttackOwnTarget, std::monostate{}, {}};
+    ChannelCommand const mark{"m", 22, 11, ChannelIntent::Mark, ChannelMark{44, 7}, {}};
     Check(EffectTargetGuid(attack, 44) == 44 && EffectTargetGuid(attack, 0) == 0 && EffectTargetGuid(mark, 99) == 44,
           "an attack resolves the bot's own target, a mark its payload target");
     auto const attacking = BuildEffectOrder(attack, facts);
@@ -333,7 +362,7 @@ void EffectOrders()
 
     for (ChannelIntent const intent : {ChannelIntent::Follow, ChannelIntent::Stay, ChannelIntent::Flee})
     {
-        ChannelCommand const oneShot{"o", 22, 11, intent, std::monostate{}};
+        ChannelCommand const oneShot{"o", 22, 11, intent, std::monostate{}, {}};
         auto const ordered = BuildEffectOrder(oneShot, facts);
         Check(ordered && ordered->intent == intent && ordered->botGuid == 11 && ordered->controllerGuid == 22 &&
                   ordered->groupGuid == 33 && ordered->targetGuid == 0 && ordered->icon == 0 &&
@@ -369,7 +398,7 @@ void EffectOrders()
     }
 
     ChannelPosition const spot{1.5, -2.25, 3.0, 1};
-    ChannelCommand const position{"x", 22, 11, ChannelIntent::Position, spot};
+    ChannelCommand const position{"x", 22, 11, ChannelIntent::Position, spot, {}};
     Check(!MapIntent(position, facts) && !BuildEffectOrder(position, facts),
           "a position without the pathable fact builds no order");
     IntentContext pathable = facts;
@@ -412,7 +441,7 @@ void EffectOrders()
     infinite.pathableNearbyPosition = unbounded;
     Check(!BuildEffectOrder(stray, infinite), "a non-finite position never maps, even as a matching fact");
 
-    ChannelCommand const pull{"p", 22, 11, ChannelIntent::Pull, ChannelTarget{44}};
+    ChannelCommand const pull{"p", 22, 11, ChannelIntent::Pull, ChannelTarget{44}, {}};
     Check(MapIntent(pull, facts) && !BuildEffectOrder(pull, facts) && EffectTargetGuid(pull, 44) == 0,
           "a mappable verb without an accepted effect builds no order");
     unsigned orders = 0;
@@ -1014,8 +1043,63 @@ void TransportLoss()
 }
 }  // namespace
 
+// LC3b: a stepped order is one command on the world thread: one rate slot, one executor call (so one authorize),
+// and its result lists each step as the executor reported it.
+void SteppedDispatch()
+{
+    Json const three = Json::array({{{"act", "follow"}, {"params", Json::object()}},
+                                    {{"act", "go_to"}, {"params", {{"place", "Goldshire"}}}},
+                                    {{"act", "mark"}, {"params", {{"target", "Hogger"}, {"icon", "skull"}}}}});
+    ChannelStepResult const ok{ChannelOutcome::Applied, "", ""};
+    {
+        Fixture f;
+        f.probe.stepResults = {ok, ok, ok};
+        Check(f.Result(f.Send(f.Steps("s1", three)), "s1") == "applied" && f.probe.calls == 1 && f.probe.grants == 1 &&
+                  f.probe.mutations == 1 && f.probe.stepCount == 3,
+              "a three-step order reaches the executor once, with one authorize");
+        Check(f.steps == Json::parse(R"([{"act":"follow","outcome":"applied"},{"act":"go_to","outcome":"applied"},
+                  {"act":"mark","outcome":"applied"}])"),
+              "each step as the executor reported it");
+        Check(f.channel.Commands().attempts == 1 && f.channel.Commands().applied == 1, "one order is one attempt");
+        Check(f.Result(f.Send(f.Steps("s2", three)), "s2") == "rejected" && f.reason == "too_soon" &&
+                  f.probe.calls == 1 &&
+                  f.steps == Json::parse(R"([{"act":"follow","outcome":"skipped"},{"act":"go_to","outcome":"skipped"},
+                      {"act":"mark","outcome":"skipped"}])"),
+              "the order took one rate slot: the next within the interval is refused, every step skipped");
+    }
+    {
+        Fixture f;
+        f.probe.result = EffectResult::Rejected;
+        f.probe.stepResults = {ok, {ChannelOutcome::Rejected, "unknown_name", "I do not know what you mean by that."}};
+        Check(f.Result(f.Send(f.Steps("s3", three)), "s3") == "rejected" && f.reason == "unknown_name" &&
+                  f.steps.size() == 3 && f.steps[1].at("reason") == "unknown_name" &&
+                  f.steps[2] == Json{{"act", "mark"}, {"outcome", "skipped"}},
+              "a refused second step words the order; the third is skipped");
+        Check(f.channel.Close(f.ticket), "an earlier step that applied makes the route act");
+    }
+    {
+        Fixture f;
+        f.probe.early = EffectResult::Rejected;
+        Check(f.Result(f.Send(f.Steps("s4", three)), "s4") == "rejected" && f.reason == "cannot_now" &&
+                  f.steps.size() == 3 && f.steps[0] == Json{{"act", "follow"}, {"outcome", "skipped"}} &&
+                  !f.channel.Close(f.ticket),
+              "an order the executor refused before any step: all skipped, no act");
+    }
+    {
+        Fixture f({.executor = false});
+        Check(f.Result(f.Send(f.Steps("s5", three)), "s5") == "rejected" && f.reason == "unavailable" &&
+                  f.steps.size() == 3 && f.steps[2] == Json{{"act", "mark"}, {"outcome", "skipped"}},
+              "no executor: the order refused with every step skipped");
+    }
+}
+
 int main()
 {
+    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    {
+        std::cerr << "FAIL: the ability double was refused\n";
+        return 1;
+    }
     try
     {
         PureSeam();
@@ -1032,6 +1116,7 @@ int main()
         PostEffectJoin();
         ActedRoutes();
         TransportLoss();
+        SteppedDispatch();
         std::cout << "PASS " << checks << " typed command dispatch checks\n";
     }
     catch (std::exception const& e)
