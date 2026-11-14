@@ -1336,6 +1336,22 @@ void FactsChecks()
     request.input.traits = {};
     Check(!InputWire(request).contains("traits"), "lc10: traits left out when both lists are empty");
 
+    // LC15c: areas beside words, one per word; a dropped word takes its area along; no areas key unless every kept
+    // word has one.
+    request.input.traits.words = {"rather calm", " \t", "very kind"};
+    request.input.traits.areas = {"work", "talk", "others"};
+    wire = InputWire(request)["traits"];
+    Check(wire["words"] == nlohmann::json({"rather calm", "very kind"}) &&
+              wire["areas"] == nlohmann::json({"work", "others"}),
+          "lc15c: areas beside words, a dropped word's area dropped with it");
+    request.input.traits.areas = {"work", "talk"};
+    wire = InputWire(request)["traits"];
+    Check(wire["words"].size() == 2 && !wire.contains("areas"), "lc15c: no areas key when not one per word");
+    request.input.traits.areas = {"work", "talk", " \t"};
+    wire = InputWire(request)["traits"];
+    Check(wire["words"].size() == 2 && !wire.contains("areas"), "lc15c: no areas key when a kept word's area is blank");
+    request.input.traits = {};
+
     // State: around (nearest first, one per name, known kinds, count 1-255), servant and mount (64-byte rule),
     // deeds (whole sentences to 200 bytes, newest first, at most 3; a blank or invalid one dropped, not the state).
     request = Request();
