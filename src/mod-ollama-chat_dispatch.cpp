@@ -6,6 +6,7 @@
 #include "mod-ollama-chat_governor.h"
 #include "mod-ollama-chat_memory.h"
 #include "mod-ollama-chat_persona_bridge.h"
+#include "mod-ollama-chat_reply_split.h"
 #include "mod-ollama-chat_response.h"
 #include "mod-ollama-chat_roleplay.h"
 #include "mod-ollama-chat_sentiment.h"
@@ -73,6 +74,7 @@ namespace
         bool bridgePrepared = false;
         OllamaChatRequest request;
         std::string       text;
+        std::string secondText;  // LC10: the bridge reply's second chat message, empty for one message.
         uint32_t          emoteId = 0;
         Clock::time_point deliverAt;
         std::optional<std::string> personaProposal;  // Bridge card proposal; never chat text.
@@ -100,6 +102,10 @@ bool g_channelEnabled = false;
 OllamaBridge::CommandStats g_loggedCommands;  // World-thread: the counters in the last watchlist line.
 uint64_t g_bridgeSilent = 0;  // World-thread: delivered action-only answers (DS.14), in the commands line.
 uint64_t g_loggedSilent = 0;  // World-thread: the silent count in the last watchlist line.
+uint64_t g_bridgeSplit = 0;   // World-thread: replies delivered as two chat messages (LC10), in the commands line.
+uint64_t g_bridgeRefusedLong = 0;  // World-thread: replies refused for needing three messages (LC10), the same.
+uint64_t g_loggedSplit = 0;
+uint64_t g_loggedRefusedLong = 0;
 Clock::time_point g_nextCommandsLog{};
 OllamaBridge::PlanCounters g_loggedPlans;  // World-thread: the plan counters in the last watchlist line.
 Clock::time_point g_nextPlansLog{};
@@ -197,7 +203,7 @@ void RunBridgeTask(Task& task)
         }
 
         uint32_t emoteId = 0;
-        std::string text = ProcessLlmResponse(api.text, task.request.botName, &emoteId);
+        std::string text = ProcessLlmResponse(api.text, task.request.botName, &emoteId, g_MaxReplyLength);
 
         // Roleplay mode rejects lines carrying out-of-world vocabulary rather
         // than mangling the sentence around the offending word.
@@ -344,8 +350,9 @@ bool PrepareBridge(Completion& c)
         c.bridgeOutcome = WorldOutcome::Empty;
     if (c.bridgeOutcome == WorldOutcome::Success)
     {
-        // Config-dependent cleanup stays on the world thread, after fresh authority/perception checks.
-        c.text = ProcessLlmResponse(c.text, c.request.botName, nullptr);
+        // Config-dependent cleanup stays on the world thread, after fresh authority/perception checks. LC10: no clamp;
+        // a bridge reply is never cut (LC.11), only split below.
+        c.text = ProcessLlmResponse(c.text, c.request.botName, nullptr, 0);
         if (c.text.empty())
             c.bridgeOutcome = WorldOutcome::Empty;
         else
@@ -356,7 +363,23 @@ bool PrepareBridge(Completion& c)
             if (c.text.empty())
                 c.bridgeOutcome = WorldOutcome::Filtered;
             else  // Bot speech is never a playerbots command line, whoever hears it ("# Plan" -> "Plan").
+            {
                 PlayerbotBridge::NeutralizeCommandIndicator(c.text);
+                // LC10: over one chat line, two messages split at a sentence end; a reply that needs three, or has
+                // no fitting sentence end, is refused whole (a terminal no-line outcome) and counted.
+                ReplySplit split = SplitReply(c.text);
+                if (split.refused)
+                {
+                    c.bridgeOutcome = WorldOutcome::Filtered;
+                    ++g_bridgeRefusedLong;
+                }
+                else
+                {
+                    c.text = std::move(split.first);
+                    c.secondText = std::move(split.second);
+                    PlayerbotBridge::NeutralizeCommandIndicator(c.secondText);
+                }
+            }
         }
     }
     auto const action = DispatchTerminal(c.bridgeOutcome, c.request.directAddress);
@@ -369,7 +392,9 @@ bool PrepareBridge(Completion& c)
     uint64_t delayMs = 0;
     if (g_EnableTypingSimulation && !silent)
     {
-        delayMs = g_TypingSimulationBaseDelay + static_cast<uint64_t>(c.text.size()) * g_TypingSimulationDelayPerChar;
+        // The whole reply is typed, both messages.
+        std::size_t const typed = c.text.size() + (c.secondText.empty() ? 0 : 1 + c.secondText.size());
+        delayMs = g_TypingSimulationBaseDelay + static_cast<uint64_t>(typed) * g_TypingSimulationDelayPerChar;
         if (g_TypingSimulationMaxDelay)
             delayMs = std::min(delayMs, static_cast<uint64_t>(g_TypingSimulationMaxDelay));
     }
@@ -412,9 +437,8 @@ bool PrepareBridge(Completion& c)
     }
 
     // Returns true when the line actually went out.
-    bool RouteMessage(Player* bot, PlayerbotAI* botAI, const Completion& c,
-                      const OllamaWorldSnapshot& world,
-                      Channel*& outChannel)
+    bool RouteMessage(Player* bot, PlayerbotAI* botAI, const Completion& c, std::string const& text,
+                      const OllamaWorldSnapshot& world, Channel*& outChannel)
     {
         outChannel = nullptr;
 
@@ -431,7 +455,7 @@ bool PrepareBridge(Completion& c)
                 if (!world.RealPlayerInChannel(channel))
                     return false;
 
-                channel->Say(bot->GetGUID(), c.text, LANG_UNIVERSAL);
+                channel->Say(bot->GetGUID(), text, LANG_UNIVERSAL);
                 outChannel = channel;
                 return true;
             }
@@ -447,40 +471,40 @@ bool PrepareBridge(Completion& c)
                     return false;
                 if (!world.GuildHasRealPlayer(bot->GetGuildId()))
                     return false;
-                return botAI->SayToGuild(c.text);
+                return botAI->SayToGuild(text);
 
             case SRC_PARTY_LOCAL:
                 if (g_DisableForParty || !bot->GetGroup())
                     return false;
                 if (!OllamaGroupHasRealPlayer(bot))
                     return false;
-                return botAI->SayToParty(c.text);
+                return botAI->SayToParty(text);
 
             case SRC_RAID_LOCAL:
                 if (g_DisableForParty || !bot->GetGroup())
                     return false;
                 if (!OllamaGroupHasRealPlayer(bot))
                     return false;
-                return botAI->SayToRaid(c.text);
+                return botAI->SayToRaid(text);
 
             case SRC_YELL_LOCAL:
                 if (g_DisableForSayYell || !AnyoneInRange(bot, g_YellDistance))
                     return false;
-                return botAI->Yell(c.text);
+                return botAI->Yell(text);
 
             case SRC_WHISPER_LOCAL:
             {
                 Player* target = ObjectAccessor::FindConnectedPlayer(ObjectGuid(c.request.targetGuid));
                 if (!target)
                     return false;
-                return botAI->Whisper(c.text, target->GetName());
+                return botAI->Whisper(text, target->GetName());
             }
 
             case SRC_SAY_LOCAL:
             default:
                 if (g_DisableForSayYell || !AnyoneInRange(bot, g_SayDistance))
                     return false;
-                return botAI->Say(c.text);
+                return botAI->Say(text);
         }
     }
 
@@ -497,7 +521,8 @@ bool PrepareBridge(Completion& c)
         // Fail closed for every text source (PrepareBridge strips generated text): a line that playerbots would parse
         // as a command is never sent, so no bot commands another bot or itself, and no send budget is spent on it.
         std::string commandLine;
-        if (PlayerbotBridge::ExtractChatCommand(c.text, commandLine))
+        if (PlayerbotBridge::ExtractChatCommand(c.text, commandLine) ||
+            PlayerbotBridge::ExtractChatCommand(c.secondText, commandLine))
             return;
         Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(c.request.botGuid));
         if (!bot || !bot->IsInWorld())
@@ -506,21 +531,32 @@ bool PrepareBridge(Completion& c)
         if (!botAI || !BridgeCurrent(c))
             return;
         auto const botGuid = bot->GetGUID();
-        if ((!c.request.directAddress && Governor_IsRepetitive(botGuid, c.request.scopeKey, c.text)) ||
+        // LC10: a reply in two messages is still one reply: one governor send, and the repetition check, the
+        // utterance history and the one-exchange memory see what the bot said, both parts joined by a space.
+        std::string said = c.secondText.empty() ? c.text : c.text + ' ' + c.secondText;
+        if ((!c.request.directAddress && Governor_IsRepetitive(botGuid, c.request.scopeKey, said)) ||
             !Governor_TryConsumeSend(botGuid, c.request.scopeKey, c.request.directAddress))
         {
             ++g_droppedGovernor;
             return;
         }
         Channel* channel = nullptr;
-        if (!BridgeCurrent(c) || !RouteMessage(bot, botAI, c, world, channel))
+        if (!BridgeCurrent(c) || !RouteMessage(bot, botAI, c, c.text, world, channel))
             return;
         if (!BridgeCurrent(c))
             return;
-        Governor_RecordUtterance(botGuid, c.request.scopeKey, c.text);
+        if (!c.secondText.empty())
+        {
+            // Only after the first message went out on a route that is still current; once (DeliverBridge's claim).
+            if (RouteMessage(bot, botAI, c, c.secondText, world, channel))
+                ++g_bridgeSplit;
+            else
+                said = c.text;
+        }
+        Governor_RecordUtterance(botGuid, c.request.scopeKey, said);
         ++g_totalDelivered;
         if (c.bridgeOutcome == OllamaBridge::WorldOutcome::Success && BridgeCurrent(c))
-            OllamaChat_BridgeRemember(c.request.bridgeTicket, c.text);
+            OllamaChat_BridgeRemember(c.request.bridgeTicket, said);
         // Neither outage nor success enters legacy memory, history, expression, sentiment or bot-chain paths.
     }
 
@@ -607,7 +643,7 @@ bool PrepareBridge(Completion& c)
         }
 
         Channel* channel = nullptr;
-        if (!RouteMessage(bot, botAI, c, world, channel))
+        if (!RouteMessage(bot, botAI, c, c.text, world, channel))
         {
             if (g_DebugEnabled)
                 LOG_INFO("module.ollamachat",
@@ -1098,16 +1134,19 @@ namespace
 void LogBridgeCommands(Clock::time_point now)
 {
     OllamaBridge::CommandStats const& stats = g_bridgeChannel.Commands();
-    if (now < g_nextCommandsLog || (stats == g_loggedCommands && g_bridgeSilent == g_loggedSilent))
+    if (now < g_nextCommandsLog || (stats == g_loggedCommands && g_bridgeSilent == g_loggedSilent &&
+                                    g_bridgeSplit == g_loggedSplit && g_bridgeRefusedLong == g_loggedRefusedLong))
         return;
     g_loggedCommands = stats;
     g_loggedSilent = g_bridgeSilent;
+    g_loggedSplit = g_bridgeSplit;
+    g_loggedRefusedLong = g_bridgeRefusedLong;
     g_nextCommandsLog = now + std::chrono::minutes(1);
     LOG_INFO("module.ollamachat",
              "[Ollama Chat] Bridge commands: proposed {} duplicates {} refused {} attempts {} applied {} "
-             "failed {} withheld {} silent {}",
+             "failed {} withheld {} silent {} split {} toolong {}",
              stats.proposed, stats.duplicates, stats.refused, stats.attempts, stats.applied, stats.failed,
-             stats.withheld, g_bridgeSilent);
+             stats.withheld, g_bridgeSilent, g_bridgeSplit, g_bridgeRefusedLong);
 }
 
 // Smoke-test watchlist (J12): lasting-plan counters, after a change and at most once a minute.

@@ -22,6 +22,7 @@
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_persona_db.h"
+#include "mod-ollama-chat_reply_split.h"
 
 enum class OllamaProvider
 {
@@ -100,6 +101,9 @@ unsigned checks = 0;
 unsigned governorCalls = 0;
 unsigned recordCalls = 0;
 unsigned rememberCalls = 0;
+std::string recorded;             // LC10: the last utterance the governor recorded.
+std::string remembered;           // LC10: the last reply the one-exchange memory kept.
+uint32_t g_MaxReplyLength = 240;  // The legacy clamp; the bridge path never passes it.
 bool g_DebugEnabled = false;
 bool g_EnableTypingSimulation = false;
 uint32_t g_TypingSimulationBaseDelay = 100;
@@ -125,7 +129,11 @@ void Check(bool condition, std::string const& message)
 
 OllamaEndpointSettings OllamaConfig_Snapshot() { return config; }
 OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const&, OllamaBridge::Request const&) { return apiResult; }
-std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*) { return text; }
+// The legacy clamp stand-in cuts at maxLen, so a bridge path that still clamped would lose its second message.
+std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t maxLen)
+{
+    return maxLen && text.size() > maxLen ? text.substr(0, maxLen) : text;
+}
 std::string Roleplay_FilterMetaTerms(std::string const& text) { return text; }
 
 struct ObjectGuid
@@ -302,8 +310,16 @@ bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool)
     ++governorCalls;
     return true;
 }
-void Governor_RecordUtterance(ObjectGuid, std::string const&, std::string const&) { ++recordCalls; }
-void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const&, std::string const&) { ++rememberCalls; }
+void Governor_RecordUtterance(ObjectGuid, std::string const&, std::string const& text)
+{
+    ++recordCalls;
+    recorded = text;
+}
+void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const&, std::string const& reply)
+{
+    ++rememberCalls;
+    remembered = reply;
+}
 OllamaPersona::ProposalStatus OllamaChat_BridgeProposeCard(OllamaBridge::WorldTicket const&, uint64_t, uint64_t,
                                                            std::string)
 {
@@ -359,6 +375,8 @@ void Reset()
     otherAI.self = &otherBot;
     heard.clear();
     commandLines = pbParses = ocRequests = governorCalls = recordCalls = rememberCalls = 0;
+    recorded.clear();
+    remembered.clear();
     nested = nullptr;
 }
 
@@ -528,6 +546,55 @@ void RejectionTests()
     Check(heard.size() == 1 && heard[0].text == OllamaBridge::DispatchOutageText() && !pbParses, "outage delivered");
     ExpectReleased(done, "outage");
 }
+
+// LC10: a reply over one chat line goes out as two messages on its route, in order, each neutralized, as one reply;
+// one that would need three is refused whole and counted.
+void SplitTests()
+{
+    std::string const first = std::string(150, 'a') + ".";
+    std::string const tail = std::string(150, 'b') + "?";
+    for (auto const& route : routes)
+        for (bool command : {false, true})
+        {
+            std::string const second = (command ? "#follow " : "") + tail;
+            std::string const expected = command ? "follow " + tail : tail;
+            std::string const label = std::string(route.label) + (command ? " split, command" : " split");
+            Reset();
+            auto done = Generate(first + " " + second, route.source, route.target);
+            uint64_t const splits = g_bridgeSplit;
+            Check(g_MaxReplyLength == 240 && PrepareBridge(done) && done.text == first && done.secondText == expected,
+                  label + ": prepared as two messages, uncut");
+            nested = &done;
+            DeliverBridge(done, {});
+            Check(!nested, label + ": the send fired the hooks");
+            Check(heard.size() == 2 && heard[0].text == first && heard[1].text == expected &&
+                      heard[0].source == route.heardAs && heard[1].source == route.heardAs &&
+                      (route.heardAs != SRC_WHISPER_LOCAL ||
+                       (heard[0].receiver == route.target && heard[1].receiver == route.target)),
+                  label + ": both messages, in order, on the route");
+            Check(!commandLines && !pbParses && !ocRequests, label + ": neither message parses");
+            Check(governorCalls == 1 && recordCalls == 1 && rememberCalls == 1 && recorded == first + " " + expected &&
+                      remembered == recorded && g_bridgeSplit == splits + 1,
+                  label + ": one reply: one send, the whole reply recorded and remembered");
+            ExpectReleased(done, label);
+        }
+    std::string const three = std::string(199, 'a') + ". " + std::string(199, 'b') + ". " + std::string(199, 'c') + ".";
+    for (auto const& route : routes)
+    {
+        std::string const label = std::string(route.label) + " three messages";
+        Reset();
+        auto done = Generate(three, route.source, route.target);
+        uint64_t const refusals = g_bridgeRefusedLong;
+        Check(PrepareBridge(done) && done.text == OllamaBridge::DispatchOutageText() && done.secondText.empty() &&
+                  g_bridgeRefusedLong == refusals + 1,
+              label + ": refused whole and counted; the outage line for the addressed human");
+        DeliverBridge(done, {});
+        Check(heard.size() == 1 && heard[0].text == OllamaBridge::DispatchOutageText() &&
+                  g_bridgeRefusedLong == refusals + 1,
+              label + ": none of the reply is sent");
+        ExpectReleased(done, label);
+    }
+}
 }  // namespace
 
 int main()
@@ -536,6 +603,7 @@ int main()
     {
         SpeechTests();
         RejectionTests();
+        SplitTests();
         g_queue.clear();
         g_done.clear();
         Check(!OllamaBridge::DispatchSlot::Used(), "final no leaked slots");

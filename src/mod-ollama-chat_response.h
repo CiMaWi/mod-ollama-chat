@@ -49,8 +49,11 @@ std::string ClampReplyLength(const std::string& text, uint32_t maxLen);
 // outEmoteId, when non-null, receives the TEXT_EMOTE_* id parsed from an
 // "[emote:name]" tag (0 when absent or unknown); the tag is removed from the
 // text either way.
-std::string ProcessLlmResponse(const std::string& raw,
-                               const std::string& botName,
-                               uint32_t* outEmoteId = nullptr);
+//
+// maxLen is ClampReplyLength's bound: the legacy paths pass g_MaxReplyLength;
+// the bridge passes 0 (no clamp), since its replies are never cut but split
+// into two chat messages at a sentence end (LC10, mod-ollama-chat_reply_split.h).
+std::string ProcessLlmResponse(const std::string& raw, const std::string& botName, uint32_t* outEmoteId,
+                               uint32_t maxLen);
 
 #endif // MOD_OLLAMA_CHAT_RESPONSE_H

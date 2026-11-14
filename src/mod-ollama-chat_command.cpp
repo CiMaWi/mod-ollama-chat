@@ -579,7 +579,7 @@ bool OllamaChatConfigCommand::HandleOllamaTestCommand(ChatHandler* handler, Acor
         }
 
         uint32_t emote = 0;
-        const std::string cleaned = ProcessLlmResponse(api.text, "Tester", &emote);
+        const std::string cleaned = ProcessLlmResponse(api.text, "Tester", &emote, g_MaxReplyLength);
 
         LOG_INFO("module.ollamachat", "[Ollama Chat] TEST ok in {}ms (think={}).",
                  api.latencyMs, api.thinkUsed ? "yes" : "no");

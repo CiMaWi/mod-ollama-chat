@@ -20,6 +20,7 @@
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_persona_db.h"
+#include "mod-ollama-chat_reply_split.h"
 
 enum class OllamaProvider
 {
@@ -137,6 +138,10 @@ bool apiBlocked = false;
 bool apiEntered = false;
 bool throwApi = false;
 std::string routedText;
+std::vector<std::string> routed;  // LC10: every routed message, in order.
+unsigned routeFailAt = 0;         // LC10: the route call (1-based) that fails; 0 = none.
+uint32_t cleanupMaxLen = 0;       // LC10: the clamp bound the cleanup was asked for.
+uint32_t g_MaxReplyLength = 240;  // The legacy clamp; the bridge path never passes it.
 bool adapterMode = false;
 bool secondBot = false;  // players[3] is a second bot of the group, sharing the first bot's AI double.
 bool g_Enable = true;
@@ -168,9 +173,10 @@ OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, Ollama
         throw std::runtime_error("synthetic failure");
     return apiResult;
 }
-std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*)
+std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t maxLen)
 {
     ++cleanupCalls;
+    cleanupMaxLen = maxLen;
     return cleanupEmpty ? "" : text;
 }
 std::string Roleplay_FilterMetaTerms(std::string const& text)
@@ -350,10 +356,13 @@ bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool)
     return true;
 }
 void Governor_RecordUtterance(ObjectGuid, std::string const&, std::string const&) { ++recordCalls; }
-bool RouteMessage(Player*, PlayerbotAI*, Completion const& c, OllamaWorldSnapshot const&, Channel*&)
+bool RouteMessage(Player*, PlayerbotAI*, Completion const&, std::string const& text, OllamaWorldSnapshot const&,
+                  Channel*&)
 {
-    ++routeCalls;
-    routedText = c.text;
+    if (++routeCalls == routeFailAt)
+        return false;
+    routedText = text;
+    routed.push_back(text);
     return true;
 }
 bool Observe(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard& guard)
@@ -440,6 +449,9 @@ void Reset()
     cleanupCalls = filterCalls = routeCalls = governorCalls = recordCalls = observeCalls = revokeOnObserve = 0;
     changeScopeOnObserve = scopeChange = 0;
     routedText.clear();
+    routed.clear();
+    routeFailAt = 0;
+    cleanupMaxLen = 999;
 }
 
 bool Submit(bool addressed = true, std::string memory = {}, int64_t lifetimeMs = 1000)
@@ -1748,6 +1760,105 @@ void WakeTests()
 }
 }  // namespace
 
+// LC10: a reply over one chat line is two messages in order, with one governor send, one utterance and the whole
+// reply remembered; a failed first message sends no second; one that would need three is refused (the outage line
+// for an addressed human, silence otherwise) and counted once.
+void SplitTests()
+{
+    using namespace OllamaBridge;
+    std::string const first = std::string(199, 'a') + ".";
+    std::string const second = std::string(198, 'b') + "!";
+    std::string const reply = first + " " + second;
+    Reset();
+    apiResult.text = reply;
+    Check(Submit(), "LC10: split fixture admitted");
+    auto done = Finish();
+    g_EnableTypingSimulation = true;
+    g_TypingSimulationDelayPerChar = 1;
+    g_TypingSimulationMaxDelay = 0;
+    uint64_t const splits = g_bridgeSplit, refusals = g_bridgeRefusedLong;
+    auto const before = std::chrono::steady_clock::now();
+    Check(PrepareBridge(done) && done.text == first && done.secondText == second && !cleanupMaxLen &&
+              g_MaxReplyLength == 240,
+          "LC10: the bridge path is not clamped; the reply is split at its sentence end");
+    Check(done.deliverAt >= before + std::chrono::milliseconds(100 + reply.size()),
+          "LC10: the typing delay covers the whole reply");
+    g_TypingSimulationDelayPerChar = 10;
+    g_TypingSimulationMaxDelay = 1000;
+    DeliverBridge(done, {});
+    DeliverBridge(done, {});
+    Check(routed == std::vector<std::string>{first, second} && governorCalls == 1 && recordCalls == 1 &&
+              g_bridgeSplit == splits + 1 && g_bridgeRefusedLong == refusals,
+          "LC10: two messages in order, once; one governor send and one utterance");
+
+    for (unsigned failAt : {1u, 2u})
+    {
+        done = {};
+        Reset();
+        apiResult.text = reply;
+        Check(Submit(), "LC10: route-failure fixture admitted");
+        done = Finish();
+        Check(PrepareBridge(done) && !done.secondText.empty(), "LC10: route-failure fixture split");
+        routeFailAt = failAt;
+        uint64_t const counted = g_bridgeSplit;
+        DeliverBridge(done, {});
+        DeliverBridge(done, {});
+        if (failAt == 1)
+            Check(routed.empty() && routeCalls == 1 && !recordCalls && g_bridgeSplit == counted,
+                  "LC10: a failed first message sends no second and records nothing");
+        else
+            Check(routed == std::vector<std::string>{first} && routeCalls == 2 && recordCalls == 1 &&
+                      g_bridgeSplit == counted,
+                  "LC10: a failed second message is not counted as a split; the first stays recorded");
+    }
+
+    std::string const three = first + " " + std::string(199, 'c') + ". " + std::string(199, 'd') + ".";
+    for (bool addressed : {true, false})
+    {
+        done = {};
+        Reset();
+        apiResult.text = three;
+        Check(Submit(addressed), "LC10: three-message fixture admitted");
+        done = Finish();
+        auto const ticket = done.request.bridgeTicket;
+        uint64_t const counted = g_bridgeRefusedLong, splitCount = g_bridgeSplit;
+        bool const prepared = PrepareBridge(done);
+        Check(g_bridgeRefusedLong == counted + 1 && g_bridgeSplit == splitCount,
+              "LC10: a reply needing three messages is refused and counted once");
+        if (addressed)
+        {
+            Check(prepared && done.bridgeOutcome == WorldOutcome::Filtered && done.text == DispatchOutageText() &&
+                      done.secondText.empty(),
+                  "LC10: refused whole; the outage line for an addressed human");
+            DeliverBridge(done, {});
+            DeliverBridge(done, {});
+            Check(routed == std::vector<std::string>{DispatchOutageText()} && governorCalls == 1 &&
+                      g_bridgeRefusedLong == counted + 1,
+                  "LC10: only the outage line goes out, once");
+        }
+        else
+        {
+            Check(!prepared && !routeCalls, "LC10: refused in silence when not addressed");
+            g_bridgeWorld.Cancel(ticket);
+        }
+    }
+
+    // The real adapter remembers what the bot said: both messages, joined by a space.
+    done = {};
+    AdapterFixture();
+    Check(AdapterSubmit(SRC_PARTY_LOCAL, "Tell me about the mill."), "LC10: adapter split fixture");
+    apiResult.text = reply;
+    done = Finish();
+    Check(PrepareBridge(done), "LC10: adapter split prepared");
+    DeliverBridge(done, {});
+    Check(routed.size() == 2 && g_bridgeBindings.size() == 1 &&
+              g_bridgeBindings[0].memory ==
+                  "Earlier the same speaker said: Tell me about the mill.\nYou replied: " + reply,
+          "LC10: the memory keeps both parts joined by a space");
+    done = {};
+    Reset();
+}
+
 int main()
 {
     if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
@@ -1765,6 +1876,7 @@ int main()
         TerminalTests();
         WakeTests();
         SilentTests();
+        SplitTests();
         DrainTest();
         AdapterTests();
         SelfMarkTests();
