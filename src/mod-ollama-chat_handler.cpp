@@ -6,8 +6,10 @@
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #include "BridgeAbilities.h"
+#include "BridgeBotFacts.h"
 #include "BridgeBotState.h"
 #include "BridgeBotTraits.h"
+#include "RecordWords.h"
 #include "mod-ollama-chat_trait_words.h"
 #include "ChatCommandLine.h"
 #include "AcquaintanceMgr.h"
@@ -1192,6 +1194,52 @@ void BridgeBotStateFacts(Player* bot, Player* partner, OllamaBridge::BotState& s
     state.plans = OllamaChat_BridgePlanKinds(bot->GetGUID().GetRawValue());
     state.freeBagSlots = facts.freeBagSlots;
     state.money = facts.money;
+    // LC10: what it perceives, its servant and mount, its recent deeds; Build bounds them (deeds whole, LC7's cap).
+    state.around.clear();
+    state.around.reserve(facts.around.size());
+    for (PlayerbotBridge::AroundEntry& entry : facts.around)
+        state.around.push_back(
+            {std::move(entry.Name), PlayerbotBridge::AroundKindWord(entry.Kind), std::move(entry.Detail), entry.Count});
+    state.servant = std::move(facts.servantName);
+    state.mount = std::move(facts.mountName);
+    state.deeds = std::move(facts.deeds);
+}
+
+static_assert(OllamaBridge::MaxStateDeedBytes == RecordWords::MAX_SENTENCE,
+              "a deed on the wire is one whole record sentence (LC7's cap)");
+static_assert(OllamaBridge::MaxStateAround == PlayerbotBridge::MaxAround, "the wire carries every listed name");
+
+// LC10: the bot's lasting facts (playerbots ReadBotFacts, world thread, in memory) with who it is from the getters the
+// card facts use, and its trait words (cache read). Per request like the state, never in a capture or a signature;
+// Build bounds every value and leaves out what is empty. No database access.
+void BridgeFactsAndTraits(Player* bot, OllamaBridge::Context& input)
+{
+    input.facts.reset();
+    PlayerbotBridge::BotFacts facts;
+    if (PlayerbotBridge::ReadBotFacts(bot->GetGUID(), facts))
+    {
+        OllamaBridge::BotFacts& wire = input.facts.emplace();
+        wire.name = bot->GetName();
+        wire.race = FormatPlayerRace(bot->getRace());
+        wire.className = FormatPlayerClass(bot->getClass());
+        wire.gender = bot->getGender() == GENDER_FEMALE ? "female" : "male";
+        wire.level = bot->GetLevel();
+        wire.side = bot->GetTeamId() == TEAM_ALLIANCE ? "Alliance" : "Horde";
+        wire.phrase = std::move(facts.phrase);
+        wire.crafts = std::move(facts.crafts);
+        wire.useful = std::move(facts.useful);
+        wire.servants = std::move(facts.servants);
+        wire.standing = std::move(facts.standing);
+        wire.guild = std::move(facts.guild);
+        wire.relatives = std::move(facts.relatives);
+    }
+    PlayerbotBridge::BotPersonality traits;
+    input.traits = {};
+    if (PlayerbotBridge::ReadBotPersonality(bot->GetGUID(), traits))
+    {
+        input.traits.words = std::move(traits.words);
+        input.traits.interests = std::move(traits.interests);
+    }
 }
 
 static_assert(static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Spells) ==
@@ -1933,6 +1981,7 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     // DS.14/J5f: the bot's own state, read fresh for every request and kept out of the capture, so a change (health,
     // position) never renews a binding or a cached prompt prefix.
     BridgeBotStateFacts(bot, speaker, input.state);
+    BridgeFactsAndTraits(bot, input);  // LC10: the same rule for the lasting facts and the trait words.
     OllamaChatRequest request;
     request.botGuid = bot->GetGUID().GetRawValue();
     request.targetGuid = speaker->GetGUID().GetRawValue();

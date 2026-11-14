@@ -318,6 +318,14 @@ void BridgeBotStateFacts(Player*, Player*, OllamaBridge::BotState& state)
     state.alive = true;
     state.zone = "MARKERZONE";
 }
+// LC10: the facts and traits gatherer (outside the extract) is a stand-in too; its marker shows a leak.
+unsigned factsCalls = 0;
+void BridgeFactsAndTraits(Player*, OllamaBridge::Context& input)
+{
+    ++factsCalls;
+    input.facts.emplace().phrase = "MARKERFACT";
+    input.traits.words = {"MARKERTRAIT"};
+}
 // J5f-b: the topic reader (playerbots, outside the extract); not exercised here.
 bool BridgeBotStateTopic(uint64_t, OllamaBridge::StateTopic, std::string const&,
                          std::vector<OllamaBridge::StateEntry>& entries)
@@ -1383,6 +1391,7 @@ void StateTests()
 {
     AdapterFixture();
     stateFactsCalls = 0;
+    factsCalls = 0;
     Check(AdapterSubmit(SRC_PARTY_LOCAL, "Come here."), "state: first message admitted");
     auto const first = g_queue.back().request.bridgeTicket;
     OllamaChat_BridgeRefresh();
@@ -1399,6 +1408,15 @@ void StateTests()
               !leaks(g_bridgeBindings[0].view.context.persona) && !leaks(second.request.input.systemPrompt) &&
               !leaks(second.request.input.persona) && g_bridgeBindings[0].view.context.state.zone.empty(),
           "state: no state value in the binding, signature, system prompt or persona");
+    auto const marked = [](std::string const& text)
+    { return text.find("MARKERFACT") != std::string::npos || text.find("MARKERTRAIT") != std::string::npos; };
+    Check(factsCalls == 2 && first.request.input.facts && second.request.input.facts &&
+              second.request.input.facts->phrase == "MARKERFACT" && second.request.input.traits.words.size() == 1,
+          "facts: each request reads the facts and traits at submit");
+    Check(!g_bridgeBindings[0].view.context.facts && g_bridgeBindings[0].view.context.traits.words.empty() &&
+              !marked(g_bridgeBindings[0].view.signature) && !marked(g_bridgeBindings[0].view.context.persona) &&
+              !marked(second.request.input.systemPrompt) && !marked(second.request.input.persona),
+          "facts: no fact or trait in the binding, signature, system prompt or persona");
     g_queue.clear();
 }
 
@@ -1673,6 +1691,7 @@ void WakeTests()
     Check(!input.directAddress && !wakeAddressed, "wake: never addressed, so a failure stays silent");
     Check(input.wakeDepth == 2 && input.originUnixMs == watch.originUnixMs, "wake: the chain's depth and origin");
     Check(stateFactsCalls == 2 && input.state.present, "wake: the bot's state is read again for the wake");
+    Check(input.facts && input.facts->phrase == "MARKERFACT", "wake: the facts are read for the wake too");
     Check(wakeScopeKey == "wake-scope" && wake.scope.botGuid == 77 && wake.scope.controllerGuid == players[2].guid &&
               wake.scope.contextId == line.scope.contextId,
           "wake: the partner's scope key and the same conversation");

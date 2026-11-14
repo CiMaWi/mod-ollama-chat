@@ -6,6 +6,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mod-ollama-chat_httpclient.h"
@@ -20,6 +21,17 @@ constexpr std::size_t MaxTextBytes = 4096;
 // Persona card proposal body; equal to OllamaPersona::MaxCardBytes (checked where both are visible).
 constexpr std::size_t MaxCardProposalBytes = 8192;
 constexpr std::size_t MaxCardFactBytes = 64;  // Each string of `input.personaCard.context`.
+// LC10: a recent deed in `input.state.deeds` is one whole record sentence, the cap LC7 carries across the wire
+// (playerbots RecordWords::MAX_SENTENCE, ChannelMaxTopicText, the bridge's MAX_STATE_DEED_BYTES); never the 64-byte
+// rule.
+constexpr std::size_t MaxStateDeedBytes = 200;
+constexpr std::size_t MaxStateDeeds = 3;
+constexpr std::size_t MaxStateAround = 12;
+constexpr std::size_t MaxPhraseBytes = 96;    // `input.facts.phrase`.
+constexpr std::size_t MaxFactWordBytes = 32;  // A craft's rank word, a standing word.
+constexpr std::size_t MaxTraitBytes = 1024;   // Each word and interest of `input.traits`, never cut at 64.
+constexpr std::size_t MaxTraitWords = 32;
+constexpr std::size_t MaxTraitInterests = 3;
 constexpr int64_t MaxLifetimeMs = 120000;
 constexpr int64_t CircuitCooldownMs = 5000;
 
@@ -147,6 +159,48 @@ struct BotState
     uint8_t plans = 0;
     uint32_t freeBagSlots = 0;
     uint32_t money = 0;
+    // LC10 (LC7, LC8): written after money, each only when not empty. `around` nearest first, one entry per name (a
+    // name repeated after the bound is left out), kind one of hostile, service, task, person, object; `deeds` newest
+    // first, each a whole sentence of at most MaxStateDeedBytes.
+    struct Around
+    {
+        std::string name;
+        std::string kind;
+        std::string detail;
+        uint32_t count = 0;
+    };
+    std::vector<Around> around;
+    std::string servant;
+    std::string mount;
+    std::vector<std::string> deeds;
+};
+
+// LC10 `input.facts`: the bot's lasting facts (playerbots ReadBotFacts) and who it is, as the wire has them. Absent
+// unless the reader succeeded; dropped whole when a required value (who, phrase) does not survive the bounds. Lists
+// keep the reader's order and are cut at their wire caps; an empty list is left out.
+struct BotFacts
+{
+    std::string name;
+    std::string race;
+    std::string className;
+    std::string gender;  // male or female
+    uint32_t level = 0;
+    std::string side;                                           // Alliance or Horde
+    std::string phrase;                                         // How it fights; required.
+    std::vector<std::pair<std::string, std::string>> crafts;    // Name, rank word; at most 8.
+    std::vector<std::string> useful;                            // At most 12.
+    std::vector<std::string> servants;                          // At most 8.
+    std::vector<std::pair<std::string, std::string>> standing;  // Faction, standing word; at most 6.
+    std::string guild;                                          // Empty: none.
+    std::vector<std::string> relatives;                         // At most 8.
+};
+
+// LC10 `input.traits` (playerbots ReadBotPersonality): every word and interest whole within MaxTraitBytes. Absent
+// when both lists are empty.
+struct BotTraits
+{
+    std::vector<std::string> words;
+    std::vector<std::string> interests;
 };
 
 struct Context
@@ -165,6 +219,9 @@ struct Context
     std::vector<Participant> party;
     CardOpportunity card;  // Absent from the wire unless offered.
     BotState state;        // Per request, filled at submit; never in a capture.
+    // LC10: per request like state, filled at submit; never in a capture or a signature.
+    std::optional<BotFacts> facts;
+    BotTraits traits;
     // J6e-c: a wake request carries its condition and watch id as `input.wake`; depth and origin stay in the module
     // (a watch armed on this route opens wake depth + 1 and may not outlast origin + 10 minutes).
     std::string wakeCondition;  // Empty unless this request is a wake.

@@ -544,8 +544,10 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
     return false;
 }
 
-// LC3: what this channel takes beyond the old wire, listed in its catalogue answer (not part of the hash).
-constexpr char const* ChannelAbilities[] = {"catalogue", "names", "steps"};
+// LC3: what this channel takes beyond the old wire, listed in its catalogue answer (not part of the hash). LC10:
+// `facts`, the module sends input.facts, input.traits and the new state keys (around, servant, mount, deeds).
+constexpr char const* ChannelAbilities[] = {"catalogue", "names", "steps", "facts"};
+static_assert(MaxStateDeedBytes == ChannelMaxTopicText, "a deed on the wire is a whole record topic sentence");
 
 std::string Hex16(uint64_t value)
 {

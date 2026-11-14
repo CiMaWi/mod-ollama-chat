@@ -886,7 +886,7 @@ void Catalogue()
     auto const& catalogue = json.at("catalogue");
     Check(catalogue.size() == 5 && catalogue.at("hash") == "0a1b2c3d4e5f6071" && catalogue.at("version") == 1 &&
               catalogue.at("maxSteps") == 3 &&
-              catalogue.at("abilities") == Json::array({"catalogue", "names", "steps"}) &&
+              catalogue.at("abilities") == Json::array({"catalogue", "names", "steps", "facts"}) &&
               catalogue.at("rows").size() == 17,
           "hash, version, abilities, the most steps and every row");
     Check(catalogue.at("rows").at(1) == Json::parse(R"({"kind":"act","name":"mark",
