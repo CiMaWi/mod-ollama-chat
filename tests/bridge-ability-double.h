@@ -1,6 +1,6 @@
 // LC3: a double of the ability index the game adapter installs from mod-playerbots' table (handler.cpp's
-// BridgeAbilityIndex): the old wire's 22 verbs in ChannelIntent order, three acts with every part filled and the eleven
-// topics in StateTopic order. A standalone selftest installs it before it parses a command or a topic.
+// BridgeAbilityIndex): the old wire's 22 verbs in ChannelIntent order, three acts with every part filled and the
+// fourteen topics in StateTopic order. A standalone selftest installs it before it parses a command or a topic.
 #ifndef MOD_OLLAMA_CHAT_TESTS_BRIDGE_ABILITY_DOUBLE_H
 #define MOD_OLLAMA_CHAT_TESTS_BRIDGE_ABILITY_DOUBLE_H
 
@@ -77,7 +77,8 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
     };
     Topic const topics[] = {{"inventory", 40},  {"quests", 40}, {"cooldowns", 40}, {"strategies", 40},
                             {"spells", 40},     {"plan", 8},    {"options", 5},    {"route", 12},
-                            {"quest_plan", 12}, {"bags", 6},    {"places", 24}};
+                            {"quest_plan", 12}, {"bags", 6},    {"places", 24}, {"history", 24},
+                            {"lately", 12},     {"known", 12}};
     for (std::size_t value = 0; value < std::size(topics); ++value)
     {
         AbilityRow row{.topic = true,
@@ -100,7 +101,7 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
 
 // LC3b: the double with the acts a stepped command needs for every parameter form, inserted after go_to (rows 3-9;
 // the topics follow from row 10): stay, quest, position, formation, save_mana, focus_healing, attack_own_target.
-// TestAbilityIndex stays as it is: the selftests pin its fourteen rows by position.
+// TestAbilityIndex stays as it is: the selftests pin its seventeen rows by position.
 inline OllamaBridge::AbilityIndex TestStepAbilityIndex()
 {
     using namespace OllamaBridge;

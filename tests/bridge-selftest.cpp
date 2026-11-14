@@ -1210,6 +1210,208 @@ void WakeChecks()
     state.travelling = false;
     Check(code(state) == 0, "activity code: idle 0");
 }
+
+// LC10: `input.facts`, `input.traits` and the state's around, servant, mount and deeds exactly as Build encodes them.
+// Absent fields leave the request as before; a deed is a whole sentence of at most 200 bytes (LC7's cap), never the
+// 64-byte fact rule; every list stops at its wire cap; an empty list or traits object is left out.
+nlohmann::json InputWire(OllamaBridge::Request const& request)
+{
+    std::string body;
+    Check(OllamaBridge::Build(Settings(), request, {1000000, 10000}, body), "lc10: build");
+    return nlohmann::json::parse(body)["input"];
+}
+
+OllamaBridge::BotFacts FullFacts()
+{
+    OllamaBridge::BotFacts facts;
+    facts.name = "Thorgrim";
+    facts.race = "Dwarf";
+    facts.className = "Warrior";
+    facts.gender = "male";
+    facts.level = 42;
+    facts.side = "Alliance";
+    facts.phrase = "fights with a great axe in both hands";
+    facts.crafts = {{"Mining", "expert"}, {"Blacksmithing", "journeyman"}};
+    facts.useful = {"sharpening stones"};
+    facts.standing = {{"Ironforge", "honoured"}};
+    facts.guild = "Stonehearth";
+    return facts;
+}
+
+void FactsChecks()
+{
+    using namespace OllamaBridge;
+    std::string const oldBody = []
+    {
+        std::string body;
+        Check(Build(Settings(), Request(), {1000000, 10000}, body), "lc10: old build");
+        return body;
+    }();
+    auto const oldInput = nlohmann::json::parse(oldBody)["input"];
+    std::vector<std::string> keys;
+    for (auto const& item : oldInput.items())
+        keys.push_back(item.key());
+    Check(keys == std::vector<std::string>{"channel", "directAddress", "groupScope", "memory", "observations", "party",
+                                           "persona", "speakerControlsBot", "speakerGuid", "systemPrompt", "text"},
+          "lc10: without the new fields the input has exactly the old keys");
+    auto request = Request();
+    request.input.facts = BotFacts();  // Present but without who or phrase: left out whole.
+    request.input.traits.words = {"", " \t", "\x01"};
+    request.input.traits.interests = {"\xFF"};
+    std::string body;
+    Check(Build(Settings(), request, {1000000, 10000}, body) && body == oldBody,
+          "lc10: facts without who, blank and invalid traits leave the request byte-identical");
+    request = Request();
+    auto state = FullState();
+    request.input.state = state;
+    Check(Build(Settings(), request, {1000000, 10000}, body), "lc10: old state build");
+    std::string const oldStateBody = body;
+    state.around = {{"", "hostile", "", 1}, {"Wolf", "beast", "", 1}};
+    state.servant = state.mount = " ";
+    state.deeds = {"", "\xC3"};
+    request.input.state = state;
+    Check(Build(Settings(), request, {1000000, 10000}, body) && body == oldStateBody,
+          "lc10: state lists without a valid entry are left out (old bytes)");
+
+    // Facts: who, phrase, the lists in the reader's order; empty lists and no guild left out.
+    request = Request();
+    request.input.facts = FullFacts();
+    Check(InputWire(request)["facts"] == nlohmann::json::parse(R"({"who":{"name":"Thorgrim","race":"Dwarf",
+        "class":"Warrior","gender":"male","level":42,"side":"Alliance"},
+        "phrase":"fights with a great axe in both hands",
+        "crafts":[{"name":"Mining","rank":"expert"},{"name":"Blacksmithing","rank":"journeyman"}],
+        "useful":["sharpening stones"],"standing":[{"faction":"Ironforge","word":"honoured"}],"guild":"Stonehearth"})"),
+          "lc10: facts encoded with their keys, empty lists left out");
+    auto const dropped = [&request](auto&& spoil)
+    {
+        auto facts = FullFacts();
+        spoil(facts);
+        request.input.facts = facts;
+        return !InputWire(request).contains("facts");
+    };
+    Check(dropped([](BotFacts& f) { f.phrase = "  "; }) && dropped([](BotFacts& f) { f.name.clear(); }) &&
+              dropped([](BotFacts& f) { f.race = "\x01"; }) && dropped([](BotFacts& f) { f.className = "\xFF"; }) &&
+              dropped([](BotFacts& f) { f.gender = "other"; }) && dropped([](BotFacts& f) { f.level = 0; }) &&
+              dropped([](BotFacts& f) { f.side = "Scourge"; }),
+          "lc10: facts left out whole when who or the phrase fails its rule");
+    auto facts = FullFacts();
+    facts.level = 300;
+    facts.guild.clear();
+    facts.phrase = std::string(96, 'p');
+    facts.crafts = {{"Mining", ""}, {"", "expert"}, {"Herbalism", std::string(40, 'r')}};
+    facts.standing.clear();
+    facts.useful.assign(13, "torch");
+    facts.servants.assign(9, "Grimtooth");
+    facts.relatives = {"Brann", " "};
+    request.input.facts = facts;
+    auto wire = InputWire(request)["facts"];
+    Check(wire["who"]["level"] == 255 && !wire.contains("guild") && !wire.contains("standing") &&
+              wire["phrase"] == std::string(96, 'p') &&
+              wire["crafts"] ==
+                  nlohmann::json::parse(R"([{"name":"Herbalism","rank":"rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}])") &&
+              wire["useful"].size() == 12 && wire["servants"].size() == 8 &&
+              wire["relatives"] == nlohmann::json::array({"Brann"}),
+          "lc10: level capped, pairs need both texts (word cut at 32), lists at their caps, blanks dropped");
+    facts.phrase = std::string(97, 'p');
+    request.input.facts = facts;
+    Check(InputWire(request)["facts"]["phrase"] == std::string(96, 'p'), "lc10: phrase cut at 96 bytes");
+
+    // Traits: each word whole within 1024 bytes (never cut at 64), 32 words, 3 interests; one list alone is fine.
+    request = Request();
+    std::string const longWord = std::string(1023, 'w') + "\xC3\xA9";  // 1025 bytes, byte 1024 inside a character.
+    request.input.traits.words = {"very careful", std::string(100, 'c'), std::string(1024, 'k'), longWord};
+    for (int i = 0; i < 30; ++i)
+        request.input.traits.words.push_back("rather chatty");
+    request.input.traits.interests = {"fishing", "inns and ale", "old maps", "dancing"};
+    wire = InputWire(request)["traits"];
+    Check(wire.size() == 2 && wire["words"].size() == 32 && wire["words"][0] == "very careful" &&
+              wire["words"][1] == std::string(100, 'c') && wire["words"][2] == std::string(1024, 'k') &&
+              wire["words"][3] == std::string(1023, 'w') &&
+              wire["interests"] == nlohmann::json({"fishing", "inns and ale", "old maps"}),
+          "lc10: trait words whole to 1024 bytes, cut on a character boundary past it, lists at their caps");
+    request.input.traits.words.clear();
+    wire = InputWire(request);
+    Check(wire.contains("traits") && !wire["traits"].contains("words") && wire["traits"]["interests"].size() == 3,
+          "lc10: traits with interests only");
+    request.input.traits = {};
+    Check(!InputWire(request).contains("traits"), "lc10: traits left out when both lists are empty");
+
+    // State: around (nearest first, one per name, known kinds, count 1-255), servant and mount (64-byte rule),
+    // deeds (whole sentences to 200 bytes, newest first, at most 3; a blank or invalid one dropped, not the state).
+    request = Request();
+    state = FullState();
+    state.around = {{"Defias Pillager", "hostile", "", 2},
+                    {"Wolf", "hostile", "", 0},
+                    {"Wolf\x01", "hostile", "", 1},
+                    {"Innkeeper Farley", "service", "innkeeper", 300},
+                    {"Strange Rock", "riddle", "", 1},
+                    {"\xFF", "object", "", 1},
+                    {std::string(70, 'n'), "person", std::string(70, 'd'), 1}};
+    for (int i = 0; i < 12; ++i)
+        state.around.push_back({"Kobold " + std::to_string(i), "hostile", "", 1});
+    state.servant = std::string(64, 's');
+    state.mount = std::string(65, 'm');
+    std::string const deed200 = std::string(199, 'd') + ".";
+    std::string const deed201 = std::string(199, 'e') + "\xC3\xA9";  // Byte 200 inside a character.
+    state.deeds = {deed200, " ", deed201, "\xC3\x28", std::string(201, 'f'), "A fourth deed."};
+    request.input.state = state;
+    auto const stateWire = InputWire(request)["state"];
+    auto const& around = stateWire["around"];
+    Check(around.size() == 12 &&
+              around[0] == nlohmann::json({{"name", "Defias Pillager"}, {"kind", "hostile"}, {"count", 2}}) &&
+              around[1] == nlohmann::json({{"name", "Wolf"}, {"kind", "hostile"}, {"count", 1}}) &&
+              around[2] ==
+                  nlohmann::json(
+                      {{"name", "Innkeeper Farley"}, {"kind", "service"}, {"detail", "innkeeper"}, {"count", 255}}) &&
+              around[3] == nlohmann::json({{"name", std::string(64, 'n')},
+                                           {"kind", "person"},
+                                           {"detail", std::string(64, 'd')},
+                                           {"count", 1}}) &&
+              around[4]["name"] == "Kobold 0" && around[11]["name"] == "Kobold 7",
+          "lc10: around in order, one per name after the bounds, known kinds only, count 1-255, at most 12");
+    Check(stateWire["servant"] == std::string(64, 's') && stateWire["mount"] == std::string(64, 'm'),
+          "lc10: servant and mount keep the 64-byte rule (64 unchanged, 65 cut)");
+    Check(stateWire["deeds"] == nlohmann::json({deed200, std::string(199, 'e'), std::string(200, 'f')}),
+          "lc10: deeds whole to 200 bytes, cut on a character boundary past it, blank and invalid dropped, at most 3");
+    Check(stateWire["money"] == 1234567 && stateWire["where"]["zone"] == "Westfall",
+          "lc10: the old state keys are unchanged beside the new ones");
+
+    // Size: every new field at its cap (traits at 1024 bytes each) on the fixture request stays under the bound.
+    request = Request();
+    BotFacts cap;
+    cap.name = cap.race = cap.className = cap.guild = std::string(64, 'x');
+    cap.gender = "female";
+    cap.level = 80;
+    cap.side = "Horde";
+    cap.phrase = std::string(96, 'p');
+    cap.crafts.assign(8, {std::string(64, 'c'), std::string(32, 'r')});
+    cap.useful.assign(12, std::string(64, 'u'));
+    cap.servants.assign(8, std::string(64, 's'));
+    cap.standing.assign(6, {std::string(64, 'f'), std::string(32, 'w')});
+    cap.relatives.assign(8, std::string(64, 'k'));
+    request.input.facts = cap;
+    request.input.traits.words.assign(32, "extremely careful");
+    request.input.traits.interests.assign(3, "inns and ale");
+    state = FullState();
+    state.around.clear();
+    for (int i = 0; i < 12; ++i)
+        state.around.push_back({std::string(60, 'a') + std::to_string(1000 + i), "hostile", std::string(64, 'd'), 255});
+    state.servant = state.mount = std::string(64, 'v');
+    state.deeds.assign(3, std::string(200, 'z'));
+    request.input.state = state;
+    Check(Build(Settings(), request, {1000000, 10000}, body), "lc10: realistic traits build");
+    std::size_t const realistic = body.size();
+    auto const capped = nlohmann::json::parse(body)["input"];
+    Check(capped["state"]["around"].size() == 12 && capped["facts"]["crafts"].size() == 8 &&
+              capped["state"]["deeds"].size() == 3,
+          "lc10: every list at its cap is sent whole");
+    request.input.traits.words.assign(32, std::string(1024, 't'));
+    request.input.traits.interests.assign(3, std::string(1024, 'i'));
+    Check(Build(Settings(), request, {1000000, 10000}, body) && body.size() < MaxRequestBytes,
+          "lc10: every new field at its cap stays under MaxRequestBytes");
+    std::cout << "bridge-selftest: lc10 request bytes: old " << oldBody.size() << ", every new field at cap with "
+              << "realistic traits " << realistic << ", with every trait at 1024 bytes " << body.size() << '\n';
+}
 }  // namespace
 
 int main(int argc, char** argv)
@@ -1219,6 +1421,7 @@ int main(int argc, char** argv)
         BoundaryChecks();
         StateChecks();
         WakeChecks();
+        FactsChecks();
         if (argc == 2)
             ObserverSettingsChecks(argv[1]);
         CircuitChecks();

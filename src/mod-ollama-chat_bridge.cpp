@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
+#include <utility>
 
 namespace OllamaBridge
 {
@@ -96,32 +97,134 @@ bool Blank(std::string const& value)
                        [](unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
 }
 
-// One card fact on the wire: control characters dropped, cut to MaxCardFactBytes on a character boundary, and left
-// out when blank or not valid UTF-8 (the envelope dump would throw).
-void PutCardFact(nlohmann::json& context, char const* key, std::string const& value)
+// One text on the wire: control characters dropped, cut to maxBytes on a character boundary; none when blank or not
+// valid UTF-8 (the envelope dump would throw).
+std::optional<std::string> WireText(std::string const& value, std::size_t maxBytes)
 {
-    std::string fact;
+    std::string text;
     for (unsigned char byte : value)
         if (byte >= 0x20 && byte != 0x7F)
-            fact.push_back(static_cast<char>(byte));
-    if (fact.size() > MaxCardFactBytes)
+            text.push_back(static_cast<char>(byte));
+    if (text.size() > maxBytes)
     {
-        std::size_t cut = MaxCardFactBytes;
-        while (cut && (static_cast<unsigned char>(fact[cut]) & 0xC0) == 0x80)
+        std::size_t cut = maxBytes;
+        while (cut && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80)
             --cut;
-        fact.resize(cut);
+        text.resize(cut);
     }
-    if (Blank(fact))
-        return;
+    if (Blank(text))
+        return std::nullopt;
     try
     {
-        static_cast<void>(nlohmann::json(fact).dump());
+        static_cast<void>(nlohmann::json(text).dump());
     }
     catch (nlohmann::json::exception const&)
     {
-        return;
+        return std::nullopt;
     }
-    context[key] = std::move(fact);
+    return text;
+}
+
+// A text under its key, left out when WireText gives none.
+void PutText(nlohmann::json& json, char const* key, std::string const& value, std::size_t maxBytes)
+{
+    if (auto text = WireText(value, maxBytes))
+        json[key] = std::move(*text);
+}
+
+// One card fact on the wire: the text rule at MaxCardFactBytes.
+void PutCardFact(nlohmann::json& context, char const* key, std::string const& value)
+{
+    PutText(context, key, value, MaxCardFactBytes);
+}
+
+// LC10: a list of texts in the given order, an entry without a text dropped, at most cap entries; left out when empty.
+void PutTextList(nlohmann::json& json, char const* key, std::vector<std::string> const& values, std::size_t cap,
+                 std::size_t maxBytes)
+{
+    nlohmann::json list = nlohmann::json::array();
+    for (std::string const& value : values)
+    {
+        if (list.size() == cap)
+            break;
+        if (auto text = WireText(value, maxBytes))
+            list.push_back(std::move(*text));
+    }
+    if (!list.empty())
+        json[key] = std::move(list);
+}
+
+// LC10: a list of {first: fact, second: word} pairs, the same rule; a pair missing either text is dropped.
+void PutPairList(nlohmann::json& json, char const* key, std::vector<std::pair<std::string, std::string>> const& values,
+                 std::size_t cap, char const* firstKey, char const* secondKey)
+{
+    nlohmann::json list = nlohmann::json::array();
+    for (auto const& [first, second] : values)
+    {
+        if (list.size() == cap)
+            break;
+        auto name = WireText(first, MaxCardFactBytes);
+        auto word = WireText(second, MaxFactWordBytes);
+        if (name && word)
+            list.push_back({{firstKey, std::move(*name)}, {secondKey, std::move(*word)}});
+    }
+    if (!list.empty())
+        json[key] = std::move(list);
+}
+
+constexpr std::size_t MaxFactCrafts = 8;
+constexpr std::size_t MaxFactUseful = 12;
+constexpr std::size_t MaxFactServants = 8;
+constexpr std::size_t MaxFactStanding = 6;
+constexpr std::size_t MaxFactRelatives = 8;
+
+// LC10 `input.facts`: who the bot is (the card-fact rule), how it fights, its crafts, standing and kin. False when who
+// or the phrase does not survive the bounds; the module then leaves the whole object out.
+bool FactsJson(BotFacts const& facts, nlohmann::json& json)
+{
+    nlohmann::json who = nlohmann::json::object();
+    PutCardFact(who, "name", facts.name);
+    PutCardFact(who, "race", facts.race);
+    PutCardFact(who, "class", facts.className);
+    if (facts.gender == "male" || facts.gender == "female")
+        who["gender"] = facts.gender;
+    if (facts.level)
+        who["level"] = std::min<uint32_t>(facts.level, 255);
+    if (facts.side == "Alliance" || facts.side == "Horde")
+        who["side"] = facts.side;
+    auto phrase = WireText(facts.phrase, MaxPhraseBytes);
+    if (who.size() != 6 || !phrase)
+        return false;
+    json = {{"who", std::move(who)}, {"phrase", std::move(*phrase)}};
+    PutPairList(json, "crafts", facts.crafts, MaxFactCrafts, "name", "rank");
+    PutTextList(json, "useful", facts.useful, MaxFactUseful, MaxCardFactBytes);
+    PutTextList(json, "servants", facts.servants, MaxFactServants, MaxCardFactBytes);
+    PutPairList(json, "standing", facts.standing, MaxFactStanding, "faction", "word");
+    PutCardFact(json, "guild", facts.guild);
+    PutTextList(json, "relatives", facts.relatives, MaxFactRelatives, MaxCardFactBytes);
+    return true;
+}
+
+// LC10 `input.state.around`: nearest first, one entry per name (after the bounds), a known kind, count 1-255.
+nlohmann::json AroundJson(std::vector<BotState::Around> const& entries)
+{
+    static constexpr std::string_view kinds[] = {"hostile", "service", "task", "person", "object"};
+    nlohmann::json around = nlohmann::json::array();
+    for (BotState::Around const& entry : entries)
+    {
+        if (around.size() == MaxStateAround)
+            break;
+        auto name = WireText(entry.name, MaxCardFactBytes);
+        if (!name || std::find(std::begin(kinds), std::end(kinds), entry.kind) == std::end(kinds) ||
+            std::any_of(around.begin(), around.end(),
+                        [&name](nlohmann::json const& listed) { return listed.at("name") == *name; }))
+            continue;
+        nlohmann::json item = {{"name", std::move(*name)}, {"kind", entry.kind}};
+        PutCardFact(item, "detail", entry.detail);
+        item["count"] = std::clamp<uint32_t>(entry.count, 1, 255);
+        around.push_back(std::move(item));
+    }
+    return around;
 }
 
 // DS.12 `input.personaCard.context`: a flat object of the bot's in-world facts; absent facts are left out.
@@ -275,6 +378,12 @@ nlohmann::json StateJson(BotState const& state)
         json["plans"] = std::move(plans);
     json["bags"] = std::min<uint32_t>(state.freeBagSlots, 255);
     json["money"] = state.money;
+    if (nlohmann::json around = AroundJson(state.around); !around.empty())
+        json["around"] = std::move(around);
+    PutCardFact(json, "servant", state.servant);
+    PutCardFact(json, "mount", state.mount);
+    // Whole record sentences (LC7's cap), never the 64-byte fact rule.
+    PutTextList(json, "deeds", state.deeds, MaxStateDeeds, MaxStateDeedBytes);
     return json;
 }
 }  // namespace
@@ -453,6 +562,14 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
                 card["context"] = CardContextJson(input.card.facts);
             envelope["input"]["personaCard"] = std::move(card);
         }
+        // LC10: the lasting facts and the trait words, each only when there is something to say.
+        if (nlohmann::json facts; input.facts && FactsJson(*input.facts, facts))
+            envelope["input"]["facts"] = std::move(facts);
+        nlohmann::json traits = nlohmann::json::object();
+        PutTextList(traits, "words", input.traits.words, MaxTraitWords, MaxTraitBytes);
+        PutTextList(traits, "interests", input.traits.interests, MaxTraitInterests, MaxTraitBytes);
+        if (!traits.empty())
+            envelope["input"]["traits"] = std::move(traits);
         if (input.state.present)
             envelope["input"]["state"] = StateJson(input.state);
         if (!input.wakeCondition.empty())  // J6e-c: a wake turn (never addressed); the watch that opened it.

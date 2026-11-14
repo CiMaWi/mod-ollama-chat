@@ -30,10 +30,12 @@ inline std::string Clean(std::string const& text)
     return out;
 }
 
-// "very careful" -> "careful", "a loner" -> "loner": the word without its intensity or article
+// "very careful" -> "careful", "a loner" -> "loner": the word without its intensity or article (the four grades of
+// playerbots' TraitRules::Word: somewhat, rather, very, extremely)
 inline std::string StripAdverb(std::string const& word)
 {
-    static char const* const prefixes[] = {"very ", "rather ", "fiercely ", "deeply ", "a ", "an "};
+    static char const* const prefixes[] = {"extremely ", "very ",   "rather ", "somewhat ",
+                                           "fiercely ",  "deeply ", "a ",      "an "};
     for (char const* prefix : prefixes)
     {
         std::string const p = prefix;

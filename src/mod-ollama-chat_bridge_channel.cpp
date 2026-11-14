@@ -526,12 +526,28 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
                      {"value", std::clamp<int64_t>(entry.first, 0, UINT32_MAX)},
                      {"extra", std::clamp<int64_t>(entry.second, 0, UINT32_MAX)}};
             return true;
+        case StateTopic::History:  // LC7: the planner shape and the entry's sentence in its own field.
+        case StateTopic::Lately:
+        case StateTopic::Known:
+        {
+            auto const text = TopicText(entry.text, ChannelMaxTopicText);
+            if (!PlannerRow(topic, entry.kind) || text.empty())
+                return false;
+            value = {{"row", entry.kind},
+                     {"name", name},
+                     {"text", text},
+                     {"value", std::clamp<int64_t>(entry.first, 0, UINT32_MAX)},
+                     {"extra", std::clamp<int64_t>(entry.second, 0, UINT32_MAX)}};
+            return true;
+        }
     }
     return false;
 }
 
-// LC3: what this channel takes beyond the old wire, listed in its catalogue answer (not part of the hash).
-constexpr char const* ChannelAbilities[] = {"catalogue", "names", "steps"};
+// LC3: what this channel takes beyond the old wire, listed in its catalogue answer (not part of the hash). LC10:
+// `facts`, the module sends input.facts, input.traits and the new state keys (around, servant, mount, deeds).
+constexpr char const* ChannelAbilities[] = {"catalogue", "names", "steps", "facts"};
+static_assert(MaxStateDeedBytes == ChannelMaxTopicText, "a deed on the wire is a whole record topic sentence");
 
 std::string Hex16(uint64_t value)
 {
@@ -665,6 +681,9 @@ char const* StateTopicRow(StateTopic topic, uint8_t code)
     static constexpr char const* questPlan[] = {"take", "task", "turn_in", "carried", "deferred"};
     static constexpr char const* bags[] = {"free", "sell", "bag"};
     static constexpr char const* places[] = {"hearth", "flight_here", "flight_elsewhere"};
+    static constexpr char const* history[] = {"event", "zone", "dungeon", "boss"};
+    static constexpr char const* lately[] = {"deed"};
+    static constexpr char const* known[] = {"bot"};
     auto const pick = [code](auto const& words) -> char const* { return code < std::size(words) ? words[code] : ""; };
     switch (topic)
     {
@@ -680,6 +699,12 @@ char const* StateTopicRow(StateTopic topic, uint8_t code)
             return pick(bags);
         case StateTopic::Places:
             return pick(places);
+        case StateTopic::History:
+            return pick(history);
+        case StateTopic::Lately:
+            return pick(lately);
+        case StateTopic::Known:
+            return pick(known);
         case StateTopic::Inventory:
         case StateTopic::Quests:
         case StateTopic::Cooldowns:
@@ -716,6 +741,12 @@ std::size_t StateTopicLimit(StateTopic topic)
             return 6;
         case StateTopic::Places:
             return 24;
+        case StateTopic::History:  // LC7: the limits playerbots' record readers keep.
+            return 24;
+        case StateTopic::Lately:
+            return 12;
+        case StateTopic::Known:
+            return 12;
     }
     return 0;
 }

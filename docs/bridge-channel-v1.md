@@ -63,6 +63,8 @@ plan, no restore) and are refused with not_planner, goal_held, unknown_place, no
 already_there. A bot_state query names one topic; route, and only route, also names its place (WT18b), which the
 world thread hands to playerbots' topic reader as a value. The planner topics (plan, options, route, quest_plan, bags,
 places) share one entry shape: row (a fixed word per topic, from `StateTopicRow`), name, value and extra.
+The record topics (LC7: history, lately, known) add text, one in-world sentence of 1..200 bytes
+(`ChannelMaxTopicText`, cut on a character boundary); an entry without one is dropped.
 Retirement selects no new epoch until every retired plan is restored or dropped.
 
 LC3: the verbs and the topic words are playerbots' (`PlayerbotBridge::IntentWord`/`FindIntent` and `TopicRows`).
