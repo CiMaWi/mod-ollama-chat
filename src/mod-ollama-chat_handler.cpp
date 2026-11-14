@@ -1262,7 +1262,8 @@ static_assert(static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Spells) ==
                   static_cast<uint8_t>(OllamaBridge::StateTopic::Lately) &&
               static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Known) ==
                   static_cast<uint8_t>(OllamaBridge::StateTopic::Known) &&
-              OllamaBridge::StateTopicCount == PlayerbotBridge::TopicRows().size());
+              OllamaBridge::StateTopicCount <= PlayerbotBridge::TopicRows().size());
+// LC16c: the fourteen topics above keep their values; a topic playerbots appends is answered in the lines form.
 
 // LC3: the channel takes an act's intent and a parameter's field as playerbots' values; each pair is one value.
 template <typename Pairs>
@@ -1301,10 +1302,11 @@ constexpr std::pair<PlayerbotBridge::Intent, OllamaBridge::ChannelIntent> Bridge
     {PlayerbotBridge::Intent::MeetAt, OllamaBridge::ChannelIntent::MeetAt},
     {PlayerbotBridge::Intent::PausePlan, OllamaBridge::ChannelIntent::PausePlan},
     {PlayerbotBridge::Intent::ResumePlan, OllamaBridge::ChannelIntent::ResumePlan}};
-// Every playerbots verb has a ChannelIntent of the same value (IntentCount counts the table, BridgeAbilities.cpp), so
-// an appended verb fails here until the channel has its value; a stepped order casts one to the other.
-static_assert(BridgeValuesAgree(BridgeIntentPairs) && std::size(BridgeIntentPairs) == PlayerbotBridge::IntentCount &&
-              OllamaBridge::ChannelIntentCount == PlayerbotBridge::IntentCount);
+// The old form's 22 verbs have a ChannelIntent of the same value; the old form stays frozen at them (LC.23). LC16c: a
+// verb playerbots appends is an act of its table only: a stepped order takes its row's Intent value from the index.
+static_assert(BridgeValuesAgree(BridgeIntentPairs) && std::size(BridgeIntentPairs) == 22 &&
+              OllamaBridge::ChannelIntentCount == 22 &&
+              PlayerbotBridge::IntentCount >= OllamaBridge::ChannelIntentCount);
 
 constexpr std::pair<PlayerbotBridge::OrderField, OllamaBridge::AbilityField> BridgeFieldPairs[] = {
     {PlayerbotBridge::OrderField::Target, OllamaBridge::AbilityField::Target},
@@ -1313,12 +1315,16 @@ constexpr std::pair<PlayerbotBridge::OrderField, OllamaBridge::AbilityField> Bri
     {PlayerbotBridge::OrderField::Position, OllamaBridge::AbilityField::Position},
     {PlayerbotBridge::OrderField::QuestId, OllamaBridge::AbilityField::QuestId},
     {PlayerbotBridge::OrderField::Shape, OllamaBridge::AbilityField::Shape},
-    {PlayerbotBridge::OrderField::Enabled, OllamaBridge::AbilityField::Enabled}};
+    {PlayerbotBridge::OrderField::Enabled, OllamaBridge::AbilityField::Enabled},
+    {PlayerbotBridge::OrderField::ItemName, OllamaBridge::AbilityField::ItemName},
+    {PlayerbotBridge::OrderField::SpellName, OllamaBridge::AbilityField::SpellName},
+    {PlayerbotBridge::OrderField::Choice, OllamaBridge::AbilityField::Choice},
+    {PlayerbotBridge::OrderField::Count, OllamaBridge::AbilityField::Count}};
 static_assert(BridgeValuesAgree(BridgeFieldPairs));
 
 // J5f-b: one topic of the bot's own state for a bot_state query, read by playerbots on world (WorldChannel::Update,
-// map threads idle) and copied as raw entries; the channel filters, bounds and names them. WT18b: place is the route
-// topic's argument (a value from the staged query).
+// map threads idle) and copied as raw entries; the channel filters, bounds and names them. WT18b: place is the
+// topic's argument (route's place; LC16c: an open topic's name), a value from the staged query.
 bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic, std::string const& place,
                          std::vector<OllamaBridge::StateEntry>& entries)
 {

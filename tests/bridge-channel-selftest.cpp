@@ -761,8 +761,9 @@ void Catalogue()
     Check(bytes > 0 && bytes <= ChannelMaxCatalogueBytes && Abilities().rows.size() == 17 &&
               Abilities().verbs.size() == 22 && CatalogueInstalled(),
           "the double installs");
-    Check(ChannelMaxCatalogueBytes == 24576 && ChannelMaxCatalogueBytes + 4096 < MaxResponseBytes,
-          "the catalogue's budget leaves the transport headroom");
+    Check(ChannelMaxCatalogueBytes == 49152 && ChannelMaxCatalogueBytes + 4096 < MaxCatalogueResponseBytes &&
+              MaxResponseBytes == 32768,
+          "the catalogue's budget leaves its answer headroom; the other bodies keep 32 KB");
 
     // A refused index leaves the channel none: no verb, no topic, no catalogue.
     using Change = void (*)(AbilityIndex&);
@@ -778,7 +779,8 @@ void Catalogue()
         [](AbilityIndex& index) { index.rows[1].code = static_cast<uint8_t>(ChannelIntent::Stay); },
         [](AbilityIndex& index) { index.rows[4].name = index.rows[3].name; },
         [](AbilityIndex& index) { index.rows[4].code = index.rows[3].code; },
-        [](AbilityIndex& index) { index.rows.back().code = static_cast<uint8_t>(StateTopicCount); },
+        [](AbilityIndex& index) { index.rows[10].params.push_back(index.rows[10].params.front()); },
+        [](AbilityIndex& index) { index.rows[1].code = static_cast<uint8_t>(ChannelIntentCount); },
         [](AbilityIndex& index) { index.rows[3].name = "inventory items"; },
         [](AbilityIndex& index) { index.rows.clear(); },
         [](AbilityIndex& index) { index.version = 0; },
@@ -1313,6 +1315,229 @@ void SteppedResults()
     Check(InstallTestAbilities(), "the plain double installs again");
 }
 
+// ---- LC16c: a row the module has never heard of ---------------------------------------------------------------------
+void OpenRows()
+{
+    // Malformed rows first: an open act or topic never loosens the old verbs' authority.
+    using Change = void (*)(AbilityIndex&);
+    Change const refused[] = {
+        [](AbilityIndex& index) { index.rows[3].name = "regroup"; },
+        [](AbilityIndex& index) { index.rows[3].name = "stay"; },
+        [](AbilityIndex& index) { index.rows[3].code = static_cast<uint8_t>(ChannelIntent::Stay); },
+        [](AbilityIndex& index) { index.rows[3].params[3].field = static_cast<AbilityField>(11); },
+        [](AbilityIndex& index)
+        {
+            auto twin = index.rows[3];
+            twin.name = "cast_again";
+            index.rows.insert(index.rows.begin() + 4, std::move(twin));
+        },
+        [](AbilityIndex& index) { index.rows.back().code = index.rows[4].code; },
+        [](AbilityIndex& index) { index.rows.back().params.push_back(index.rows.back().params.front()); },
+        [](AbilityIndex& index) { index.rows.back().name = "deeds of"; },
+    };
+    for (Change change : refused)
+    {
+        auto index = TestOpenAbilityIndex();
+        change(index);
+        Check(SetAbilityIndex(std::move(index)) == 0 && Abilities().rows.empty(),
+              "an open row named like a verb, below 22 as another verb, with an unknown field, a twin code, a "
+              "duplicate topic, two topic parameters or a bad word refuses the index");
+    }
+    auto high = TestOpenAbilityIndex();
+    high.rows[3].code = 255;
+    high.rows.back().code = 200;
+    Check(SetAbilityIndex(std::move(high)) > 0, "any act or topic value past the old ones");
+    Check(SetAbilityIndex(TestOpenAbilityIndex()) > 0 && Abilities().rows.size() == 19 && CatalogueInstalled() &&
+              Abilities().verbs.size() == 22,
+          "the open double installs: an act past the 22 verbs, a topic past the 14");
+
+    // A stepped order: the act's value from the index, the four new fields by kind.
+    Json const cast =
+        Step("cast_on", {{"item", "Hearthstone"}, {"spell", "Frost Nova"}, {"times", 1000}, {"manner", "loudly"}});
+    auto const open =
+        Decoded(Json::array({cast, Step("mark", {{"target", "Hogger"}, {"icon", "skull"}})}), "an open act decodes");
+    Check(open.size() == 2 && static_cast<uint8_t>(open[0].intent) == TestOpenAct &&
+              open[0].itemName == "Hearthstone" && open[0].spellName == "Frost Nova" && open[0].count == 1000 &&
+              open[0].choice == 1 && !open[0].icon && !open[0].shape && !open[0].enabled && !open[0].position &&
+              open[0].place.empty() && !open[0].targetGuid && open[0].targetName.empty() &&
+              open[1].intent == ChannelIntent::Mark && open[1].icon == 7 && !open[1].choice && !open[1].count &&
+              open[1].itemName.empty(),
+          "an item and a spell as named, a count as given, a choice as its index; the old act beside it unchanged");
+    auto const least = Decoded(Json::array({Step("cast_on", {{"item", std::string(ChannelMaxPlaceName, 'i')},
+                                                             {"spell", "Blink"},
+                                                             {"times", 1},
+                                                             {"manner", "quietly"}})}),
+                               "the least count and the longest name decode");
+    Check(least[0].count == 1 && least[0].choice == 0 && least[0].itemName.size() == ChannelMaxPlaceName,
+          "a count of one, the first choice, a name of 64 bytes");
+    auto const with = [&cast](char const* key, Json value)
+    {
+        auto step = cast;
+        step["params"][key] = std::move(value);
+        return Json::array({step});
+    };
+    auto const without = [&cast](char const* key)
+    {
+        auto step = cast;
+        step["params"].erase(key);
+        return Json::array({step});
+    };
+    std::string const longName(ChannelMaxPlaceName + 1, 'a');
+    struct Bad
+    {
+        Json steps;
+        char const* label;
+    };
+    Bad const bad[] = {
+        {without("item"), "an open act without its item"},
+        {without("spell"), "without its spell"},
+        {without("times"), "without its count"},
+        {without("manner"), "without its choice"},
+        {with("item", 7), "an item is text"},
+        {with("item", ""), "an empty item"},
+        {with("item", longName), "an item name over 64 bytes"},
+        {with("item", "Hearth\nstone"), "a control character in an item"},
+        {with("spell", " "), "a blank spell"},
+        {with("spell", Json::array({"Blink"})), "a spell is text"},
+        {with("times", 0), "a count of zero"},
+        {with("times", ChannelMaxCount + 1), "a count past 1000"},
+        {with("times", -1), "a negative count"},
+        {with("times", 2.5), "a fractional count"},
+        {with("times", "3"), "a count is a number"},
+        {with("manner", "Loudly"), "a choice is its exact word"},
+        {with("manner", 1), "a choice is a word, not its index"},
+        {with("manner", "softly"), "a choice not among the act's"},
+        {with("itemId", 6948), "an item takes no id"},
+        {with("spellGuid", "44"), "a spell takes no guid"},
+        {Json::array({Step("cast_on")}), "an open act without parameters"},
+        {Json::array({Step("deeds_of", {{"name", "Hogger"}})}), "an open topic is no act"},
+    };
+    for (std::size_t at = 0; at < std::size(bad); ++at)
+    {
+        Fixture f;
+        f.Open();
+        Check(f.Receive(StepWire(f, "open-bad-" + std::to_string(at), bad[at].steps)) == ChannelError::Invalid &&
+                  f.policy.CommandReservations() == 0,
+              bad[at].label);
+    }
+    {
+        Fixture f;
+        f.Open();
+        auto old = f.Command("old-open");
+        old["intent"] = "cast_on";
+        old["params"] = cast.at("params");
+        auto bare = f.Command("old-open-bare");
+        bare["intent"] = "cast_on";
+        bare["params"] = Json::object();
+        auto topic = f.Command("old-open-topic");
+        topic["intent"] = "deeds_of";
+        topic["params"] = Json::object();
+        Check(f.Receive(old) == ChannelError::Invalid && f.Receive(bare) == ChannelError::Invalid &&
+                  f.Receive(topic) == ChannelError::Invalid && f.policy.CommandReservations() == 0,
+              "the old form refuses an act it lacks: its verbs stay the 22");
+        Check(f.Receive(StepWire(f, "open-once", Json::array({cast}))) == ChannelError::None &&
+                  f.policy.CommandReservations() == 1,
+              "one reservation for an open act's order");
+    }
+    auto const refusedStep =
+        Finish(Json::array({cast, Step("mark", {{"target", "Hogger"}, {"icon", "skull"}})}), ChannelOutcome::Rejected,
+               {{ChannelOutcome::Rejected, "no_such_item", "I carry nothing like that."}}, CommandRefusal::CannotNow);
+    Check(refusedStep.error == ChannelError::None && refusedStep.json.at("reason") == "no_such_item" &&
+              refusedStep.json.at("steps") == Json::parse(R"([{"act":"cast_on","outcome":"rejected",
+                  "reason":"no_such_item","reasonText":"I carry nothing like that."},{"act":"mark","outcome":"skipped"}])"),
+          "an open act's step is named by its row and refused in playerbots' words");
+
+    // A topic past the fourteen: its argument under the row's parameter name, its entries in the lines form.
+    Check(StateTopicLimit(static_cast<StateTopic>(TestOpenTopic)) == 6 &&
+              std::string(StateTopicRow(static_cast<StateTopic>(TestOpenTopic), 3)) == "deeds_of" &&
+              !*StateTopicRow(static_cast<StateTopic>(TestOpenTopic + 1), 0) &&
+              !StateTopicLimit(static_cast<StateTopic>(TestOpenTopic + 1)),
+          "an open topic's limit is its row's, its row word its own; a topic the index lacks has neither");
+    {
+        Fixture f;
+        f.Open();
+        auto const asking = [&f](char const* id, char const* key, Json value)
+        {
+            auto json = StateQuery(f, id, "deeds_of");
+            if (key)
+                json[key] = std::move(value);
+            return json;
+        };
+        auto both = asking("deeds-both", "name", "Hogger");
+        both["place"] = "Goldshire";
+        auto routeNamed = StateQuery(f, "route-named", "route");
+        routeNamed["name"] = "Goldshire";
+        Check(f.Receive(asking("deeds-bare", nullptr, {})) == ChannelError::Invalid &&
+                  f.Receive(asking("deeds-place", "place", "Hogger")) == ChannelError::Invalid &&
+                  f.Receive(both) == ChannelError::Invalid &&
+                  f.Receive(asking("deeds-blank", "name", " ")) == ChannelError::Invalid &&
+                  f.Receive(asking("deeds-number", "name", 44)) == ChannelError::Invalid &&
+                  f.Receive(asking("deeds-control", "name", "Hog\tger")) == ChannelError::Invalid &&
+                  f.Receive(asking("deeds-long", "name", longName)) == ChannelError::Invalid &&
+                  f.Receive(routeNamed) == ChannelError::Invalid,
+              "an open topic takes exactly its argument, under its own name and Place's rules");
+        ChannelMessage message;
+        Check(f.policy.Receive(bearer, asking("deeds", "name", "Hogger").dump(), f.scope, now, message, "work") ==
+                  ChannelError::None,
+              "an open topic's query admitted");
+        auto const& query = std::get<ChannelQuery>(message.payload);
+        Check(query.kind == QueryKind::BotState && static_cast<uint8_t>(query.topic) == TestOpenTopic &&
+                  query.place == "Hogger",
+              "the open topic and its argument");
+        std::string const longText(ChannelMaxTopicText + 40, 't');
+        std::vector<StateEntry> entries = {
+            {"Hogger", StateTopicRow(query.topic, 0), 3, 4, "Hogger slew a wolf."},
+            {"Hogger", "deed", -5, 5000000000LL, longText},
+            {"Hogger", "Bad Word", 1, 1, "Dropped."},
+            {"Hogger", "deed", 1, 1, ""},
+            {"", "deed", 1, 1, "No name."},
+        };
+        for (int line = 0; line < 9; ++line)
+            entries.push_back({"Hogger", "deed", line, 0, "Line " + std::to_string(line)});
+        std::string body;
+        Check(f.policy.FinishTopic(message.envelope, f.scope, query.topic, entries, now, body) == ChannelError::None,
+              "an open topic answered");
+        auto const json = Json::parse(body);
+        auto const& list = json.at("entries");
+        Check(json.at("topic") == "deeds_of" && list.size() == 6 &&
+                  list.at(0) == Json{{"row", "deeds_of"},
+                                     {"name", "Hogger"},
+                                     {"text", "Hogger slew a wolf."},
+                                     {"value", 3},
+                                     {"extra", 4}} &&
+                  list.at(2).at("text") == "Line 0" && list.at(5).at("text") == "Line 3",
+              "the lines form, unusable entries dropped, cut at the row's limit");
+        Check(list.at(1).at("row") == "deed" &&
+                  list.at(1).at("text").get<std::string>().size() == ChannelMaxTopicText &&
+                  list.at(1).at("value") == 0 && list.at(1).at("extra") == UINT32_MAX,
+              "any wire word as the row; the text cut to 200 bytes, value and extra clamped");
+        ChannelMessage other;
+        Check(f.policy.Receive(bearer, asking("deeds-other", "name", "Hogger").dump(), f.scope, now, other, "work") ==
+                      ChannelError::None &&
+                  f.policy.FinishTopic(other.envelope, f.scope, static_cast<StateTopic>(TestOpenTopic + 1), entries,
+                                       now, body) == ChannelError::Invalid,
+              "a topic the index lacks is never answered");
+    }
+
+    // The catalogue answer: past the old 32 KB reply, within the catalogue's own bound.
+    {
+        auto big = TestOpenAbilityIndex();
+        big.rows[0].sentence = std::string(40000, 'x');
+        auto const size = SetAbilityIndex(std::move(big));
+        Fixture f;
+        f.Open();
+        ChannelMessage message;
+        std::string body;
+        Check(size > MaxResponseBytes && size <= ChannelMaxCatalogueBytes &&
+                  f.policy.Receive(bearer, CatalogueQuery(f, "cat-big").dump(), f.scope, now, message, "work") ==
+                      ChannelError::None &&
+                  f.policy.FinishCatalogue(message.envelope, f.scope, now, body) == ChannelError::None &&
+                  body.size() > MaxResponseBytes && body.size() <= MaxCatalogueResponseBytes,
+              "a catalogue past the old 32 KB reply is answered whole");
+    }
+    Check(InstallTestAbilities(), "the plain double installs again");
+}
+
 int main()
 {
     if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
@@ -1331,6 +1556,7 @@ int main()
         Catalogue();
         Stepped();
         SteppedResults();
+        OpenRows();
         std::cout << "PASS " << checks << " production channel checks\n";
         return 0;
     }

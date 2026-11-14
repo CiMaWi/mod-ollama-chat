@@ -101,11 +101,15 @@ enum class StateTopic : uint8_t
     Lately,
     Known
 };
+// The fourteen topics with an entry shape of their own. LC16c: any other topic row of the installed index (playerbots'
+// TopicRow past Known, its BotStateTopic value) is answered in the lines form; handler.cpp pins these fourteen values.
 constexpr std::size_t StateTopicCount = 14;
 
 char const* StateTopicName(StateTopic topic);
-std::size_t StateTopicLimit(StateTopic topic);  // Most entries a topic result carries.
-// WT18b: the row word of a planner or record topic's raw code ("" for an unknown code or an older topic).
+// Most entries a topic result carries; an open topic's is its row's limit (0 for a topic the index lacks).
+std::size_t StateTopicLimit(StateTopic topic);
+// WT18b: the row word of a planner or record topic's raw code ("" for an unknown code or an older topic). LC16c:
+// playerbots gives an open topic's entries no row word, so each reads as the topic's own word.
 char const* StateTopicRow(StateTopic topic, uint8_t code);
 
 // LC3: the ability catalogue as plain data, mod-playerbots' one table of acts and topics (PlayerbotBridge::Catalogue)
@@ -120,13 +124,17 @@ enum class AbilityField : uint8_t  // PlayerbotBridge::OrderField: the order fie
     Position,
     QuestId,
     Shape,
-    Enabled
+    Enabled,
+    ItemName,  // LC16c: an item or a spell by name (Place's text rules), a choice by its word, a count 1..1000.
+    SpellName,
+    Choice,
+    Count
 };
 
 struct AbilityParam
 {
     std::string name;
-    std::string kind;  // unit, place, item, spell, quest, choice or flag
+    std::string kind;  // unit, place, item, spell, quest, choice, flag or count
     std::string sentence;
     std::vector<std::string> choices;
     AbilityField field = AbilityField::Target;  // An act's; a topic's argument leaves it unread.
@@ -142,7 +150,7 @@ struct AbilityRefusal
 struct AbilityRow
 {
     bool topic = false;
-    uint8_t code = 0;  // An act's ChannelIntent, a topic's StateTopic.
+    uint8_t code = 0;  // An act's playerbots Intent value (a ChannelIntent below 22), a topic's BotStateTopic value.
     std::string name;
     std::string sentence;
     std::vector<AbilityParam> params;
@@ -170,14 +178,16 @@ struct AbilityIndex
     std::vector<AbilityVerb> verbs;
 };
 
-// The bytes the encoded catalogue may take; the bridge reads it whole (MaxResponseBytes is the transport's bound).
-constexpr std::size_t ChannelMaxCatalogueBytes = 24576;
+// The bytes the encoded catalogue may take (the hub's MAX_CATALOGUE_BYTES); the bridge reads it whole, its answer
+// within MaxCatalogueResponseBytes.
+constexpr std::size_t ChannelMaxCatalogueBytes = 49152;
 
 // Installs the index and returns the bytes its catalogue encodes to (0 when the index is refused or its text is not
-// UTF-8). An index with a missing, duplicate or unknown verb, topic or row is refused: the channel then holds an empty
-// index (every verb and topic unknown, no catalogue). A catalogue that is not UTF-8 or over ChannelMaxCatalogueBytes
-// drops only the catalogue answer: the verbs and topics stand, so the old wire keeps working (LC.23). World thread
-// only, once at startup.
+// UTF-8). An index with a missing, duplicate or unknown verb, a duplicate row word or code, an act below 22 that is not
+// its verb, one past it named like a verb, a parameter field the channel does not fill or a topic with more than one
+// parameter is refused: the channel then holds an empty index (every verb and topic unknown, no catalogue). A catalogue
+// that is not UTF-8 or over ChannelMaxCatalogueBytes drops only the catalogue answer: the verbs and topics stand, so
+// the old wire keeps working (LC.23). World thread only, once at startup.
 std::size_t SetAbilityIndex(AbilityIndex index);
 AbilityIndex const& Abilities();
 bool CatalogueInstalled();  // Whether a catalogue query has an answer.
@@ -191,6 +201,7 @@ bool CatalogueInstalled();  // Whether a catalogue query has an answer.
 //   plan, options, route, quest_plan, bags, places (WT18b): kind = the row word (StateTopicRow), name (words, or a
 //               quest title or bind area), first = value, second = extra (0..4294967295 each)
 //   history, lately, known (LC7): the planner shape and text = one sentence (1..ChannelMaxTopicText bytes)
+//   any other topic of the index (LC16c): history's shape, kind = any wire word (StateTopicRow gives the topic's)
 struct StateEntry
 {
     std::string name;
