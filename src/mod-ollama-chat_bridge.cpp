@@ -154,6 +154,31 @@ void PutTextList(nlohmann::json& json, char const* key, std::vector<std::string>
         json[key] = std::move(list);
 }
 
+// LC15c: `traits.words` and, beside them, `traits.areas`: one area per word, a word dropped (no text) takes its area
+// with it so the two stay as long as each other; no areas key unless the game gave one area per word.
+void PutTraitWords(nlohmann::json& json, BotTraits const& traits)
+{
+    bool const withAreas = traits.areas.size() == traits.words.size();
+    nlohmann::json words = nlohmann::json::array();
+    nlohmann::json areas = nlohmann::json::array();
+    for (std::size_t i = 0; i < traits.words.size() && words.size() < MaxTraitWords; ++i)
+    {
+        auto word = WireText(traits.words[i], MaxTraitBytes);
+        if (!word)
+            continue;
+        words.push_back(std::move(*word));
+        if (withAreas)
+            if (auto area = WireText(traits.areas[i], MaxTraitBytes))
+                areas.push_back(std::move(*area));
+    }
+    if (words.empty())
+        return;
+    bool const allAreas = withAreas && areas.size() == words.size();
+    json["words"] = std::move(words);
+    if (allAreas)
+        json["areas"] = std::move(areas);
+}
+
 // LC10: a list of {first: fact, second: word} pairs, the same rule; a pair missing either text is dropped.
 void PutPairList(nlohmann::json& json, char const* key, std::vector<std::pair<std::string, std::string>> const& values,
                  std::size_t cap, char const* firstKey, char const* secondKey)
@@ -566,7 +591,7 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
         if (nlohmann::json facts; input.facts && FactsJson(*input.facts, facts))
             envelope["input"]["facts"] = std::move(facts);
         nlohmann::json traits = nlohmann::json::object();
-        PutTextList(traits, "words", input.traits.words, MaxTraitWords, MaxTraitBytes);
+        PutTraitWords(traits, input.traits);
         PutTextList(traits, "interests", input.traits.interests, MaxTraitInterests, MaxTraitBytes);
         if (!traits.empty())
             envelope["input"]["traits"] = std::move(traits);

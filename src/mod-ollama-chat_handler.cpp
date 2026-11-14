@@ -1238,6 +1238,7 @@ void BridgeFactsAndTraits(Player* bot, OllamaBridge::Context& input)
     if (PlayerbotBridge::ReadBotPersonality(bot->GetGUID(), traits))
     {
         input.traits.words = std::move(traits.words);
+        input.traits.areas = std::move(traits.areas);
         input.traits.interests = std::move(traits.interests);
     }
 }

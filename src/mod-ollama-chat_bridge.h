@@ -202,6 +202,7 @@ struct BotFacts
 struct BotTraits
 {
     std::vector<std::string> words;
+    std::vector<std::string> areas;  // LC15c: one per word, same order; sent only when it is as long as words.
     std::vector<std::string> interests;
 };
 
