@@ -92,6 +92,8 @@ using ChannelParams = std::variant<std::monostate, ChannelTarget, ChannelMark, C
 // LC3: one step of a stepped command, its parameters by the catalogue's names. The act is a row of the installed
 // catalogue; a unit and a quest come as an id or a name (exactly one when the act takes it), a place as given, a
 // position as the spot "x,y,z,map" names, a choice as its index among the act's choices. playerbots checks the rest.
+// LC16c: intent is the act's playerbots Intent value from the installed index; for an act the old form lacks it lies
+// past ChannelIntentCount, so code keyed on ChannelIntent (plan kinds, the partner rule) finds no verb of its own.
 struct ChannelStep
 {
     ChannelIntent intent = ChannelIntent::Stay;
@@ -104,7 +106,12 @@ struct ChannelStep
     std::optional<uint8_t> icon;              // mark
     std::optional<uint8_t> shape;             // formation
     std::optional<bool> enabled;              // save_mana
+    std::string itemName;                     // LC16c: an item, by name
+    std::string spellName;                    // a spell, by name
+    std::optional<uint8_t> choice;            // a choice other than an icon or a shape, as its index
+    uint32_t count = 0;                       // 1..ChannelMaxCount; 0 = the act takes none
 };
+constexpr uint32_t ChannelMaxCount = 1000;  // playerbots' and the hub's MAX_COUNT.
 
 struct ChannelCommand
 {

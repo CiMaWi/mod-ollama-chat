@@ -1245,6 +1245,34 @@ void SteppedOrders()
               "a bot out of the world: unavailable, nothing runs");
     }
     {
+        // LC16c: an act the old form lacks: its Intent value and the four new fields go to playerbots as given; it has
+        // no plan kind, so no ledger entry.
+        Env env;
+        auto cast = Step(static_cast<ChannelIntent>(22));
+        cast.itemName = "Hearthstone";
+        cast.spellName = "Frost Nova";
+        cast.choice = 1;
+        cast.count = 1000;
+        Check(RunSteps(env, Steps({cast, mark})) == EffectResult::Applied && pb.steps.size() == 2 &&
+                  static_cast<uint8_t>(pb.steps[0].Operation) == 22 && pb.steps[0].ItemName == "Hearthstone" &&
+                  pb.steps[0].SpellName == "Frost Nova" && pb.steps[0].Choice == 1 && pb.steps[0].Count == 1000 &&
+                  pb.steps[0].Icon == 0 && pb.steps[0].Shape == PlayerbotBridge::FormationShape::None &&
+                  pb.steps[1].ItemName.empty() && pb.steps[1].SpellName.empty() && pb.steps[1].Choice == 0 &&
+                  pb.steps[1].Count == 0 && pb.steps[1].Icon == 7 && plans.Size() == 0 && AllApplied(env.ran, 2),
+              "an open act's value and its item, spell, choice and count reach playerbots; no plan recorded");
+    }
+    {
+        // A refusal the module has no CommandRefusal for passes in playerbots' word and sentence.
+        Env env;
+        auto cast = Step(static_cast<ChannelIntent>(22));
+        cast.count = 3;
+        PlayerbotBridge::pb.stepOutcomes = {{Result::Rejected, static_cast<Refusal>(200)}};
+        Check(RunSteps(env, Steps({cast})) == EffectResult::Rejected && env.ran.size() == 1 &&
+                  env.ran[0].outcome == ChannelOutcome::Rejected && env.ran[0].reason == "pb_word" &&
+                  env.ran[0].reasonText == "A playerbots sentence." && pb.wordsFor == static_cast<Refusal>(200),
+              "an open refusal in playerbots' words");
+    }
+    {
         // The old form keeps the one-order way and reports no steps.
         Env env;
         BridgeCommandExecutor executor;

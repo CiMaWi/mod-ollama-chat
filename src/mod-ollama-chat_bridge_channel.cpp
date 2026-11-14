@@ -155,8 +155,9 @@ ChannelPosition Spot(Json const& value)
 
 // LC3: the steps of a stepped command, 1..maxSteps acts of the installed catalogue. Each is {act, params} with exactly
 // the act's parameters by their catalogue names: a unit as `name` (its name) or `nameGuid`, a quest as `name` (its
-// title) or `nameId`, exactly one of the two; names and places have Place's text rules. A topic, a verb without a row
-// and an unknown word are no act.
+// title) or `nameId`, exactly one of the two; names and places have Place's text rules. LC16c: an item or a spell as
+// its name (Place's rules), a choice as one of its words, a count 1..ChannelMaxCount. A topic, a verb without a row
+// and an unknown word are no act; an act the old form lacks is a row like any other.
 std::vector<ChannelStep> Steps(Json const& value)
 {
     auto const& index = Installed().index;
@@ -214,6 +215,19 @@ std::vector<ChannelStep> Steps(Json const& value)
                     if (!given.is_boolean())
                         throw std::runtime_error("invalid");
                     step.enabled = given.get<bool>();
+                    break;
+                case AbilityField::ItemName:
+                    step.itemName = Place(given);
+                    break;
+                case AbilityField::SpellName:
+                    step.spellName = Place(given);
+                    break;
+                case AbilityField::Choice:
+                    step.choice = Choice(given, param);
+                    break;
+                case AbilityField::Count:
+                    if (!(step.count = static_cast<uint32_t>(Integer(given, ChannelMaxCount))))
+                        throw std::runtime_error("invalid");
                     break;
             }
         }
@@ -457,7 +471,23 @@ bool StrategyAllowed(std::string const& name)
     return std::any_of(std::begin(allowed), std::end(allowed), [&](char const* item) { return name == item; });
 }
 
-// LC3: any topic the installed catalogue lists; SetAbilityIndex took only topics with a StateTopic (an entry shape).
+// LC3: the installed index's row of a topic; null for a topic it does not list.
+AbilityRow const* TopicRowOf(StateTopic topic)
+{
+    for (auto const& row : Installed().index.rows)
+        if (row.topic && row.code == static_cast<uint8_t>(topic))
+            return &row;
+    return nullptr;
+}
+
+// A wire word: 1..64 lower-case letters and underscores.
+bool Word(std::string const& name)
+{
+    return !name.empty() && name.size() <= 64 &&
+           std::all_of(name.begin(), name.end(), [](unsigned char c) { return (c >= 'a' && c <= 'z') || c == '_'; });
+}
+
+// LC3: any topic the installed catalogue lists. LC16c: one past the fourteen is answered in the lines form.
 bool ParseTopic(std::string const& name, StateTopic& topic)
 {
     for (auto const& row : Installed().index.rows)
@@ -475,6 +505,19 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
     auto const name = TopicText(entry.name, ChannelMaxTopicName);
     if (name.empty())
         return false;
+    if (static_cast<std::size_t>(topic) >= StateTopicCount)
+    {
+        // LC16c: an open topic's entry, the record topics' shape; its row word any wire word.
+        auto const text = TopicText(entry.text, ChannelMaxTopicText);
+        if (!Word(entry.kind) || text.empty())
+            return false;
+        value = {{"row", entry.kind},
+                 {"name", name},
+                 {"text", text},
+                 {"value", std::clamp<int64_t>(entry.first, 0, UINT32_MAX)},
+                 {"extra", std::clamp<int64_t>(entry.second, 0, UINT32_MAX)}};
+        return true;
+    }
     switch (topic)
     {
         case StateTopic::Inventory:
@@ -601,15 +644,12 @@ Json CatalogueJson(AbilityIndex const& index)
             {"rows", std::move(rows)}};
 }
 
-// A wire word: 1..64 lower-case letters and underscores.
-bool Word(std::string const& name)
-{
-    return !name.empty() && name.size() <= 64 &&
-           std::all_of(name.begin(), name.end(), [](unsigned char c) { return (c >= 'a' && c <= 'z') || c == '_'; });
-}
+static_assert(ChannelMaxCatalogueBytes + 4096 < MaxCatalogueResponseBytes, "the catalogue answer's envelope fits");
 
-// Every ChannelIntent one verb of its own; every row a word of its own, an act one of the verbs (its own intent), a
-// topic one StateTopic.
+// Every ChannelIntent one verb of its own; every row a word of its own. LC16c: an act's code is its playerbots Intent
+// value, one act each: one below the 22 is its verb (the same word), one past them no verb's word, and each parameter
+// fills a field the channel knows. A topic's code is its BotStateTopic value, one topic each, with at most one
+// parameter (its argument).
 bool ValidIndex(AbilityIndex const& index)
 {
     constexpr std::size_t intents = ChannelIntentCount;
@@ -622,14 +662,20 @@ bool ValidIndex(AbilityIndex const& index)
             !taken.insert(verb.intent).second)
             return false;
     std::set<std::string> names;
+    std::set<uint8_t> acts;
     std::set<uint8_t> topics;
     for (auto const& row : index.rows)
     {
-        auto const own = [&row](AbilityVerb const& verb)
-        { return verb.name == row.name && static_cast<uint8_t>(verb.intent) == row.code; };
+        auto const verb = std::find_if(index.verbs.begin(), index.verbs.end(),
+                                       [&row](AbilityVerb const& entry) { return entry.name == row.name; });
+        bool const own = row.code < intents
+                             ? verb != index.verbs.end() && static_cast<uint8_t>(verb->intent) == row.code
+                             : verb == index.verbs.end();
+        bool const fields = std::all_of(row.params.begin(), row.params.end(),
+                                        [](AbilityParam const& param) { return param.field <= AbilityField::Count; });
         if (!Word(row.name) || !names.insert(row.name).second ||
-            (row.topic ? row.code >= StateTopicCount || !topics.insert(row.code).second
-                       : std::none_of(index.verbs.begin(), index.verbs.end(), own)))
+            (row.topic ? row.params.size() > 1 || !topics.insert(row.code).second
+                       : !own || !fields || !acts.insert(row.code).second))
             return false;
     }
     return true;
@@ -667,10 +713,8 @@ bool CatalogueInstalled() { return Installed().catalogue.is_object(); }
 // LC3: the installed catalogue's word for the topic.
 char const* StateTopicName(StateTopic topic)
 {
-    for (auto const& row : Installed().index.rows)
-        if (row.topic && row.code == static_cast<uint8_t>(topic))
-            return row.name.c_str();
-    return "";
+    auto const* row = TopicRowOf(topic);
+    return row ? row->name.c_str() : "";
 }
 
 char const* StateTopicRow(StateTopic topic, uint8_t code)
@@ -712,7 +756,7 @@ char const* StateTopicRow(StateTopic topic, uint8_t code)
         case StateTopic::Spells:
             break;
     }
-    return "";
+    return static_cast<std::size_t>(topic) >= StateTopicCount ? StateTopicName(topic) : "";
 }
 
 std::size_t StateTopicLimit(StateTopic topic)
@@ -748,7 +792,8 @@ std::size_t StateTopicLimit(StateTopic topic)
         case StateTopic::Known:
             return 12;
     }
-    return 0;
+    auto const* row = TopicRowOf(topic);  // LC16c: an open topic's own limit.
+    return row ? row->limit : 0;
 }
 
 char const* ChannelErrorName(ChannelError error)
@@ -998,18 +1043,20 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
             ChannelQuery query;
             if (kind == "bot_state")
             {
-                // J5f-b: one topic of the bot's own state; an unknown topic is invalid_input. WT18b: route, and
-                // only route, names the place it goes to.
+                // J5f-b: one topic of the bot's own state; an unknown topic is invalid_input. LC16c: a topic with
+                // a parameter (route's place, an open topic's name) takes it under its catalogue name, and only it.
                 if (!ParseTopic(String(json.at("topic")), query.topic))
                     return ChannelError::Invalid;
-                if (query.topic != StateTopic::Route
+                auto const& argument = TopicRowOf(query.topic)->params;
+                if (argument.empty()
                         ? !Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs",
                                         "type", "controllerGuid", "botGuid", "query", "topic"})
-                        : !Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs",
-                                        "type", "controllerGuid", "botGuid", "query", "topic", "place"}))
+                        : !Exact(json,
+                                 {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
+                                  "controllerGuid", "botGuid", "query", "topic", argument.front().name.c_str()}))
                     return ChannelError::Invalid;
-                if (query.topic == StateTopic::Route)
-                    query.place = Place(json.at("place"));
+                if (!argument.empty())
+                    query.place = Place(json.at(argument.front().name));
                 query.kind = QueryKind::BotState;
             }
             else
@@ -1172,8 +1219,8 @@ ChannelError ChannelPolicy::FinishTopic(ChannelEnvelope const& envelope, WorldSc
                                         std::vector<StateEntry> const& entries, Clock now, std::string& body)
 {
     body.clear();
-    if (static_cast<std::size_t>(topic) >= StateTopicCount)
-        return ChannelError::Invalid;
+    if (!TopicRowOf(topic))
+        return ChannelError::Invalid;  // LC16c: a topic the installed index lists, any of its values.
     if (!Current(envelope, current, now) || _requests.at(envelope.requestId).work != ChannelWork::Query)
         return ChannelError::Stale;
     try
@@ -1228,7 +1275,7 @@ ChannelError ChannelPolicy::FinishCatalogue(ChannelEnvelope const& envelope, Wor
         auto json = EnvelopeJson(envelope, "query.result");
         json["catalogue"] = catalogue;
         auto encoded = json.dump();
-        if (encoded.size() > MaxResponseBytes)
+        if (encoded.size() > MaxCatalogueResponseBytes)
             return ChannelError::TooLarge;
         _requests.at(envelope.requestId).terminal = true;
         body = std::move(encoded);
@@ -1321,12 +1368,13 @@ ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::
     if (!steps.empty())
     {
         Json list = Json::array();
-        auto const& verbs = Installed().index.verbs;
+        auto const& rows = Installed().index.rows;  // LC16c: the act's row, an act the old form lacks included.
         for (std::size_t index = 0; index < steps.size(); ++index)
         {
-            auto const verb = std::find_if(verbs.begin(), verbs.end(), [&](AbilityVerb const& entry)
-                                           { return entry.intent == steps[index].intent; });
-            Json step = {{"act", verb == verbs.end() ? std::string() : verb->name}};
+            auto const code = static_cast<uint8_t>(steps[index].intent);
+            auto const row = std::find_if(rows.begin(), rows.end(), [code](AbilityRow const& entry)
+                                          { return !entry.topic && entry.code == code; });
+            Json step = {{"act", row == rows.end() ? std::string() : row->name}};
             if (index >= ran.size())
                 step["outcome"] = "skipped";  // After the ending step, or the order was refused before any ran.
             else

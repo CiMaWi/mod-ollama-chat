@@ -429,7 +429,8 @@ private:
         {
             ChannelStep const& step = command.steps[index];
             PlayerbotBridge::Order order;
-            order.Operation = static_cast<PlayerbotBridge::Intent>(step.intent);  // Equal values: handler.cpp asserts.
+            // The row's playerbots Intent value (handler.cpp asserts the 22 old verbs' values are equal).
+            order.Operation = static_cast<PlayerbotBridge::Intent>(step.intent);
             order.Bot = ticket.scope.botGuid;
             order.Controller = ticket.scope.controllerGuid;
             order.Group = guard.groupGuid;
@@ -451,6 +452,10 @@ private:
             order.Shape = step.shape ? static_cast<PlayerbotBridge::FormationShape>(*step.shape + 1)
                                      : PlayerbotBridge::FormationShape::None;
             order.Enabled = step.enabled.value_or(false);
+            order.ItemName = step.itemName;  // LC16c: OrderField ItemName, SpellName, Choice (its index), Count.
+            order.SpellName = step.spellName;
+            order.Choice = step.choice.value_or(0);
+            order.Count = step.count;
             auto const part = PlayerbotBridge::LastingPart(order.Operation);
             auto const kind = PlanKindFor(step.intent);
             orders.push_back(std::move(order));

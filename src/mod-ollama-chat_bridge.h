@@ -17,6 +17,8 @@ namespace OllamaBridge
 {
 constexpr std::size_t MaxRequestBytes = 65536;
 constexpr std::size_t MaxResponseBytes = 32768;
+// LC16c: the catalogue answer's bound, the hub link's MAX_REPLY_BYTES; every other body keeps MaxResponseBytes.
+constexpr std::size_t MaxCatalogueResponseBytes = 65536;
 constexpr std::size_t MaxTextBytes = 4096;
 // Persona card proposal body; equal to OllamaPersona::MaxCardBytes (checked where both are visible).
 constexpr std::size_t MaxCardProposalBytes = 8192;
@@ -200,6 +202,7 @@ struct BotFacts
 struct BotTraits
 {
     std::vector<std::string> words;
+    std::vector<std::string> areas;  // LC15c: one per word, same order; sent only when it is as long as words.
     std::vector<std::string> interests;
 };
 

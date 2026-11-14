@@ -136,6 +136,45 @@ inline OllamaBridge::AbilityIndex TestStepAbilityIndex()
     return index;
 }
 
+// LC16c: the double with one act and one topic the old form lacks, as a row playerbots appends: cast_on (Intent value
+// 22, after go_to at row 3) takes an item, a spell, a count and a choice; deeds_of (BotStateTopic 14, the last row)
+// takes a unit by name and answers in lines. The module has no verb, enum value or switch case for either.
+constexpr uint8_t TestOpenAct = 22;
+constexpr uint8_t TestOpenTopic = 14;
+
+inline OllamaBridge::AbilityIndex TestOpenAbilityIndex()
+{
+    using namespace OllamaBridge;
+    auto index = TestAbilityIndex();
+    index.rows.insert(index.rows.begin() + 3,
+                      AbilityRow{.topic = false,
+                                 .code = TestOpenAct,
+                                 .name = "cast_on",
+                                 .sentence = "Use an item and a spell a number of times, in a manner.",
+                                 .params = {{"item", "item", "The item, by name.", {}, AbilityField::ItemName},
+                                            {"spell", "spell", "The spell, by name.", {}, AbilityField::SpellName},
+                                            {"times", "count", "How many times.", {}, AbilityField::Count},
+                                            {"manner", "choice", "How.", {"quietly", "loudly"}, AbilityField::Choice}},
+                                 .refusals = {{"no_such_item", "I carry nothing like that."}},
+                                 .effect = "none",
+                                 .done = "at_once",
+                                 .state = "casting {spell}",
+                                 .event = "BridgeAct",
+                                 .limit = 0});
+    index.rows.push_back({.topic = true,
+                          .code = TestOpenTopic,
+                          .name = "deeds_of",
+                          .sentence = "What a person you know has done.",
+                          .params = {{"name", "unit", "The person, by name.", {}, AbilityField::Target}},
+                          .refusals = {},
+                          .effect = "none",
+                          .done = "at_once",
+                          .state = "",
+                          .event = "",
+                          .limit = 6});
+    return index;
+}
+
 // Installs the double; false when the channel refused it.
 inline bool InstallTestAbilities()
 {
