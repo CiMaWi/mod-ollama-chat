@@ -1,0 +1,270 @@
+{
+    "tests": [
+        {
+            "file": "api-selftest.cpp",
+            "baseline": "needs core headers (boost, IoContext) and a generated config-excerpt.inc; no runner in the repo"
+        },
+        {
+            "file": "bridge-card-facts-selftest.cpp",
+            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+        },
+        {
+            "file": "bridge-channel-dispatch-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp"
+            ],
+            "extract": [
+                {
+                    "from": "src/mod-ollama-chat_httpclient.cpp",
+                    "start": "bool OllamaBridge::ValidObserverSettings(",
+                    "end": "bool OllamaBridge::LoadObserverToken(",
+                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
+                    "as": "observer-settings.cpp"
+                }
+            ],
+            "success": "PASS \\d+ production channel dispatch checks"
+        },
+        {
+            "file": "bridge-channel-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge_channel.cpp"
+            ],
+            "success": "PASS \\d+ production channel checks"
+        },
+        {
+            "file": "bridge-combat-filter-selftest.cpp",
+            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+        },
+        {
+            "file": "bridge-command-dispatch-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp"
+            ],
+            "extract": [
+                {
+                    "from": "src/mod-ollama-chat_httpclient.cpp",
+                    "start": "bool OllamaBridge::ValidObserverSettings(",
+                    "end": "bool OllamaBridge::LoadObserverToken(",
+                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
+                    "as": "observer-settings.cpp"
+                }
+            ],
+            "success": "PASS \\d+ typed command dispatch checks"
+        },
+        {
+            "file": "bridge-effect-selftest.cpp",
+            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+        },
+        {
+            "file": "bridge-intent-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp"
+            ],
+            "extract": [
+                {
+                    "from": "src/mod-ollama-chat_httpclient.cpp",
+                    "start": "bool OllamaBridge::ValidObserverSettings(",
+                    "end": "bool OllamaBridge::LoadObserverToken(",
+                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
+                    "as": "observer-settings.cpp"
+                }
+            ],
+            "success": "PASS \\d+ checks"
+        },
+        {
+            "file": "bridge-listener-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge_listener.cpp",
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp"
+            ],
+            "extract": [
+                {
+                    "from": "src/mod-ollama-chat_httpclient.cpp",
+                    "start": "bool OllamaBridge::ValidObserverSettings(",
+                    "end": "bool OllamaBridge::LoadObserverToken(",
+                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
+                    "as": "observer-settings.cpp"
+                }
+            ],
+            "flags": [
+                "ws2_32.lib"
+            ],
+            "success": "\\d+ checks passed"
+        },
+        {
+            "file": "bridge-observer-selftest.cpp",
+            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+        },
+        {
+            "file": "bridge-plan-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "success": "PASS \\d+ checks"
+        },
+        {
+            "file": "bridge-query-dispatch-selftest.cpp",
+            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+        },
+        {
+            "file": "bridge-query-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp"
+            ],
+            "extract": [
+                {
+                    "from": "src/mod-ollama-chat_httpclient.cpp",
+                    "start": "bool OllamaBridge::ValidObserverSettings(",
+                    "end": "bool OllamaBridge::LoadObserverToken(",
+                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
+                    "as": "observer-settings.cpp"
+                }
+            ],
+            "success": "PASS \\d+ production filtered query/event helper checks"
+        },
+        {
+            "file": "bridge-selftest.cpp",
+            "baseline": "needs core headers (ScriptMgr.h) and stubs; no runner in the repo"
+        },
+        {
+            "file": "bridge-speech-routing-selftest.cpp",
+            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+        },
+        {
+            "file": "bridge-watch-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "success": "PASS \\d+ watch table checks"
+        },
+        {
+            "file": "bridge-world-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "flags": [
+                "-Wno-missing-field-initializers"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp"
+            ],
+            "extract": [
+                {
+                    "from": "src/mod-ollama-chat_httpclient.cpp",
+                    "start": "bool OllamaBridge::ValidObserverSettings(",
+                    "end": "bool OllamaBridge::LoadObserverToken(",
+                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
+                    "as": "observer-settings.cpp"
+                }
+            ],
+            "success": "PASS \\d+ production world-policy checks"
+        },
+        {
+            "file": "dispatch-bridge-selftest.cpp",
+            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+        },
+        {
+            "file": "lab-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "success": "lab selftest: \\d+ checks passed"
+        },
+        {
+            "file": "persona-adapter-selftest.cpp",
+            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+        },
+        {
+            "file": "persona-bridge-selftest.cpp",
+            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+        },
+        {
+            "file": "persona-card-selftest.cpp",
+            "includes": [
+                "src",
+                "deps",
+                "{core}/deps/utf8cpp"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_persona_card.cpp"
+            ],
+            "success": "persona-card selftest passed \\d+ checks"
+        },
+        {
+            "file": "persona-store-selftest.cpp",
+            "includes": [
+                "src",
+                "deps",
+                "{core}/deps/utf8cpp"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_persona_store.cpp",
+                "src/mod-ollama-chat_persona_card.cpp"
+            ],
+            "success": "persona-store selftest: \\d+ checks passed"
+        },
+        {
+            "file": "reply-split-selftest.cpp",
+            "includes": [
+                "src",
+                "deps"
+            ],
+            "success": "\\d+ reply split checks passed"
+        },
+        {
+            "file": "trait-words-selftest.cpp",
+            "includes": [
+                "src",
+                "deps",
+                "{playerbots}/src/Ai/World/Rpg"
+            ],
+            "success": "PASS: \\d+ checks passed"
+        }
+    ]
+}
