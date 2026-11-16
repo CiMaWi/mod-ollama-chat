@@ -3,7 +3,6 @@
 
 #include <span>
 #include <unordered_map>
-#include <unordered_set>
 #include <variant>
 
 #include "mod-ollama-chat_bridge.h"
@@ -12,10 +11,11 @@
 
 namespace OllamaBridge
 {
-constexpr std::size_t ChannelMaxIds = 4096;
+// LC.35: the query and command ids one route may open. A route lives at most 120 s and the 64 packet slots bound
+// the rest; the ledger holds live routes only.
+constexpr std::size_t ChannelMaxRouteIds = 64;
 constexpr std::size_t ChannelMaxPending = 64;
 constexpr std::size_t ChannelMaxScopes = 64;
-constexpr std::size_t ChannelMaxEvents = 32;
 constexpr std::size_t ChannelMaxUnits = 40;
 constexpr std::size_t ChannelMaxTopicBytes = 8192;  // DS.14 (d): one bot_state topic's entries, encoded.
 constexpr std::size_t ChannelMaxTopicName = 64;     // Bytes of one entry's name, cut on a character boundary.
@@ -41,7 +41,6 @@ char const* ChannelErrorName(ChannelError error);
 enum class ChannelWork : uint8_t
 {
     Generation,
-    Events,
     Query
 };
 
@@ -223,9 +222,6 @@ struct ChannelText
 {
     std::string text;
 };
-struct ChannelAck
-{
-};
 // J6e-c: arm, replace or clear the route bot's watch; its id shares the command replay namespace.
 struct ChannelWatch
 {
@@ -234,8 +230,7 @@ struct ChannelWatch
     WatchCondition condition = WatchCondition::None;
     int64_t untilUnixMs = 0;
 };
-using ChannelPayload =
-    std::variant<ChannelQuery, ChannelCommand, ChannelText, ChannelAck, ChannelFailure, ChannelWatch>;
+using ChannelPayload = std::variant<ChannelQuery, ChannelCommand, ChannelText, ChannelFailure, ChannelWatch>;
 
 // Owned values only. Successful decode is staging, never an effect-execution grant.
 struct ChannelMessage
@@ -244,19 +239,13 @@ struct ChannelMessage
     ChannelPayload payload;
 };
 
-struct ChannelObservedMark
-{
-    uint64_t targetGuid = 0;
-    uint8_t icon = 0;
-};
-
 // World-thread owner; no mutex, game objects, transport, queue or activation acknowledgement.
 // J5b must bind only the actual selected/drained game epoch, authenticate EVERY transport operation,
 // own physical payload slots through disposal and revalidate live world authority before publication.
 class ChannelPolicy
 {
 public:
-    explicit ChannelPolicy(std::size_t maxIds = ChannelMaxIds, std::size_t maxPending = ChannelMaxPending);
+    explicit ChannelPolicy(std::size_t maxRouteIds = ChannelMaxRouteIds, std::size_t maxPending = ChannelMaxPending);
     ChannelPolicy(ChannelPolicy const&) = delete;
     ChannelPolicy& operator=(ChannelPolicy const&) = delete;
 
@@ -266,12 +255,14 @@ public:
     void RemoveScope(uint64_t botGuid, std::string const& contextId);
     void Expire(Clock now);
     ChannelError OpenGeneration(WorldScope const& scope, std::string requestId, Deadline deadline, Clock now);
-    ChannelError OpenEvents(WorldScope const& scope, std::string requestId, Deadline deadline,
-                            std::vector<ChannelObservedMark> const& events, Clock now, std::string& body);
+    // LC.35: forgets a route, its own id and the query and command ids opened under it; a late message of any of them
+    // then finds no route (Unknown). A generation's terminal, its expiry and WorldChannel::Close drop it.
+    void Drop(std::string const& route);
 
     // Authentication is checked before size/JSON parsing and before any replay/state mutation.
     // current and expectedRequestId come from the trusted game route, NEVER from this body.
-    // Non-query ids must match that route before state changes; queries carry independent ids.
+    // Non-query ids must match that route before state changes; queries carry independent ids, opened under the
+    // route (an unknown route refuses them as Unknown) and dropped with it.
     ChannelError Receive(std::string const& localBearer, std::string const& body, WorldScope const& current, Clock now,
                          ChannelMessage& message, std::string const& expectedRequestId);
     bool Current(ChannelEnvelope const& envelope, WorldScope const& current, Clock now, bool requireOpen = true) const;
@@ -315,6 +306,8 @@ private:
         ChannelWork work = ChannelWork::Generation;
         bool terminal = false;
         bool invalid = false;
+        std::vector<std::string> queries;   // A generation route's query ids, dropped with it.
+        std::vector<std::string> commands;  // Its command and watch ids, dropped with it.
     };
     struct CommandEntry
     {
@@ -323,18 +316,20 @@ private:
     };
     bool Authenticated(std::string const& bearer) const;
     bool ScopeCurrent(WorldScope const& scope, Clock now) const;
-    ChannelError Open(WorldScope const& scope, std::string requestId, Deadline deadline, ChannelWork work, Clock now);
+    ChannelError Open(WorldScope const& scope, std::string requestId, Deadline deadline, ChannelWork work, Clock now,
+                      std::string const& route = {});
     bool const _validLimits;
-    std::size_t const _maxIds;
+    std::size_t const _maxRouteIds;
     std::size_t const _maxPending;
     Identity _identity;
     Clock _observed;  // Trusted clock high-water marks: heartbeat expiry cannot be undone by clock rollback.
     std::string _bearer;
-    // Bounded lifetime epoch history also prevents accidental reconnect with a retired identity.
-    std::unordered_set<std::string> _epochs;
+    // The previous binding's epoch: a reconnect with it is refused. Epochs are fresh 128-bit random values, so no
+    // longer history is kept (LC.35).
+    std::string _previous;
     std::vector<ScopeEntry> _scopes;
-    std::unordered_map<std::string, RequestEntry> _requests;
-    std::unordered_map<std::string, CommandEntry> _commands;
+    std::unordered_map<std::string, RequestEntry> _requests;  // Live routes and their queries only.
+    std::unordered_map<std::string, CommandEntry> _commands;  // The live routes' command and watch ids.
 };
 }  // namespace OllamaBridge
 

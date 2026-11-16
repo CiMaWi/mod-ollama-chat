@@ -663,7 +663,6 @@ struct Source : QueryWorldSource
         result = {it->second.guid, it->second.group, it->second.name, 70};
         return true;
     }
-    bool ReadMark(WorldTicket const&, uint8_t, uint64_t&) override { return false; }
 };
 
 struct RealFixture

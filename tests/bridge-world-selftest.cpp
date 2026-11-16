@@ -143,21 +143,21 @@ void Capacity()
     Check(policy.Reserve(scope, Input(), now, 1000).generation == 0, "pending capacity rejects without eviction");
     for (auto const& ticket : pending)
         policy.Cancel(ticket);
+    // LC.35: no epoch cap: 5,000 reservations one after another all succeed.
     WorldTicket last;
-    for (uint64_t i = MaxWorldPending; i < MaxEpochRequests; ++i)
+    for (unsigned i = 0; i < 5000; ++i)
     {
         last = policy.Reserve(scope, Input(), now, 1000);
         if (!last.generation)
-            throw std::runtime_error("premature id capacity");
+            throw std::runtime_error("an epoch refused a reservation");
         policy.Cancel(last);
     }
     Check(last.request.requestId != pending.front().request.requestId, "cancelled ids never reused");
-    Check(policy.Pending() == 0 && policy.Reserve(scope, Input(), now, 1000).generation == 0,
-          "id capacity does not recycle terminal reservations");
+    Check(policy.Pending() == 0, "5,000 reservations in one epoch, every one admitted");
     Select(policy, "world-epoch-capacity-2");
     Check(policy.ObserveScope(Scope(policy), now), "new epoch capacity scope");
     auto const next = policy.Reserve(Scope(policy), Input(), now, 1000);
-    Check(next.generation && next.request.requestId != last.request.requestId, "fresh epoch restores capacity safely");
+    Check(next.generation && next.request.requestId != last.request.requestId, "a fresh epoch issues fresh ids");
     for (std::size_t i = 1; i < MaxWorldScopes; ++i)
     {
         auto another = Scope(policy);

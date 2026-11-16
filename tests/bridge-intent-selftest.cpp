@@ -262,8 +262,10 @@ void WireRefusals()
     Check(fixture.policy.CommandReservations() == 0, "invalid requests consume zero command ids");
     fixture.Stage("stay", empty);
     Check(fixture.Receive(fixture.Wire("stay", empty)) == ChannelError::Duplicate, "duplicate cannot stage again");
-    Check(fixture.Receive(fixture.Wire("stay", empty, "expired"), {Until.unixMs, Now.steadyMs}) == ChannelError::Stale,
-          "equal wall deadline refuses fresh id");
+    // LC.35: at its wall deadline the route leaves the ledger; a fresh id then finds no route.
+    Check(
+        fixture.Receive(fixture.Wire("stay", empty, "expired"), {Until.unixMs, Now.steadyMs}) == ChannelError::Unknown,
+        "equal wall deadline refuses fresh id");
 }
 
 void WorldRefusals()

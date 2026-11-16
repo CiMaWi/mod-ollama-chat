@@ -173,7 +173,6 @@ bool BridgeWatchFacts(uint64_t, uint64_t, WatchFacts& facts)
     return false;
 }
 WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
-bool OllamaDispatch_ChannelEvents(DispatchGuard const&, std::vector<uint8_t> const&);
 // The production channel names the world-only typed effect adapter, which needs game headers. This fixture stands in
 // with the closed release gate: every command is refused without a game read.
 CommandExecutor& OllamaChat_BridgeCommandExecutor()
@@ -217,7 +216,6 @@ struct Fixture
         onResolve = {};
         resolutions = 0;
         g_bridgeChannel.Retire();
-        g_eventPublications.clear();
         OllamaChat_BridgeReset();
         g_bridgeWorld.Shutdown();
         clockNow = Now();
@@ -246,12 +244,8 @@ struct Fixture
         scope.contextRevision = scope.membershipRevision = scope.personaRevision = scope.perceptionScope = "rev1";
         guard = view.guard;
         Check(g_bridgeWorld.ObserveScope(scope, clockNow), "observe trusted scope");
-        g_bridgeBindings.push_back({g_bridgeWorld.Generation(),
-                                    view,
-                                    CaptureDeadline(clockNow, WorldLivenessMs),
-                                    CaptureDeadline(clockNow, MaxLifetimeMs),
-                                    "",
-                                    {}});
+        g_bridgeBindings.push_back({g_bridgeWorld.Generation(), view, CaptureDeadline(clockNow, WorldLivenessMs),
+                                    CaptureDeadline(clockNow, MaxLifetimeMs), ""});
         auto input = view.context;
         input.text = "What can we see?";
         ticket = g_bridgeWorld.Reserve(scope, input, clockNow, 30000);
@@ -262,7 +256,6 @@ struct Fixture
     {
         onResolve = {};
         g_bridgeChannel.Retire();
-        g_eventPublications.clear();
         OllamaChat_BridgeReset();
         g_bridgeWorld.Shutdown();
     }
@@ -382,10 +375,8 @@ void Queries()
 void Events()
 {
     Fixture f;
-    // J6e-c (DS.14 brief, Unclear 1): the generic port has no events endpoint, so nothing ever took an event receipt
-    // and each mark change held a packet slot until retirement. A mark change now opens no event route there: no
-    // publication, no packet slot and no world reservation, however many changes come.
-    EventPublication publication;
+    // LC.35: there is no event route. A mark change opens no route, holds no packet slot and reserves nothing in the
+    // world, however many changes come.
     auto const used = g_bridgeChannel.Used();
     auto const reserved = g_bridgeWorld.Pending();
     for (unsigned i = 0; i < 2 * WorldChannel::MaxPackets; ++i)
@@ -393,69 +384,8 @@ void Events()
         party.marks[0] = i % 2 ? 0 : 77;
         OllamaChat_BridgeRefresh();
     }
-    Check(!OllamaDispatch_ChannelNextEvent(publication) && g_bridgeChannel.Used() == used &&
-              g_bridgeWorld.Pending() == reserved,
-          "generic provider: 128 mark changes open no event route and hold no packet slot");
-    // The event route itself, opened on the channel: the dispatch handoff left with the Codex adapter (CS.20).
-    party.marks[0] = 77;
-    party.marks[1] = 77;
-    Check(g_bridgeChannel.ObserveEvents(f.guard, {0, 1}, publication) && publication.receipt &&
-              publication.route != f.ticket.request.requestId,
-          "channel opens a distinct event route");
-    auto packet = f.Take(publication.receipt);
-    auto value = Json::parse(packet->body);
-    Check(value["type"] == "events" && value["requestId"] == publication.route && value["events"].size() == 2,
-          "actual event serialization and route join");
-    Check(value["deadlineUnixMs"].get<int64_t>() <= Now().unixMs + WorldLivenessMs, "event age capped at five seconds");
-    Check(OllamaDispatch_ChannelReceive("wrong", publication.route, "{}", publication.receipt) ==
-              ChannelError::Unauthorized,
-          "every I/O operation authenticates");
-    packet.reset();
-    auto pending = g_bridgeWorld.Pending();
-    EventPublication failed;
-    Check(!g_bridgeChannel.ObserveEvents(f.guard, {8}, failed) && !failed.receipt && failed.route.empty() &&
-              g_bridgeWorld.Pending() == pending,
-          "malformed mark admission cancels game reservation");
-    enemy.visible = false;
-    Check(!g_bridgeChannel.ObserveEvents(f.guard, {0}, failed) && g_bridgeWorld.Pending() == pending,
-          "hidden mark fails closed and cleans reservation");
-    enemy.visible = true;
-    Context input;
-    input.speakerGuid = 22;
-    input.channel = f.guard.scope.channel;
-    input.text = "Observed marks.";
-    auto ticket = g_bridgeWorld.Reserve(f.guard.scope, input, Now(), WorldLivenessMs);
-    FilteredQueryAdapter adapter(g_bridgeWorld, OllamaChat_BridgeQuerySource());
-    MarkObservation observed;
-    Check(adapter.CaptureMarks(ticket, f.guard, {0}, observed), "capture final-event failure fixture");
-    uint64_t receipt = 0;
-    bool validated = false;
-    Check(!g_bridgeChannel.RegisterEvents(ticket, f.guard, observed.marks, receipt,
-                                          [&]
-                                          {
-                                              validated =
-                                                  true;  // Invoked after OpenEvents serialized, before insertion.
-                                              enemy.visible = false;
-                                              return adapter.Current(observed);
-                                          }) &&
-              validated && !receipt,
-          "post-serialization hidden mark never publishes receipt");
-    g_bridgeChannel.Close(ticket);
-    g_bridgeWorld.Cancel(ticket);
-    enemy.visible = true;
-    for (unsigned i = 0; i < WorldChannel::MaxPackets; ++i)
-    {
-        if (g_bridgeChannel.Used() >= WorldChannel::MaxPackets || g_bridgeWorld.Pending() >= MaxWorldPending)
-            break;
-        Check(g_bridgeChannel.ObserveEvents(f.guard, {0}, failed), "all events share physical packet capacity");
-    }
-    while (g_bridgeChannel.Used() < WorldChannel::MaxPackets)
-        f.Receive();
-    pending = g_bridgeWorld.Pending();
-    Check(!g_bridgeChannel.ObserveEvents(f.guard, {0}, failed) && g_bridgeWorld.Pending() == pending,
-          "full shared capacity rejects event and cancels reservation");
-    g_bridgeChannel.Retire();
-    Check(g_bridgeChannel.Drained(), "retirement disposes all queued event payloads");
+    Check(g_bridgeChannel.Used() == used && g_bridgeWorld.Pending() == reserved,
+          "128 mark changes open no route and hold no packet slot");
 }
 
 void Lifetimes()
@@ -470,17 +400,7 @@ void Lifetimes()
         channel.Configure(true);
         Check(channel.Activate() && channel.Register(f.ticket, f.guard),
               "one millisecond wall/steady skew cannot falsely reject captured generation");
-        party.marks[0] = 77;
-        EventPublication publication;
-        Check(channel.ObserveEvents(f.guard, {0}, publication) && publication.receipt,
-              "capture distinct controlled-clock event");
         auto const original = Json::parse(f.Query())["deadlineUnixMs"].get<int64_t>();
-        std::unique_ptr<ChannelPacket> packet;
-        clockNow.steadyMs += WorldLivenessMs;
-        clockNow.unixMs -= 10000;
-        Check(channel.Take(settings.token, publication.receipt, packet) == ChannelError::Stale && !packet &&
-                  channel.Drained(),
-              "event original monotonic five-second cap survives UTC rollback");
         Check(f.ticket.request.deadline.unixMs == original, "channel cap preserves original wire deadline");
     }
     for (unsigned clock = 0; clock < 3; ++clock)

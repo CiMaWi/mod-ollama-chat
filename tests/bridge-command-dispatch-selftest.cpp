@@ -708,11 +708,12 @@ void TerminalAndIds()
     result["text"] = "Done.";
     Check(f.Result(f.Send(result.dump()), "") == "unknown_request", "generation result closes the request");
     f.Advance(CommandRate::IntervalMs);
-    Check(f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "closed" && f.probe.calls == 2,
-          "a command after its request is terminal is closed before reservation or effect");
-    Check(
-        f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "closed" && !f.channel.Commands().duplicates,
-        "the closed command consumed no id");
+    // LC.35: the terminal dropped the route; a later command finds none.
+    Check(f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "unknown_request" && f.probe.calls == 2,
+          "a command after its request is terminal is refused before reservation or effect");
+    Check(f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "unknown_request" &&
+              !f.channel.Commands().duplicates,
+          "the refused command consumed no id");
 
     Fixture c;
     auto const id = c.Receive(c.Attack("closed-route"));

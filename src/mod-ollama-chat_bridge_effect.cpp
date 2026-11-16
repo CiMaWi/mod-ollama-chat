@@ -346,12 +346,6 @@ private:
                 !Plans().Record(key, owner, before, applied, nowMs))
                 Plans().NoteUnrecorded();
         }
-        // DS.10: a mark that applied or may have applied re-baselines only this bot's stored marks, so the bot does
-        // not react to its own mark change; other bots in the group still observe it. Rejected and Unavailable
-        // promise no mutation.
-        if (effect->intent == ChannelIntent::Mark && outcome != PlayerbotBridge::Result::Rejected &&
-            outcome != PlayerbotBridge::Result::Unavailable)
-            OllamaChat_BridgeNoteOwnMark(ticket.scope.botGuid);
         switch (outcome)
         {
             case PlayerbotBridge::Result::Rejected:
@@ -511,12 +505,7 @@ private:
                 Plans().NoteUnrecorded();
         }
         for (std::size_t index = 0; index < outcomes.size(); ++index)
-        {
-            // DS.10: a mark that applied or may have applied re-baselines this bot's stored marks.
-            if (command.steps[index].intent == ChannelIntent::Mark && wrote(index))
-                OllamaChat_BridgeNoteOwnMark(ticket.scope.botGuid);
             ran.push_back(StepResult(outcomes[index]));
-        }
         switch (result)
         {
             case PlayerbotBridge::Result::Rejected:

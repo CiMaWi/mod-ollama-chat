@@ -115,7 +115,6 @@ OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
                                                return g_bridgeObserver && g_bridgeObserver(ticket, guard);
         },
         OllamaBridge::Now, &OllamaChat_BridgeQuerySource(), &OllamaChat_BridgeCommandExecutor());
-    std::deque<OllamaBridge::EventPublication> g_eventPublications;  // WORLD ONLY, bounded by MaxPackets.
     std::atomic<uint64_t> g_bridgeGeneration{0};
     std::atomic<uint32_t> g_bridgeInFlight{0};
 
@@ -702,22 +701,6 @@ bool PrepareBridge(Completion& c)
 
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
 
-bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const& /*guard*/, std::vector<uint8_t> const& /*icons*/)
-{
-    // No event route since the Codex adapter left (CS.20); LCB1a deletes it.
-    return false;
-}
-
-bool OllamaDispatch_ChannelNextEvent(OllamaBridge::EventPublication& publication)
-{
-    publication = {};
-    if (g_eventPublications.empty())
-        return false;
-    publication = std::move(g_eventPublications.front());
-    g_eventPublications.pop_front();
-    return true;
-}
-
 OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer, std::string_view route,
                                                          std::string_view body, uint64_t& receipt)
 {
@@ -780,7 +763,6 @@ static void RetireBridgeWork()
     // generation is selected until the ledger is empty.
     OllamaChat_BridgePlansRetire();
     g_bridgeChannel.Retire();
-    g_eventPublications.clear();
     OllamaChat_BridgeReset();
     OllamaBridge_SetActivation({});
     {

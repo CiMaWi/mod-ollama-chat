@@ -17,7 +17,6 @@ namespace OllamaBridge
 {
 constexpr std::size_t MaxWorldPending = 64;
 constexpr std::size_t MaxWorldScopes = 64;
-constexpr uint64_t MaxEpochRequests = 4096;
 constexpr int64_t WorldLivenessMs = 5000;
 static_assert(CommandRate::MaxBots == MaxWorldScopes, "one rate entry per live world scope");
 static_assert(MaxWatches == MaxWorldScopes, "one watch per live world scope");
@@ -170,7 +169,6 @@ private:
 
     uint64_t _generation = 0;
     uint64_t _sequence = 0;  // Never reset, including reload, rejection, cancellation and queue-full.
-    uint64_t _issued = 0;
     bool _enabled = false;
     bool _retiring = false;
     Settings _settings;
@@ -206,12 +204,6 @@ public:
 // and bytes before Receive; their async write owns the returned packet until disposal, including cancellation.
 class QueryWorldSource;
 
-struct EventPublication
-{
-    std::string route;
-    uint64_t receipt = 0;
-};
-
 class WorldChannel
 {
 public:
@@ -225,15 +217,9 @@ public:
     void Retire();
     bool Activate();
     bool Register(WorldTicket const& ticket, DispatchGuard const& guard);
-    // World-only: a separate game reservation, never an already registered generation route.
-    // J5c supplies freshly filtered marks; native adapters discover the receipt out of band.
-    bool RegisterEvents(WorldTicket const& ticket, DispatchGuard const& guard,
-                        std::vector<ChannelObservedMark> const& events, uint64_t& receipt,
-                        std::function<bool()> const& current = {});
-    // Synchronous world capture; reserves a separate event route and never renews an observation.
-    bool ObserveEvents(DispatchGuard const& guard, std::vector<uint8_t> const& icons, EventPublication& publication);
     // Returns whether the closed route made an authorized effect attempt (Applied or Failed): the DS.14 rule for a
-    // silent answer. Nothing else reads the flag, and a second Close reports false.
+    // silent answer. Nothing else reads the flag, and a second Close reports false. The route leaves the replay
+    // ledger with its query and command ids (LC.35).
     bool Close(WorldTicket const& ticket);
     // World tick. Typed effects run only with the post-map-join phase, which is used during this call only;
     // without a phase every command gets the fixed refusal.
@@ -252,7 +238,6 @@ private:
     {
         WorldTicket ticket;
         DispatchGuard guard;
-        bool events = false;
         bool acted = false;  // An authorized effect attempt on this route, its receipt published or not (DS.14).
     };
     bool Authenticated(std::string_view bearer) const;  // Caller holds _mutex.

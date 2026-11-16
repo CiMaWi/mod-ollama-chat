@@ -29,7 +29,8 @@ struct Fixture
     WorldScope scope{
         1,       "fixture",       "codex",     "epoch-1",   9007199254740994ULL, 9007199254740993ULL, "conversation",
         "party", "visible-party", "context-1", "members-1", "persona-1"};
-    explicit Fixture(std::size_t ids = ChannelMaxIds, std::size_t pending = ChannelMaxPending) : policy(ids, pending)
+    explicit Fixture(std::size_t ids = ChannelMaxRouteIds, std::size_t pending = ChannelMaxPending)
+        : policy(ids, pending)
     {
         Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}, bearer), "trusted selected epoch binding");
         Check(policy.ObserveScope(scope, now), "trusted scope registration");
@@ -69,7 +70,10 @@ struct Fixture
     ChannelError Receive(Json const& json, Clock clock = now)
     {
         ChannelMessage result;
-        std::string const route = json.at("requestId").is_string() ? json.at("requestId").get<std::string>() : "work";
+        // A query opens under the fixture's generation route (LC.35); other messages name their own route.
+        bool const query = json.contains("type") && json.at("type") == "query";
+        std::string const route =
+            !query && json.at("requestId").is_string() ? json.at("requestId").get<std::string>() : "work";
         return policy.Receive(bearer, json.dump(), scope, clock, result, route);
     }
 };
@@ -98,19 +102,17 @@ void IdentityAndTerminal()
     auto terminal = f.Wire("generation.result");
     terminal["text"] = "I shall wait here.";
     Check(f.Receive(terminal) == ChannelError::None, "one terminal result");
-    Check(f.Receive(terminal) == ChannelError::Closed, "duplicate terminal blocked");
-    Check(f.Receive(f.Command("late")) == ChannelError::Closed, "command cannot follow terminal");
+    // LC.35: the terminal drops the route with its ids; whatever follows finds no route.
+    Check(f.Receive(terminal) == ChannelError::Unknown, "duplicate terminal blocked");
+    Check(f.Receive(f.Command("late")) == ChannelError::Unknown, "command cannot follow terminal");
     auto failure = f.Wire("failure");
     failure["code"] = "unavailable";
-    Check(f.Receive(failure) == ChannelError::Closed, "failure cannot replace terminal");
+    Check(f.Receive(failure) == ChannelError::Unknown, "failure cannot replace terminal");
     std::string body;
     ChannelEnvelope envelope{"fixture", "codex", "epoch-1", "work", deadline.unixMs};
-    Check(f.policy.FinishCommand(envelope, "effect", ChannelOutcome::Failed, f.scope, now, body) == ChannelError::None,
-          "failed staged proposal reports once even after parent terminal");
-    Check(Json::parse(body).at("outcome") == "failed", "typed fixed outcome");
-    Check(f.policy.FinishCommand(envelope, "effect", ChannelOutcome::Applied, f.scope, now, body) ==
-              ChannelError::Duplicate,
-          "failed command id never retries");
+    // WorldChannel finishes every command in the tick it arrives, so nothing is left to report after the terminal.
+    Check(f.policy.FinishCommand(envelope, "effect", ChannelOutcome::Failed, f.scope, now, body) == ChannelError::Stale,
+          "a closed route reports no staged proposal");
     Check(body.empty(), "rejected result has no stale output");
     auto nativeResult = f.Wire("command.result");
     nativeResult["commandId"] = "effect";
@@ -122,7 +124,7 @@ void IdentityAndTerminal()
     failure = failed.Wire("failure");
     failure["code"] = "timeout";
     Check(failed.Receive(failure) == ChannelError::None, "failure terminal accepted");
-    Check(failed.Receive(failed.Command()) == ChannelError::Closed, "failure cannot authorize effects");
+    Check(failed.Receive(failed.Command()) == ChannelError::Unknown, "failure cannot authorize effects");
     Check(failed.policy.Bind({"fixture", "codex", "", "epoch-2"}, bearer + "-new"), "reconnect uses new epoch");
     Check(!failed.policy.ObserveScope(failed.scope, now), "reconnect rejects old scope");
     Check(failed.Receive(failure) == ChannelError::Unauthorized, "old bearer retired");
@@ -135,7 +137,8 @@ void IdentityAndTerminal()
     Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result, "work") ==
               ChannelError::Unknown,
           "reconnect cannot reopen old work");
-    Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-1"}, bearer), "retired epoch reuse fails closed");
+    // LC.35: only the previous binding's epoch is remembered (epochs are 128-bit random, never reissued).
+    Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-2"}, bearer), "retired epoch reuse fails closed");
     Check(!failed.policy.ObserveScope(failed.scope, now), "bad activation leaves inactive");
 }
 
@@ -145,10 +148,11 @@ void ExpiryAndScope()
     {
         Fixture f;
         f.Open();
-        Check(f.Receive(f.Command(), clock) == ChannelError::Stale,
+        // LC.35: expiry drops the route; the trusted clock's high-water mark keeps its id from reopening.
+        Check(f.Receive(f.Command(), clock) == ChannelError::Unknown,
               "expiry equality on either clock including rollback");
-        Check(f.policy.RequestReservations() == 1 && f.policy.Pending() == 0, "expiry retains replay id");
-        Check(f.policy.OpenGeneration(f.scope, "work", deadline, now) == ChannelError::Duplicate,
+        Check(f.policy.RequestReservations() == 0 && f.policy.Pending() == 0, "expiry drops the route");
+        Check(f.policy.OpenGeneration(f.scope, "work", deadline, now) == ChannelError::Stale,
               "expired id cannot reopen");
     }
     Fixture f;
@@ -310,9 +314,10 @@ void Schemas()
     Check(f.Receive(terminal) == ChannelError::None, "exact text byte maximum");
 }
 
-void QueriesEventsAndCapacity()
+void QueriesAndCapacity()
 {
     Fixture f;
+    f.Open();  // LC.35: queries open under a live generation route.
     ChannelMessage query;
     Check(f.policy.Receive(bearer, f.Query().dump(), f.scope, now, query, "work") == ChannelError::None,
           "authenticated reverse query");
@@ -358,62 +363,114 @@ void QueriesEventsAndCapacity()
     Check(f.policy.FinishFailure(query.envelope, ChannelFailure::Cancelled, f.scope, now, body) == ChannelError::Stale,
           "local failure terminal once");
     Check(f.Receive(f.Command("query-after-failure", "q3")) == ChannelError::Closed, "failed query remains closed");
-    Check(f.policy.OpenEvents(f.scope, "events", deadline, std::vector<ChannelObservedMark>(32, {1, 7}), now, body) ==
-              ChannelError::None,
-          "maximum event batch");
-    parsed = Json::parse(body);
-    Check(parsed.at("events").size() == 32 && parsed.at("events").at(0).size() == 3, "only observed mark schema");
-    Check(f.Receive(f.Wire("events.result", "events")) == ChannelError::None, "event acknowledgement terminal");
-    Check(f.Receive(f.Wire("events.result", "events")) == ChannelError::Closed, "event terminal replay rejected");
-    Check(f.policy.OpenEvents(f.scope, "overevents", deadline, std::vector<ChannelObservedMark>(33, {1, 0}), now,
-                              body) == ChannelError::Invalid,
-          "oversize event batch");
-    Check(f.policy.OpenEvents(f.scope, "badmark", deadline, {{1, 8}}, now, body) == ChannelError::Invalid,
-          "mark icon bound");
     Fixture slots(4, 1);
     slots.Open();
     Check(slots.Receive(slots.Query()) == ChannelError::Capacity, "pending work fails closed");
     auto failure = slots.Wire("failure");
     failure["code"] = "cancelled";
     Check(slots.Receive(failure) == ChannelError::None, "terminal releases only logical pending work");
-    Check(slots.Receive(slots.Query()) == ChannelError::None, "capacity reuse with fresh request id");
-    Check(slots.policy.RequestReservations() == 2, "terminal replay reservation retained");
+    Check(slots.Receive(slots.Query()) == ChannelError::Unknown, "a closed route opens no query");
+    slots.Open("work-2");
+    Check(slots.policy.RequestReservations() == 1, "a closed route keeps no replay reservation");
     Fixture commands(2);
     commands.Open();
     Check(commands.Receive(commands.Command("a")) == ChannelError::None, "first effect reservation");
     Check(commands.Receive(commands.Command("b")) == ChannelError::None, "last effect reservation");
     Check(commands.Receive(commands.Command("c")) == ChannelError::Capacity,
-          "effect capacity rejects instead of eviction");
+          "the route's id bound rejects instead of eviction");
     Check(commands.Receive(commands.Command("a")) == ChannelError::Duplicate, "oldest live effect retained");
+    // LC.35: 5,000 generations with 3 queries each in one epoch, every one admitted. Each closed route leaves the
+    // ledger with its ids, so a late replay of any of them finds no route.
     Fixture full;
-    for (std::size_t i = 0; i < ChannelMaxIds; ++i)
+    for (std::size_t i = 0; i < 5000; ++i)
     {
         auto const id = "work-" + std::to_string(i);
-        full.Open(id);
-        auto fail = full.Wire("failure", id);
-        fail["code"] = "unavailable";
-        Check(full.Receive(fail) == ChannelError::None, "retained request terminal");
+        Check(full.policy.OpenGeneration(full.scope, id, deadline, now) == ChannelError::None,
+              "5000: every generation admitted");
+        for (std::size_t k = 0; k < 3; ++k)
+        {
+            ChannelMessage asked;
+            Check(full.policy.Receive(bearer, full.Query("q-" + std::to_string(i) + "-" + std::to_string(k)).dump(),
+                                      full.scope, now, asked, id) == ChannelError::None,
+                  "5000: every query admitted");
+        }
+        Check(full.Receive(full.Command("c-" + std::to_string(i), id)) == ChannelError::None,
+              "5000: every command admitted");
+        auto close = full.Wire(i % 2 ? "generation.result" : "failure", id);
+        if (i % 2)
+            close["text"] = "Done.";
+        else
+            close["code"] = "unavailable";
+        Check(full.Receive(close) == ChannelError::None, "5000: every route closes");
     }
-    Check(full.policy.RequestReservations() == 4096, "exact epoch request maximum");
-    Check(full.policy.OpenGeneration(full.scope, "overflow", deadline, now) == ChannelError::Capacity,
-          "request capacity fails closed");
-    Check(full.policy.OpenGeneration(full.scope, "work-0", deadline, now) == ChannelError::Duplicate,
-          "oldest terminal id retained");
+    Check(
+        full.policy.RequestReservations() == 0 && full.policy.CommandReservations() == 0 && full.policy.Pending() == 0,
+        "closed routes leave an empty ledger");
+    auto lateFailure = full.Wire("failure", "work-0");
+    lateFailure["code"] = "unavailable";
+    auto lateText = full.Wire("generation.result", "work-1");
+    lateText["text"] = "Again.";
+    ChannelMessage late;
+    Check(full.Receive(lateFailure) == ChannelError::Unknown && full.Receive(lateText) == ChannelError::Unknown &&
+              full.Receive(full.Command("c-0", "work-0")) == ChannelError::Unknown &&
+              full.policy.Receive(bearer, full.Query("q-0-0").dump(), full.scope, now, late, "work-0") ==
+                  ChannelError::Unknown,
+          "a late replay of a closed route's failure, text, command or query is unknown_request");
+    Fixture pair;
+    pair.Open("route-a");
+    pair.Open("route-b");
+    ChannelMessage asked;
+    Check(
+        pair.policy.Receive(bearer, pair.Query("qa").dump(), pair.scope, now, asked, "route-a") == ChannelError::None &&
+            pair.policy.Receive(bearer, pair.Query("qb").dump(), pair.scope, now, asked, "route-b") ==
+                ChannelError::None &&
+            pair.Receive(pair.Command("ca", "route-a")) == ChannelError::None &&
+            pair.Receive(pair.Command("cb", "route-b")) == ChannelError::None,
+        "two routes, each with a query and a command");
+    auto closeA = pair.Wire("generation.result", "route-a");
+    closeA["text"] = "Done.";
+    Check(pair.Receive(closeA) == ChannelError::None, "route a closes");
+    Check(pair.policy.RequestReservations() == 2 && pair.policy.CommandReservations() == 1,
+          "only the closed route's ids leave the ledger");
+    Check(pair.Receive(pair.Command("cb", "route-b")) == ChannelError::Duplicate &&
+              pair.policy.Receive(bearer, pair.Query("qb").dump(), pair.scope, now, asked, "route-b") ==
+                  ChannelError::Duplicate,
+          "the open route's ids stay refused as duplicates");
+    Check(pair.Receive(pair.Command("ca", "route-a")) == ChannelError::Unknown,
+          "a closed route's command id never lands on that route");
+    Fixture aging;
+    aging.Open("old");
+    Check(aging.policy.Receive(bearer, aging.Query("old-q").dump(), aging.scope, now, asked, "old") ==
+                  ChannelError::None &&
+              aging.Receive(aging.Command("old-c", "old")) == ChannelError::None,
+          "expiry: a route with a query and a command");
+    Clock const after{deadline.unixMs, deadline.steadyMs};
+    aging.policy.Expire(after);
+    Check(aging.policy.RequestReservations() == 0 && aging.policy.CommandReservations() == 0,
+          "expiry: a route at its deadline leaves the ledger with its ids");
+    auto lateTimeout = aging.Wire("failure", "old");
+    lateTimeout["code"] = "timeout";
+    Check(aging.Receive(lateTimeout, after) == ChannelError::Unknown &&
+              aging.Receive(aging.Command("old-c", "old"), after) == ChannelError::Unknown,
+          "expiry: a late replay finds no route");
     ChannelPolicy invalid(0);
     Check(!invalid.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "zero capacity fails closed");
-    ChannelPolicy tooMany(ChannelMaxIds + 1);
+    ChannelPolicy tooMany(ChannelMaxRouteIds + 1);
     Check(!tooMany.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "cannot expand id bound");
     ChannelPolicy tooPending(1, ChannelMaxPending + 1);
     Check(!tooPending.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "cannot expand pending bound");
 
     Fixture effects;
     effects.Open();
-    for (std::size_t i = 0; i < ChannelMaxIds; ++i)
+    for (std::size_t i = 0; i < ChannelMaxRouteIds; ++i)
         Check(effects.Receive(effects.Command("effect-" + std::to_string(i))) == ChannelError::None,
-              "reserve full effect namespace");
-    Check(effects.policy.CommandReservations() == 4096, "exact effect maximum");
-    Check(effects.Receive(effects.Command("overflow")) == ChannelError::Capacity, "full effect namespace refuses");
+              "a route holds its full id bound");
+    Check(effects.policy.CommandReservations() == ChannelMaxRouteIds, "exact route id maximum");
+    Check(effects.Receive(effects.Command("overflow")) == ChannelError::Capacity, "a full route refuses another id");
     Check(effects.Receive(effects.Command("effect-0")) == ChannelError::Duplicate, "first effect never evicted");
+    Check(effects.policy.Receive(bearer, effects.Query("q-over").dump(), effects.scope, now, asked, "work") ==
+              ChannelError::Capacity,
+          "queries share the route's id bound");
     Fixture scopes;
     for (unsigned i = 1; i < ChannelMaxScopes; ++i)
     {
@@ -426,14 +483,15 @@ void QueriesEventsAndCapacity()
     Check(!scopes.policy.ObserveScope(extra, now), "scope capacity fails closed");
     scopes.policy.RemoveScope(scopes.scope.botGuid, scopes.scope.contextId);
     Check(scopes.policy.ObserveScope(extra, now), "removed scope frees bounded scope slot");
+    // LC.35: no epoch history bound; only the previous binding's epoch is refused (epochs are 128-bit random).
     ChannelPolicy epochs;
-    for (unsigned i = 0; i < ChannelMaxIds; ++i)
+    for (unsigned i = 0; i < 5000; ++i)
         Check(epochs.Bind({"fixture", "codex", "", "epoch-" + std::to_string(i)}, bearer),
-              "bounded fresh epoch history");
-    Check(!epochs.Bind({"fixture", "codex", "", "epoch-overflow"}, bearer), "epoch history capacity fails closed");
+              "fresh epochs bind without a history bound");
+    Check(!epochs.Bind({"fixture", "codex", "", "epoch-4999"}, bearer), "the previous binding's epoch is refused");
     ChannelMessage output;
     Check(epochs.Receive(bearer, f.Query().dump(), f.scope, now, output, "work") == ChannelError::Unauthorized,
-          "epoch exhaustion leaves inactive");
+          "a refused rebind leaves inactive");
 }
 }  // namespace
 
@@ -483,6 +541,7 @@ bool Keys(Json const& entry, std::set<std::string> const& keys)
 void Topics()
 {
     Fixture f;
+    f.Open();
     // Parse: the fourteen topics, nothing else.
     for (std::string bad : {"bank", "", "Inventory", "talents", "Plan", "quest plan", "questplan", "place"})
         Check(f.Receive(StateQuery(f, "bad-" + bad, bad)) == ChannelError::Invalid, "unknown topic invalid_input");
@@ -993,10 +1052,6 @@ void Watches()
     Check(f.Receive(WatchWire(f, "on-query", "time", 160000, "q-watch")) == ChannelError::Invalid,
           "watch: never on a query route");
     std::string body;
-    Check(f.policy.OpenEvents(f.scope, "ev-watch", deadline, {{1, 0}}, now, body) == ChannelError::None,
-          "watch: an events route");
-    Check(f.Receive(WatchWire(f, "on-events", "time", 160000, "ev-watch")) == ChannelError::Invalid,
-          "watch: never on an events route");
 
     ChannelEnvelope const envelope{f.scope.instance, f.scope.provider, f.scope.epoch, "work", deadline.unixMs};
     Check(f.policy.FinishWatch(envelope, "w-combat_end", WatchOutcome::Armed, f.scope, now, body) == ChannelError::None,
@@ -1047,7 +1102,7 @@ void Watches()
     }
     auto terminal = f.Wire("generation.result");
     terminal["text"] = "I will come once this is done.";
-    Check(f.Receive(terminal) == ChannelError::None && f.Receive(WatchWire(f, "late")) == ChannelError::Closed,
+    Check(f.Receive(terminal) == ChannelError::None && f.Receive(WatchWire(f, "late")) == ChannelError::Unknown,
           "watch: none after the terminal result");
 }
 
@@ -1550,7 +1605,7 @@ int main()
         IdentityAndTerminal();
         ExpiryAndScope();
         Schemas();
-        QueriesEventsAndCapacity();
+        QueriesAndCapacity();
         Topics();
         Watches();
         Catalogue();

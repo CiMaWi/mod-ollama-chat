@@ -23,7 +23,6 @@ public:
     virtual bool Observe(WorldTicket const& ticket, DispatchGuard& guard) = 0;
     virtual bool GroupMembers(WorldTicket const& ticket, uint64_t groupGuid, std::vector<uint64_t>& members) = 0;
     virtual bool ResolveVisible(WorldTicket const& ticket, uint64_t guid, VisibleUnit& unit) = 0;
-    virtual bool ReadMark(WorldTicket const& ticket, uint8_t icon, uint64_t& targetGuid) = 0;
     // J5f-b: one bot_state topic of the ticket's own bot, raw (FinishTopic filters and bounds it); false when the
     // bot cannot be read. Never another unit's state. WT18b: place is the route topic's place ("" for the others).
     virtual bool ReadTopic(WorldTicket const& /*ticket*/, StateTopic /*topic*/, std::string const& /*place*/,
@@ -51,30 +50,16 @@ struct QueryObservation
     std::vector<Participant> units;
 };
 
-struct MarkObservation
-{
-    WorldTicket ticket;
-    DispatchGuard guard;
-    Deadline until;
-    std::vector<ChannelObservedMark> marks;
-};
-
 class FilteredQueryAdapter
 {
 public:
     FilteredQueryAdapter(WorldPolicy& world, QueryWorldSource& source, ReadClock clock = Now);
     bool CaptureQuery(WorldTicket const& ticket, DispatchGuard const& guard, QueryObservation& result);
     bool Current(QueryObservation const& observation);
-    // icons are supplied by a trusted game hook, never by a received model message. Only current visible
-    // marks are captured; removals and other event kinds have no schema. One icon appears at most once.
-    bool CaptureMarks(WorldTicket const& ticket, DispatchGuard const& guard, std::vector<uint8_t> const& icons,
-                      MarkObservation& result);
-    bool Current(MarkObservation const& observation);
 
 private:
     bool Fresh(WorldTicket const& ticket, DispatchGuard const& guard);
     bool Units(WorldTicket const& ticket, DispatchGuard const& guard, std::vector<Participant>& result);
-    bool Marks(WorldTicket const& ticket, std::vector<uint8_t> const& icons, std::vector<ChannelObservedMark>& result);
     WorldPolicy& _world;
     QueryWorldSource& _source;
     ReadClock const _clock;

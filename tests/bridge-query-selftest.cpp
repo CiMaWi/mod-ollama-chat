@@ -52,7 +52,6 @@ struct Source : QueryWorldSource
     DispatchGuard guard;
     std::map<uint64_t, Unit> objects;
     std::vector<uint64_t> members{11, 22, 44, 55};
-    std::array<uint64_t, 8> marks{};
     bool authority = true;
     std::function<void()> afterResolve;
     unsigned resolves = 0;
@@ -82,13 +81,6 @@ struct Source : QueryWorldSource
         if (afterResolve)
             afterResolve();
         return true;
-    }
-    bool ReadMark(WorldTicket const&, uint8_t icon, uint64_t& target) override
-    {
-        if (icon > 7)
-            return false;
-        target = marks[icon];
-        return target != 0;
     }
     std::vector<StateEntry> topicEntries;
     bool topicReadable = true;
@@ -168,18 +160,11 @@ struct Fixture
         source.objects.emplace(77, enemy);
         source.objects[44].visible = false;
         source.objects.erase(55);  // Offline/missing group member.
-        source.marks[0] = 77;
     }
     QueryObservation Capture()
     {
         QueryObservation out;
         Check(adapter.CaptureQuery(ticket, source.guard, out), "capture filtered production query");
-        return out;
-    }
-    MarkObservation Marks(std::vector<uint8_t> icons = {0})
-    {
-        MarkObservation out;
-        Check(adapter.CaptureMarks(ticket, source.guard, icons, out), "capture filtered production marks");
         return out;
     }
 };
@@ -195,7 +180,9 @@ void QueryEncoding()
     Check(observed.units[0].role.empty() && !observed.units[0].visibleTargetGuid,
           "no AI role or selected-target provenance leak");
     ChannelPolicy policy;
-    Check(policy.Bind(f.world.Selected(), f.settings.token) && policy.ObserveScope(f.ticket.scope, f.now),
+    Check(policy.Bind(f.world.Selected(), f.settings.token) && policy.ObserveScope(f.ticket.scope, f.now) &&
+              policy.OpenGeneration(f.ticket.scope, f.ticket.request.requestId, f.ticket.request.deadline, f.now) ==
+                  ChannelError::None,
           "real query serializer policy binding");
     Json wire = {
         {"version", 1},           {"instance", "fixture"},      {"provider", "codex"}, {"epoch", "epoch-1"},
@@ -324,59 +311,6 @@ void Bounds()
     Check(!f.adapter.CaptureQuery(f.ticket, f.source.guard, query), "no group cannot invent group observations");
 }
 
-void MarkPublication()
-{
-    Fixture f;
-    auto observed = f.Marks();
-    Check(observed.marks.size() == 1 && observed.marks[0].targetGuid == 77 && observed.marks[0].icon == 0,
-          "visible non-group enemy mark is observable");
-    auto events = f.world.Reserve(f.ticket.scope, f.ticket.request.input, f.now, WorldLivenessMs);
-    Check(events.generation && events.request.requestId != f.ticket.request.requestId,
-          "events require distinct game-owned reservation");
-    uint64_t receipt = 0;
-    Check(f.adapter.Current(observed) && f.channel.RegisterEvents(events, f.source.guard, observed.marks, receipt) &&
-              receipt,
-          "production filtered marks enter actual bounded channel");
-    std::unique_ptr<ChannelPacket> packet;
-    Check(f.channel.Take("wrong", receipt, packet) == ChannelError::Unauthorized && !packet,
-          "receipt does not waive authentication");
-    Check(f.channel.Take(f.settings.token, receipt, packet) == ChannelError::None && packet,
-          "authenticated receipt handoff");
-    auto body = Json::parse(packet->body);
-    Check(body["requestId"] == events.request.requestId && body["type"] == "events" &&
-              body["events"][0] == Json({{"kind", "observed_mark"}, {"targetGuid", "77"}, {"icon", 0}}),
-          "actual event serializer exact typed payload and separate route");
-    Check(f.channel.Used() == 1, "async packet retains shared physical slot");
-    f.channel.Close(events);
-    f.world.Cancel(events);
-    f.channel.Retire();
-    Check(f.channel.Used() == 1 && !f.channel.Drained(), "retirement does not release returned payload");
-    packet.reset();
-    Check(f.channel.Drained(), "write disposal releases physical slot");
-
-    Fixture stale;
-    observed = stale.Marks();
-    stale.source.marks[0] = 22;
-    Check(!stale.adapter.Current(observed), "changed icon target fails last-moment provenance");
-    stale.source.marks[0] = 77;
-    stale.source.objects[77].visible = false;
-    Check(!stale.adapter.Current(observed), "hidden marked target fails last-moment provenance");
-    MarkObservation invalid;
-    Check(!stale.adapter.CaptureMarks(stale.ticket, stale.source.guard, {0}, invalid) && invalid.marks.empty(),
-          "hidden marks never enter batch");
-    Check(!stale.adapter.CaptureMarks(stale.ticket, stale.source.guard, {}, invalid), "empty marks rejected");
-    Check(!stale.adapter.CaptureMarks(stale.ticket, stale.source.guard, {8}, invalid), "invalid icon rejected");
-    Check(!stale.adapter.CaptureMarks(stale.ticket, stale.source.guard, {0, 0}, invalid), "duplicate icon rejected");
-    Check(!stale.adapter.CaptureMarks(stale.ticket, stale.source.guard, std::vector<uint8_t>(33, 0), invalid),
-          "more than32 marks rejected");
-    Fixture all;
-    for (uint8_t i = 0; i < 8; ++i)
-        all.source.marks[i] = 77;
-    Check(all.Marks({0, 1, 2, 3, 4, 5, 6, 7}).marks.size() == 8, "all supported icon values captured");
-    auto mark = all.Marks();
-    all.now.steadyMs += 5000;
-    Check(!all.adapter.Current(mark), "mark snapshot expires at5 seconds");
-}
 }  // namespace
 
 // J5f-b: a bot_state query on the real channel reads the route's own bot through the source, on the world update.
@@ -611,7 +545,6 @@ int main()
         QueryEncoding();
         Currentness();
         Bounds();
-        MarkPublication();
         TopicPublication();
         CataloguePublication();
         WatchArming();

@@ -19,14 +19,6 @@
 
 // ---- game doubles -------------------------------------------------------------------------------------------------
 float g_SayDistance = 17.5f;
-// The handler's self-mark re-baseline (DS.10), counted.
-unsigned ownMarkNotes = 0;
-uint64_t ownMarkBot = 0;
-void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid)
-{
-    ++ownMarkNotes;
-    ownMarkBot = botGuid;
-}
 
 struct ObjectGuid
 {
@@ -210,8 +202,6 @@ struct Env
         game = Counters{};
         PlayerbotBridge::pb = PlayerbotBridge::Doubles{};
         g_SayDistance = 17.5f;
-        ownMarkNotes = 0;
-        ownMarkBot = 0;
         botGroup.guid = controllerGroup.guid = kGroup;
         botGroup.leader = controllerGroup.leader = kController;
         bot.group = &botGroup;
@@ -404,8 +394,8 @@ void Gates()
     {
         Env env;
         env.phase.join.current = false;
-        Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Rejected && ownMarkNotes == 0,
-              "a mark refused before playerbots re-baselines nothing");
+        Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Rejected,
+              "a mark refused before playerbots is rejected");
     }
     for (int which = 0; which < 3; ++which)
     {
@@ -991,10 +981,6 @@ void ResultMapping()
             PlayerbotBridge::pb.result = pair.in;
             Check(env.Run(ValidCmd(verb.intent)) == pair.out && PlayerbotBridge::pb.executes == 1,
                   "playerbots result maps one to one; unknown is failed, never applied");
-            bool const mayHaveMarked = verb.intent == ChannelIntent::Mark &&
-                                       (pair.out == EffectResult::Applied || pair.out == EffectResult::Failed);
-            Check(ownMarkNotes == (mayHaveMarked ? 1u : 0u) && (!mayHaveMarked || ownMarkBot == kBot),
-                  "only a mark that applied or may have applied re-baselines the marking bot's own marks");
         }
 
     // DS.14: playerbots' reason for a refusal, in the bot's own words; no reason leaves the channel's cannot_now.
@@ -1114,7 +1100,6 @@ void SteppedOrders()
                           }),
               "every step carries the scope's bot, partner, captured group and radius");
         Check(pb.reaches == 0 && plans.Size() == 0, "no module pre-check of the spot; one-shot steps record no plan");
-        Check(ownMarkNotes == 1 && ownMarkBot == kBot, "a mark step that ran re-baselines the bot's own marks");
     }
     {
         Env env;
@@ -1184,8 +1169,8 @@ void SteppedOrders()
         PlayerbotBridge::pb.stepOutcomes = {{Result::Applied, Refusal::None}, {Result::Rejected, Refusal::None}};
         auto const cannot = DescribeRefusal(CommandRefusal::CannotNow);
         Check(RunSteps(env, Steps({go, mark})) == EffectResult::Rejected && env.ran.size() == 2 &&
-                  env.ran[1].reason == cannot.code && env.ran[1].reasonText == cannot.text && ownMarkNotes == 0,
-              "an unworded refusal reads cannot_now; a refused mark notes nothing");
+                  env.ran[1].reason == cannot.code && env.ran[1].reasonText == cannot.text,
+              "an unworded refusal reads cannot_now");
     }
     {
         Env env;
