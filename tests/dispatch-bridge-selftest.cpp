@@ -75,13 +75,8 @@ OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
 OllamaPersona::ProposalStatus OllamaChat_BridgeProposeCard(OllamaBridge::WorldTicket const&, uint64_t, uint64_t,
                                                            std::string);
 
-// Seams the bridge translation units name but this lifecycle check never reaches: the observer transport, the persona
-// store lifecycle (gate closed here) and the events route of the production channel glue.
-OllamaHttpResult OllamaHttp_PostObserver(OllamaBridge::Settings const&, OllamaObserverOperation, std::string const&,
-                                         int64_t)
-{
-    return {};
-}
+// Seams the bridge translation units name but this lifecycle check never reaches: the persona store lifecycle (gate
+// closed here) and the events route of the production channel glue.
 namespace OllamaPersona
 {
 void ForgetPersona(uint64_t) {}

@@ -1,5 +1,8 @@
 # Shared game channel policy and runtime integration (J5)
 
+The Codex adapter (observer routes, native listener) left the live paths with LCB0; parked in
+`retired/codex-observer/` (CS.20).
+
 `src/mod-ollama-chat_bridge_channel.{h,cpp}` is a production plain-value/state helper. It does not create a
 listener, acknowledge game activation, read game objects, queue work, execute commands or integrate native tools.
 The shared runtime installs bounded physical mailboxes, filtered query assembly and current-mark event production.

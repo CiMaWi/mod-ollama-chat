@@ -20,15 +20,6 @@
                 "src/mod-ollama-chat_bridge_world.cpp",
                 "src/mod-ollama-chat_bridge_query.cpp"
             ],
-            "extract": [
-                {
-                    "from": "src/mod-ollama-chat_httpclient.cpp",
-                    "start": "bool OllamaBridge::ValidObserverSettings(",
-                    "end": "bool OllamaBridge::LoadObserverToken(",
-                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
-                    "as": "observer-settings.cpp"
-                }
-            ],
             "success": "PASS \\d+ production channel dispatch checks"
         },
         {
@@ -58,15 +49,6 @@
                 "src/mod-ollama-chat_bridge_world.cpp",
                 "src/mod-ollama-chat_bridge_query.cpp"
             ],
-            "extract": [
-                {
-                    "from": "src/mod-ollama-chat_httpclient.cpp",
-                    "start": "bool OllamaBridge::ValidObserverSettings(",
-                    "end": "bool OllamaBridge::LoadObserverToken(",
-                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
-                    "as": "observer-settings.cpp"
-                }
-            ],
             "success": "PASS \\d+ typed command dispatch checks"
         },
         {
@@ -85,15 +67,6 @@
                 "src/mod-ollama-chat_bridge_world.cpp",
                 "src/mod-ollama-chat_bridge_query.cpp"
             ],
-            "extract": [
-                {
-                    "from": "src/mod-ollama-chat_httpclient.cpp",
-                    "start": "bool OllamaBridge::ValidObserverSettings(",
-                    "end": "bool OllamaBridge::LoadObserverToken(",
-                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
-                    "as": "observer-settings.cpp"
-                }
-            ],
             "success": "PASS \\d+ checks"
         },
         {
@@ -109,23 +82,10 @@
                 "src/mod-ollama-chat_bridge_world.cpp",
                 "src/mod-ollama-chat_bridge_query.cpp"
             ],
-            "extract": [
-                {
-                    "from": "src/mod-ollama-chat_httpclient.cpp",
-                    "start": "bool OllamaBridge::ValidObserverSettings(",
-                    "end": "bool OllamaBridge::LoadObserverToken(",
-                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
-                    "as": "observer-settings.cpp"
-                }
-            ],
             "flags": [
                 "ws2_32.lib"
             ],
             "success": "\\d+ checks passed"
-        },
-        {
-            "file": "bridge-observer-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
         },
         {
             "file": "bridge-plan-selftest.cpp",
@@ -150,15 +110,6 @@
                 "src/mod-ollama-chat_bridge_channel.cpp",
                 "src/mod-ollama-chat_bridge_world.cpp",
                 "src/mod-ollama-chat_bridge_query.cpp"
-            ],
-            "extract": [
-                {
-                    "from": "src/mod-ollama-chat_httpclient.cpp",
-                    "start": "bool OllamaBridge::ValidObserverSettings(",
-                    "end": "bool OllamaBridge::LoadObserverToken(",
-                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
-                    "as": "observer-settings.cpp"
-                }
             ],
             "success": "PASS \\d+ production filtered query/event helper checks"
         },
@@ -192,15 +143,6 @@
                 "src/mod-ollama-chat_bridge_channel.cpp",
                 "src/mod-ollama-chat_bridge_world.cpp",
                 "src/mod-ollama-chat_bridge_query.cpp"
-            ],
-            "extract": [
-                {
-                    "from": "src/mod-ollama-chat_httpclient.cpp",
-                    "start": "bool OllamaBridge::ValidObserverSettings(",
-                    "end": "bool OllamaBridge::LoadObserverToken(",
-                    "prefix": "#include <algorithm>\n#include \"mod-ollama-chat_bridge.h\"\n",
-                    "as": "observer-settings.cpp"
-                }
             ],
             "success": "PASS \\d+ production world-policy checks"
         },

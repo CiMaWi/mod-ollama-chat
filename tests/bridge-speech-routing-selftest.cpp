@@ -79,11 +79,6 @@ OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
     static Closed executor;
     return executor;
 }
-OllamaHttpResult OllamaHttp_PostObserver(OllamaBridge::Settings const&, OllamaObserverOperation, std::string const&,
-                                         int64_t)
-{
-    return {};
-}
 namespace OllamaPersona
 {
 void ForgetPersona(uint64_t) {}

@@ -16,8 +16,6 @@
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_persona_bridge.h"
 
-// Defined with the HTTP client; only the Codex observer path calls it, which these fixtures never select.
-bool OllamaBridge::ValidObserverSettings(Settings const&) { return false; }
 
 namespace
 {

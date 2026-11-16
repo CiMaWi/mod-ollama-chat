@@ -669,7 +669,7 @@ struct Source : QueryWorldSource
 struct RealFixture
 {
     Clock now = Now();
-    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", Token, false, "", ""};
+    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", Token};
     WorldPolicy world;
     Source source;
     WorldChannel channel{world, [this](WorldTicket const& ticket, DispatchGuard& guard)

@@ -581,13 +581,15 @@ void LoadOllamaChatConfig()
 
     g_OllamaBridgeSettings.instance = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Instance", "");
     g_OllamaBridgeSettings.provider = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Provider", "");
+    if (!g_OllamaBridgeSettings.provider.empty() && g_OllamaBridgeSettings.provider != "claude")
+    {
+        LOG_ERROR("module.ollamachat",
+                  "[Ollama Chat] OllamaChat.Bridge.Provider must be 'claude' or empty (got '{}'); treated as empty.",
+                  g_OllamaBridgeSettings.provider);
+        g_OllamaBridgeSettings.provider.clear();
+    }
     g_OllamaBridgeSettings.endpoint = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Endpoint", "");
     g_OllamaBridgeSettings.token = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Token", "");
-    g_OllamaBridgeSettings.observerEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ObserverEnabled", false);
-    g_OllamaBridgeSettings.observerTokenRef =
-        sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.ObserverTokenRef", "");
-    if (!OllamaBridge::LoadObserverToken(g_OllamaBridgeSettings) && g_OllamaBridgeSettings.observerEnabled)
-        LOG_ERROR("module.ollamachat", "[Ollama Chat] Invalid observer configuration; observation is disabled.");
     if (g_OllamaProvider == OllamaProvider::Bridge && !OllamaBridge::ValidSettings(g_OllamaBridgeSettings))
         LOG_ERROR("module.ollamachat", "[Ollama Chat] Invalid bridge configuration; generation is disabled.");
 

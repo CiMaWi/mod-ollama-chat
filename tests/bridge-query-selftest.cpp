@@ -125,7 +125,7 @@ struct Source : QueryWorldSource
 struct Fixture
 {
     Clock now{100000, 200000};
-    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-local-channel-token", false, "", ""};
+    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-local-channel-token"};
     WorldPolicy world;
     Source source;
     FilteredQueryAdapter adapter{world, source, [this] { return now; }};

@@ -93,10 +93,7 @@ namespace
     std::vector<std::thread> g_workers;
 
 // Policy and selection are world-thread only; worker counters/tags carry no game references.
-OllamaBridge::WorldObserver g_nativeObserver(OllamaHttp_PostObserver);
-OllamaBridge::WorldPolicy g_bridgeWorld(&g_nativeObserver);
-bool g_nativeSelected = false;  // World-thread cached selection, including fail-closed invalid settings.
-OllamaBridge::Settings g_nativeSettings;
+OllamaBridge::WorldPolicy g_bridgeWorld;
 OllamaBridgeObserver g_bridgeObserver = nullptr;
 bool g_channelEnabled = false;
 OllamaBridge::CommandStats g_loggedCommands;  // World-thread: the counters in the last watchlist line.
@@ -115,9 +112,7 @@ OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
                                            [](OllamaBridge::WorldTicket const& ticket,
                                               OllamaBridge::DispatchGuard& guard)
                                            {
-                                               return g_bridgeObserver && g_bridgeObserver(ticket, guard) &&
-                                                      (!g_nativeSelected ||
-                                                       g_nativeObserver.Current(ticket.scope, OllamaBridge::Now()));
+                                               return g_bridgeObserver && g_bridgeObserver(ticket, guard);
         },
         OllamaBridge::Now, &OllamaChat_BridgeQuerySource(), &OllamaChat_BridgeCommandExecutor());
     std::deque<OllamaBridge::EventPublication> g_eventPublications;  // WORLD ONLY, bounded by MaxPackets.
@@ -167,10 +162,7 @@ void RunBridgeTask(Task& task)
     completion.deliverAt = Clock::now();
     try
     {
-        auto const& settings = completion.request.bridgeSettings.bridge;
-        if (completion.request.bridgeGeneration != g_bridgeGeneration.load() ||
-            (settings.provider == "codex" && settings.observerEnabled &&
-             !g_nativeObserver.Current(completion.request.bridgeTicket.scope, OllamaBridge::Now())))
+        if (completion.request.bridgeGeneration != g_bridgeGeneration.load())
             return;
         auto api = QueryOllamaBridge(completion.request.bridgeSettings, completion.request.bridgeTicket.request);
         completion.bridgeOutcome = BridgeOutcome(api);
@@ -332,8 +324,6 @@ bool BridgeCurrent(Completion const& c)
         return false;
     auto const now = OllamaBridge::Now();
     return c.request.bridgeGeneration == g_bridgeGeneration.load() &&
-           (!(c.request.bridgeSettings.bridge.provider == "codex" && c.request.bridgeSettings.bridge.observerEnabled) ||
-            g_nativeObserver.Current(c.request.bridgeTicket.scope, now)) &&
            g_bridgeWorld.Current(c.request.bridgeTicket, now) &&
            OllamaBridge::DispatchGuardCurrent(c.request.bridgeTicket, c.request.bridgeGuard, current, now);
 }
@@ -712,18 +702,10 @@ bool PrepareBridge(Completion& c)
 
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
 
-bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const& guard, std::vector<uint8_t> const& icons)
+bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const& /*guard*/, std::vector<uint8_t> const& /*icons*/)
 {
-    // J6e-c: only the native (Codex observer) adapter takes event routes. The generic 127.0.0.1 port has no events
-    // endpoint, so an event route there held a packet slot until retirement (64 mark changes in an epoch refused every
-    // later query and command with capacity) and a world reservation of the binding's scope for nothing.
-    if (!g_nativeSelected || g_eventPublications.size() >= OllamaBridge::WorldChannel::MaxPackets)
-        return false;
-    OllamaBridge::EventPublication publication;
-    if (!g_bridgeChannel.ObserveEvents(guard, icons, publication))
-        return false;
-    g_eventPublications.push_back(std::move(publication));
-    return true;
+    // No event route since the Codex adapter left (CS.20); LCB1a deletes it.
+    return false;
 }
 
 bool OllamaDispatch_ChannelNextEvent(OllamaBridge::EventPublication& publication)
@@ -818,15 +800,6 @@ void OllamaDispatch_BridgeConfigured(bool channelEnabled)
     g_channelEnabled = channelEnabled;
     g_bridgeChannel.Configure(channelEnabled);
     OllamaEndpointSettings const settings = OllamaConfig_Snapshot();
-    g_nativeSelected = g_Enable && settings.provider == OllamaProvider::Bridge && settings.bridge.provider == "codex" &&
-                       settings.bridge.observerEnabled;
-    g_nativeSettings = g_nativeSelected ? settings.bridge : OllamaBridge::Settings{};
-    g_nativeObserver.Configured(g_nativeSelected, g_nativeSettings, OllamaBridge::Now());
-    if (g_nativeSelected)
-    {
-        g_nativeObserver.Start();
-        return;  // Tick waits for actual retired workers and authenticated open before creating an epoch.
-    }
     std::string epoch;
     if (g_Enable && settings.provider == OllamaProvider::Bridge && OllamaBridge::ValidSettings(settings.bridge))
     {
@@ -851,8 +824,6 @@ void OllamaDispatch_Start()
         return;
 
     g_running = true;
-    if (g_nativeSelected)
-        g_nativeObserver.Start();
     g_bridgeObserver = OllamaChat_BridgeObserve;
     OllamaChat_BridgeInstallAbilities();
 
@@ -878,9 +849,6 @@ void OllamaDispatch_Stop()
     OllamaChat_BridgeReset();
     OllamaBridge_SetActivation({});
     g_bridgeWorld.Shutdown();
-    g_nativeSelected = false;
-    g_nativeSettings = {};
-    g_nativeObserver.Stop();  // Terminal shutdown only, bounded observer HTTP; no tick/reload joins.
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
         if (!g_running)
@@ -975,7 +943,7 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
     auto settings = OllamaConfig_Snapshot();
     Identity const identity{settings.bridge.instance, settings.bridge.provider, settings.bridge.endpoint, scope.epoch};
     if (settings.provider != OllamaProvider::Bridge || settings.bridge.token != g_bridgeWorld.Snapshot().token ||
-        !(identity == g_bridgeWorld.Selected()) || (g_nativeSelected && !g_nativeObserver.Current(scope, Now())))
+        !(identity == g_bridgeWorld.Selected()))
         return false;
     auto slot = DispatchSlot::Acquire();
     if (!slot)
@@ -1089,45 +1057,6 @@ static void ActivateBridge()
     OllamaChat_BridgePlansOpen(g_bridgeWorld.Generation());
 }
 
-static void UpdateNativeObserver()
-{
-    using namespace OllamaBridge;
-    if (!g_nativeSelected)
-        return;
-    auto const now = Now();
-    g_nativeObserver.Poll(now);
-    auto state = g_nativeObserver.State();
-    if (state.epoch.empty() && !g_bridgeWorld.Selected().epoch.empty())
-        RetireBridgeWork();
-    // Count physical queued/completed slots as well as workers, never cancelled reservations, and wait for the
-    // restores of retired lasting plans (J12) instead of retiring again.
-    bool const drained = g_bridgeInFlight.load() == 0 && DispatchSlot::Used() == 0 && g_bridgeChannel.Drained() &&
-                         OllamaChat_BridgePlansEmpty();
-    if (state.enabled && state.epoch.empty())
-    {
-        if (state.incarnation.empty())
-            g_nativeObserver.Open(drained, now);  // Native open independently checks its own actual work drain.
-        else if (drained)
-        {
-            auto const bytes = Acore::Crypto::GetRandomBytes<16>();
-            char const hex[] = "0123456789abcdef";
-            std::string epoch = state.incarnation + ".";
-            for (auto byte : bytes)
-            {
-                epoch.push_back(hex[byte >> 4]);
-                epoch.push_back(hex[byte & 15]);
-            }
-            // Only this world-thread owner supplies entropy and selection after actual retirement.
-            g_bridgeWorld.Configured(true, g_nativeSettings, epoch);
-            if (g_bridgeWorld.ObserveDrain(drained, BridgeRetirementProof()) &&
-                g_nativeObserver.BindEpoch(std::move(epoch), drained, now))
-                ActivateBridge();
-            else
-                RetireBridgeWork();
-        }
-    }
-}
-
 namespace
 {
 // Smoke-test watchlist: typed command counters as fixed fields, after a change and at most once a minute.
@@ -1197,24 +1126,17 @@ static void ScanBridgeWatches()
 }
 
 // The bridge lifecycle part of the world tick, in order: restores of pending lasting plans first (J12), so a
-// retirement made by a reload or the previous call can be proven drained in this one; then native and generic
-// selection, which wait for an empty plan ledger. With the module disabled only the restores and expiry run: the
-// reload that disabled it retired every plan, and nothing else restores them.
+// retirement made by a reload or the previous call can be proven drained in this one; then the selection, which
+// waits for an empty plan ledger. With the module disabled only the restores and expiry run: the reload that
+// disabled it retired every plan, and nothing else restores them.
 static void UpdateBridgeLifecycle(OllamaBridge::EffectPhase const& phase)
 {
     OllamaChat_BridgePlansUpdate(phase);
     if (!g_Enable)
         return;
-    UpdateNativeObserver();
     g_bridgeWorld.Expire(OllamaBridge::Now());
     OllamaChat_BridgeRefresh();
-    if (g_nativeSelected)
-        g_nativeObserver.Publish(
-            g_bridgeWorld.Scopes(OllamaBridge::Now()),
-            g_bridgeInFlight.load() == 0 && OllamaBridge::DispatchSlot::Used() == 0 && g_bridgeChannel.Drained(),
-            OllamaBridge::Now());
-    if (!g_nativeSelected &&
-        g_bridgeWorld.ObserveDrain(
+    if (g_bridgeWorld.ObserveDrain(
             g_bridgeInFlight.load() == 0 && OllamaBridge::DispatchSlot::Used() == 0 && g_bridgeChannel.Drained(),
             BridgeRetirementProof()))
         ActivateBridge();

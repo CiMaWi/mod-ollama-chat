@@ -192,11 +192,6 @@ CommandExecutor& OllamaChat_BridgeCommandExecutor()
 
 namespace
 {
-bool g_nativeSelected = false;
-struct NativeObserver
-{
-    bool Current(WorldScope const&, Clock) const { return true; }
-} g_nativeObserver;
 auto g_bridgeObserver = ::OllamaChat_BridgeObserve;
 }  // namespace
 
@@ -211,7 +206,7 @@ namespace
 
 namespace
 {
-Settings const settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-token", false, "", ""};
+Settings const settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-token"};
 
 struct Fixture
 {
@@ -401,17 +396,12 @@ void Events()
     Check(!OllamaDispatch_ChannelNextEvent(publication) && g_bridgeChannel.Used() == used &&
               g_bridgeWorld.Pending() == reserved,
           "generic provider: 128 mark changes open no event route and hold no packet slot");
-    g_nativeSelected = true;  // The native (Codex observer) adapter's handoff, unchanged.
+    // The event route itself, opened on the channel: the dispatch handoff left with the Codex adapter (CS.20).
     party.marks[0] = 77;
-    OllamaChat_BridgeRefresh();
-    Check(OllamaDispatch_ChannelNextEvent(publication) && publication.receipt &&
-              publication.route != f.ticket.request.requestId,
-          "bounded existing refresh publishes distinct event route");
-    Check(!OllamaDispatch_ChannelNextEvent(publication), "handoff is once only");
-    // The false handoff clears its output. Publish another icon change to obtain a new receipt.
     party.marks[1] = 77;
-    OllamaChat_BridgeRefresh();
-    Check(OllamaDispatch_ChannelNextEvent(publication), "second mark observation");
+    Check(g_bridgeChannel.ObserveEvents(f.guard, {0, 1}, publication) && publication.receipt &&
+              publication.route != f.ticket.request.requestId,
+          "channel opens a distinct event route");
     auto packet = f.Take(publication.receipt);
     auto value = Json::parse(packet->body);
     Check(value["type"] == "events" && value["requestId"] == publication.route && value["events"].size() == 2,
@@ -466,7 +456,6 @@ void Events()
           "full shared capacity rejects event and cancels reservation");
     g_bridgeChannel.Retire();
     Check(g_bridgeChannel.Drained(), "retirement disposes all queued event payloads");
-    g_nativeSelected = false;
 }
 
 void Lifetimes()

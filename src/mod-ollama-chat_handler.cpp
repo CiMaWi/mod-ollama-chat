@@ -1898,24 +1898,6 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     // The one load request: a qualified current encounter (DS.12: any speaker and channel; the card is the bot's own
     // data). Captures elsewhere only read. A closed gate does no I/O.
     cards.Prepare(generation, view.guard.scope.botGuid, std::chrono::steady_clock::now());
-    auto const bridgeSettings = OllamaDispatch_BridgeWorld().Snapshot();
-    if (bridgeSettings.provider == "codex" && bridgeSettings.observerEnabled)
-    {
-        // Native permits one exact context per bot/controller/channel peer. Replace, never alias to newest.
-        for (auto prior = g_bridgeBindings.begin(); prior != g_bridgeBindings.end();)
-        {
-            auto const& scope = prior->view.guard.scope;
-            if (scope.botGuid == view.guard.scope.botGuid && scope.controllerGuid == view.guard.scope.controllerGuid &&
-                scope.channel == view.guard.scope.channel && scope.contextId != view.guard.scope.contextId)
-            {
-                auto const index = prior - g_bridgeBindings.begin();
-                BridgeErase(prior);
-                prior = g_bridgeBindings.begin() + index;
-            }
-            else
-                ++prior;
-        }
-    }
     auto it = std::find_if(g_bridgeBindings.begin(), g_bridgeBindings.end(),
                            [&](BridgeBinding const& item)
                            {
