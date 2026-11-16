@@ -438,6 +438,24 @@ void QueriesAndCapacity()
           "the open route's ids stay refused as duplicates");
     Check(pair.Receive(pair.Command("ca", "route-a")) == ChannelError::Unknown,
           "a closed route's command id never lands on that route");
+    // A dropped route's ids are answered nowhere: not under their own envelope and not under the open route's.
+    std::string none;
+    auto const envelopeOf = [&](std::string id)
+    {
+        return ChannelEnvelope{pair.scope.instance, pair.scope.provider, pair.scope.epoch, std::move(id),
+                               deadline.unixMs};
+    };
+    Check(pair.policy.FinishCommand(envelopeOf("route-a"), "ca", ChannelOutcome::Applied, pair.scope, now, none) ==
+                  ChannelError::Stale &&
+              pair.policy.FinishCommand(envelopeOf("route-b"), "ca", ChannelOutcome::Applied, pair.scope, now, none) ==
+                  ChannelError::Unknown &&
+              pair.policy.FinishQuery(envelopeOf("qa"), pair.scope, {}, now, none) == ChannelError::Stale &&
+              none.empty(),
+          "a closed route's command and query are answered on no route");
+    Check(pair.policy.FinishCommand(envelopeOf("route-b"), "cb", ChannelOutcome::Applied, pair.scope, now, none) ==
+                  ChannelError::None &&
+              Json::parse(none).at("requestId") == "route-b",
+          "the open route's command still reports once, on its own route");
     Fixture aging;
     aging.Open("old");
     Check(aging.policy.Receive(bearer, aging.Query("old-q").dump(), aging.scope, now, asked, "old") ==

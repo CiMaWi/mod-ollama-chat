@@ -5,7 +5,7 @@ The Codex adapter (observer routes, native listener) left the live paths with LC
 
 `src/mod-ollama-chat_bridge_channel.{h,cpp}` is a production plain-value/state helper. It does not create a
 listener, acknowledge game activation, read game objects, queue work, execute commands or integrate native tools.
-The shared runtime installs bounded physical mailboxes, filtered query assembly and current-mark event production.
+The shared runtime installs bounded physical mailboxes and filtered query assembly.
 J6 owns execution; J9C/X owns live proof. The transport is J5d's `src/mod-ollama-chat_bridge_listener.{h,cpp}`: a
 127.0.0.1 HTTP listener (`OllamaChat.Bridge.ChannelPort`) that authenticates the link token before reading a body,
 bounds bytes and hands each envelope to `Receive`/`Take` (wire: HUB `bridge/game/README.md`). J11C/X owns the tools.
@@ -131,26 +131,34 @@ activation/currentness guards before acceptance and publication; this in-process
 Generations must be registered by the game. Inbound queries may create a new request reservation only under a live
 generation route, against an already registered current scope and matching controller/bot. Queries share the
 request-id replay namespace but can never authorize commands. Commands need an open generation request and matching
-controller/bot/deadline. Only one terminal generation result or failure is accepted; commands must precede it. A command's result is terminal once and is
-reported only while its route is open: `WorldChannel` finishes every command in the tick that received it, and the
-route's terminal drops its ids (LC.35). `Current(..., requireOpen=true)` rejects closed
-requests. Duplicate/stale/malformed input yields no output message; output bodies clear before refused operations.
+controller/bot/deadline. Only one terminal generation result or failure is accepted; commands must precede it. A
+command's result is terminal once and is reported only while its route is open: `WorldChannel` finishes every
+command in the tick that received it, and the route's terminal drops its ids (LC.35). `Current(...,
+requireOpen=true)` rejects closed requests. Duplicate/stale/malformed input yields no output message; output bodies
+clear before refused operations.
 
 The ledger holds live routes only (LC.35). A generation route keeps its own id and the query and command ids opened
 under it, at most 64 of those per route, until its terminal (generation result or failure, received or local), its
 deadline (at most 120000 ms) or `WorldChannel::Close`; then all of them are dropped together. Within a live route a
 repeated id stays refused (duplicate, or closed for a finished query); once the route is gone every one of its ids,
 a command id included, finds no route and is refused as `unknown_request`, so a late replay can never land on the
-dropped route. Generation ids come from the world policy's counter and are never reissued in a process. Logical
-pending requests are limited to 64; limits can only be reduced in the constructor. Retiring clears maps because the
-old epoch is unusable. These limits DO NOT account physical receive/worker/completion payload slots:
+dropped route. A command or watch message names its route in its envelope and is admitted through that route only,
+so it cannot be replayed through another one; `FinishCommand`/`FinishWatch` answer an id only under the route that
+received it. What the ledger no longer refuses is a new message on another live route that reuses a dropped route's
+query or command id: it is a new request of that route (the hub bridge derives every id from its route's request
+id, so it never does this). Generation ids come from the world policy's counter and are never reissued in a
+process, and `WorldChannel::Register` refuses a ticket whose route is still bound; nothing else may open a route a
+second time, because a reopened route would not remember the command ids it consumed. Logical pending requests are
+limited to 64; limits can only be reduced in the constructor. Retiring clears maps because the old epoch is
+unusable. These limits DO NOT account physical receive/worker/completion payload slots:
 J5b must hold a bounded slot until actual disposal, independently of logical terminal/cancel/expiry and worker drain.
 Reservation expiry/invalidations run on explicit work/scope operations; do not install an all-reservations scan
 on every game tick. The helper has no autonomous timer or background thread.
 
 Offline proof compiles this exact production cpp with `tests/bridge-channel-selftest.cpp`. It covers authentication,
 strict decode, epoch retirement/reconnect, exact expiry/rollback, removed/revised/lapsed scope, terminal/replay state,
-typed command staging, bounded query shapes, route drop and capacity fail-closed. It is no full module/world/native proof.
+typed command staging, bounded query shapes, route drop and capacity fail-closed. It is no full module/world/native
+proof.
 
 
 ## J5c filtered observations and runtime integration

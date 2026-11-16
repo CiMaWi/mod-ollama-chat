@@ -265,6 +265,31 @@ void RouteCorrelation()
     }
 }
 
+// LC.35: the ledger forgets a route at its terminal, so nothing may open that route again while its binding lives: a
+// second Register of the bound ticket is refused before the policy sees it, and the route's command id stays refused.
+void BoundRouteStaysClosed()
+{
+    Fixture f;
+    auto id = f.Receive(f.Command("once"));
+    f.channel.Update();
+    auto reply = f.Take(id);
+    Check(reply->error == ChannelError::None && Json::parse(reply->body)["commandId"] == "once", "command staged once");
+    reply.reset();
+    auto failure = f.Wire("failure", f.ticket.request.requestId);
+    failure["code"] = "cancelled";
+    id = f.Receive(failure.dump());
+    f.channel.Update();
+    reply = f.Take(id);
+    Check(reply->error == ChannelError::Unknown, "the terminal drops the route; its binding stays until Close");
+    reply.reset();
+    Check(!f.channel.Register(f.ticket, f.guard), "a bound route registers once");
+    id = f.Receive(f.Command("once"));
+    f.channel.Update();
+    reply = f.Take(id);
+    Check(reply->error == ChannelError::Unknown && reply->body.empty(),
+          "a second Register cannot reopen the dropped route for a replayed command id");
+}
+
 // LC.35: a long-running server keeps answering: 5,000 generation routes with 3 queries each in one epoch, each closed
 // route leaving the world policy and the replay ledger.
 void LongRunRoutes()
@@ -368,6 +393,7 @@ int main()
         PhysicalAndIndependent();
         GuardsAndTerminal();
         RouteCorrelation();
+        BoundRouteStaysClosed();
         LongRunRoutes();
         ExpiryReloadAndDefaults();
         HeartbeatReplayLedger();

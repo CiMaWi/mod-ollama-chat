@@ -94,7 +94,10 @@ bool WorldChannel::Register(WorldTicket const& ticket, DispatchGuard const& guar
                       _policy.Drop(pair.first);
                       return true;
                   });
-    if (_bindings.size() >= MaxWorldPending || !_policy.ObserveScope(ticket.scope, now) ||
+    // A bound route registers once: the ledger forgets a route at its terminal (LC.35), so a second OpenGeneration
+    // would reopen it without the command ids it already consumed.
+    if (_bindings.contains(ticket.request.requestId) || _bindings.size() >= MaxWorldPending ||
+        !_policy.ObserveScope(ticket.scope, now) ||
         _policy.OpenGeneration(ticket.scope, ticket.request.requestId, ChannelDeadline(ticket.request.deadline, now),
                                now) != ChannelError::None)
         return false;
