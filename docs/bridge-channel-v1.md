@@ -66,7 +66,7 @@ already_there. A bot_state query names one topic; route, and only route, also na
 world thread hands to playerbots' topic reader as a value. The planner topics (plan, options, route, quest_plan, bags,
 places) share one entry shape: row, name, value and extra, and text when the game sends a sentence for the row.
 LCB1e: the row word is the game's (playerbots' `BotStateItem::word`, its words in `BridgeTexts.h`), forwarded as
-it comes: any word of 1..64 characters `[a-z_]` passes, an entry without one or with another word is dropped, and the
+it comes: any word of 1..64 characters `[a-z_]` passes, an entry without such a word is dropped, and the
 bridge decides what each word shows. A topic's result holds at most its catalogue row's limit of entries (the
 `limit` of the catalogue answer) within the 8 KB bound; the module keeps no word or limit table of its own.
 The record topics (LC7: history, lately, known) add text, one in-world sentence of 1..200 bytes
