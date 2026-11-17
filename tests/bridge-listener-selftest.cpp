@@ -507,8 +507,7 @@ void Deadlines(Harness& h)
     Check(standing.status == 400 &&
               standing.body ==
                   "{\"error\":\"invalid_input\",\"reason\":\"standing_not_supported\",\"reasonText\":"
-                  "\"I can follow or stay until you say otherwise, but I cannot take it as a standing "
-                  "order.\"}" &&
+                  "\"You can follow or stay until told otherwise, but not as a standing order.\"}" &&
               Json::parse(standing.body).size() == 3,
           "a standing shape answers invalid_input with its reason");
     quick(ChannelError::None, ChannelError::Stale, 410, "stale");  // Terminal Take error ends the wait.

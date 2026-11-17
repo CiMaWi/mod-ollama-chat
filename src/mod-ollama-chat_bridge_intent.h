@@ -268,23 +268,23 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
         case CommandRefusal::Unavailable:
             return {"unavailable", BridgeTexts::Refusals::UNAVAILABLE};
         case CommandRefusal::Dead:
-            return {"dead", "I am in no state to do anything right now."};
+            return {"dead", BridgeTexts::Refusals::DEAD};
         case CommandRefusal::Battleground:
-            return {"battleground", "Not here; I have my own fight to see to."};
+            return {"battleground", BridgeTexts::Refusals::BATTLEGROUND};
         case CommandRefusal::Travelling:
-            return {"travelling", "I cannot do that while I am in flight."};
+            return {"travelling", BridgeTexts::Refusals::TRAVELLING};
         case CommandRefusal::NotWithYou:
-            return {"not_with_you", "We are not travelling together."};
+            return {"not_with_you", BridgeTexts::Refusals::NOT_WITH_YOU};
         case CommandRefusal::TooFar:
-            return {"too_far", "You are too far away for me to reach."};
+            return {"too_far", BridgeTexts::Refusals::TOO_FAR};
         case CommandRefusal::NotInGroup:
-            return {"not_in_group", "We are not in the same group."};
+            return {"not_in_group", BridgeTexts::Refusals::NOT_IN_GROUP};
         case CommandRefusal::NoTarget:
-            return {"no_target", "I have no target to attack."};
+            return {"no_target", BridgeTexts::Refusals::NO_TARGET};
         case CommandRefusal::TargetNotVisible:
-            return {"target_not_visible", "I cannot see that target from here."};
+            return {"target_not_visible", BridgeTexts::Refusals::TARGET_NOT_VISIBLE};
         case CommandRefusal::Unreachable:
-            return {"unreachable", "I cannot get to that spot from here."};
+            return {"unreachable", BridgeTexts::Refusals::UNREACHABLE};
         case CommandRefusal::Busy:
             return {"busy", BridgeTexts::Refusals::BUSY};
         case CommandRefusal::NotFighting:
@@ -298,27 +298,27 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
         case CommandRefusal::PutOff:
             return {"put_off", BridgeTexts::Refusals::PUT_OFF};
         case CommandRefusal::CannotNow:
-            return {"cannot_now", "I cannot do that right now."};
+            return {"cannot_now", BridgeTexts::Refusals::CANNOT_NOW};
         case CommandRefusal::Failed:
             return {"failed", BridgeTexts::Refusals::FAILED};
         case CommandRefusal::NotPlanner:
-            return {"not_planner", "My own plans are not mine to change right now."};
+            return {"not_planner", BridgeTexts::Refusals::NOT_PLANNER};
         case CommandRefusal::GoalHeld:
-            return {"goal_held", "My group has a goal I am holding to."};
+            return {"goal_held", BridgeTexts::Refusals::GOAL_HELD};
         case CommandRefusal::UnknownPlace:
-            return {"unknown_place", "I do not know that place."};
+            return {"unknown_place", BridgeTexts::Refusals::UNKNOWN_PLACE};
         case CommandRefusal::NoRoute:
-            return {"no_route", "I cannot find a way there."};
+            return {"no_route", BridgeTexts::Refusals::NO_ROUTE};
         case CommandRefusal::NoSuchQuest:
-            return {"no_such_quest", "That quest is not in my log."};
+            return {"no_such_quest", BridgeTexts::Refusals::NO_SUCH_QUEST};
         case CommandRefusal::NothingHere:
-            return {"nothing_here", "There is nothing for me to do here."};
+            return {"nothing_here", BridgeTexts::Refusals::NOTHING_HERE};
         case CommandRefusal::AlreadyThere:
-            return {"already_there", "I am already there."};
+            return {"already_there", BridgeTexts::Refusals::ALREADY_THERE};
         case CommandRefusal::UnknownName:
-            return {"unknown_name", "I do not know what you mean by that."};
+            return {"unknown_name", BridgeTexts::Refusals::UNKNOWN_NAME};
     }
-    return {"cannot_now", "I cannot do that right now."};
+    return {"cannot_now", BridgeTexts::Refusals::CANNOT_NOW};
 }
 
 // DS.14: group play needs a group. Follow, formation and save_mana also need the partner in the bot's group; a mark

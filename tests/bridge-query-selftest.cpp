@@ -476,11 +476,11 @@ void WatchArming()
     f.source.watchFacts = {true, false, 0};
     result = watch(ticket, "watch-2", "combat_end", &phase);
     Check(result.at("outcome") == "rejected" && result.at("reason") == "not_fighting" &&
-              result.at("reasonText") == "I am not fighting anything right now.",
+              result.at("reasonText") == "You are not fighting anything.",
           "watch: combat_end outside a fight is not_fighting");
     result = watch(ticket, "watch-3", "activity_done", &phase);
     Check(result.at("outcome") == "rejected" && result.at("reason") == "not_busy" &&
-              result.at("reasonText") == "I am not busy with anything.",
+              result.at("reasonText") == "You are not busy with anything.",
           "watch: activity_done while idle is not_busy");
     Check(channel.Watches().Find(11) && channel.Watches().Find(11)->id == "watch-1",
           "watch: a refused watch leaves the bot's watch alone");

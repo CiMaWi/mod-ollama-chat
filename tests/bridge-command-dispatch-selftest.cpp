@@ -1071,7 +1071,7 @@ void SteppedDispatch()
     {
         Fixture f;
         f.probe.result = EffectResult::Rejected;
-        f.probe.stepResults = {ok, {ChannelOutcome::Rejected, "unknown_name", "I do not know what you mean by that."}};
+        f.probe.stepResults = {ok, {ChannelOutcome::Rejected, "unknown_name", "You know nothing by that name."}};
         Check(f.Result(f.Send(f.Steps("s3", three)), "s3") == "rejected" && f.reason == "unknown_name" &&
                   f.steps.size() == 3 && f.steps[1].at("reason") == "unknown_name" &&
                   f.steps[2] == Json{{"act", "mark"}, {"outcome", "skipped"}},

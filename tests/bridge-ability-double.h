@@ -22,9 +22,9 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
                                  "pause_plan", "resume_plan"};
     for (std::size_t value = 0; value < std::size(verbs); ++value)
         index.verbs.push_back({verbs[value], static_cast<ChannelIntent>(value)});
-    std::vector<AbilityRefusal> const common = {{"battleground", "Not here; I have my own fight to see to."},
-                                                {"travelling", "I cannot do that while I am in flight."},
-                                                {"dead", "I am in no state to do anything right now."}};
+    std::vector<AbilityRefusal> const common = {{"battleground", "You are in a battleground, where this cannot be done."},
+                                                {"travelling", "You are in flight; this cannot be done until you land."},
+                                                {"dead", "You are dead."}};
     auto const with = [&common](std::vector<AbilityRefusal> own)
     {
         own.insert(own.begin(), common.begin(), common.end());
@@ -35,8 +35,8 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
                           .name = "follow",
                           .sentence = "Follow the person you are talking to.",
                           .params = {},
-                          .refusals = with({{"not_with_you", "We are not travelling together."},
-                                            {"too_far", "You are too far away for me to reach."}}),
+                          .refusals = with({{"not_with_you", "The one who asked is not the one you follow."},
+                                            {"too_far", "The one who asked is too far away."}}),
                           .effect = "movement",
                           .done = "holds",
                           .state = "following you",
@@ -52,8 +52,8 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
                                       "The raid icon to put on it.",
                                       {"star", "circle", "diamond", "triangle", "moon", "square", "cross", "skull"},
                                       AbilityField::Icon}},
-                          .refusals = with({{"not_in_group", "We are not in the same group."},
-                                            {"unknown_name", "I do not know what you mean by that."}}),
+                          .refusals = with({{"not_in_group", "The one who asked is not in your group."},
+                                            {"unknown_name", "You know nothing by that name."}}),
                           .effect = "none",
                           .done = "at_once",
                           .state = "marking {target}",
@@ -64,7 +64,7 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
                           .name = "go_to",
                           .sentence = "Travel to a place you know.",
                           .params = {{"place", "place", "A known place's name.", {}, AbilityField::PlaceName}},
-                          .refusals = with({{"unknown_place", "I do not know that place."}}),
+                          .refusals = with({{"unknown_place", "You do not know that place."}}),
                           .effect = "none",
                           .done = "goal_ends",
                           .state = "travelling to {place}",

@@ -743,14 +743,14 @@ void Topics()
 
     // LC7: a record topic's entry carries its sentence in its own field, cut at its own cap; no sentence, no entry.
     entries = Topic(f, "history", StateTopic::History,
-                    {{"kill", "event", 3, 0, "You slew Hogger, an elite foe, in Elwynn Forest."},
+                    {{"kill", "event", 3, 0, "You slew Hogger, an elite creature, in Elwynn Forest."},
                      {"Westfall", "zone", 2, 0, "You have spent time in Westfall."},
                      {"kill", "deed", 1, 0, "A row word of another topic."},
                      {"quest", "event", 1, 0, ""},
                      {"level", "event", 1, 0, "Bad\nline"},
                      {"spell", "event", 0, 0, std::string(300, 's')}});
     Check(entries.size() == 3 && Keys(entries.at(0), {"row", "name", "text", "value", "extra"}) &&
-              entries.at(0).at("text") == "You slew Hogger, an elite foe, in Elwynn Forest." &&
+              entries.at(0).at("text") == "You slew Hogger, an elite creature, in Elwynn Forest." &&
               entries.at(0).at("name") == "kill" && entries.at(1).at("row") == "zone" &&
               entries.at(2).at("text") == std::string(ChannelMaxTopicText, 's'),
           "history rows: row, name, text, value, extra; a missing or bad sentence drops the entry, a long one is cut");
@@ -973,11 +973,11 @@ void Catalogue()
               "params":[{"name":"target","kind":"unit","sentence":"The unit to mark, by name.","choices":[]},
                         {"name":"icon","kind":"choice","sentence":"The raid icon to put on it.",
                          "choices":["star","circle","diamond","triangle","moon","square","cross","skull"]}],
-              "refusals":[{"word":"battleground","sentence":"Not here; I have my own fight to see to."},
-                          {"word":"travelling","sentence":"I cannot do that while I am in flight."},
-                          {"word":"dead","sentence":"I am in no state to do anything right now."},
-                          {"word":"not_in_group","sentence":"We are not in the same group."},
-                          {"word":"unknown_name","sentence":"I do not know what you mean by that."}],
+              "refusals":[{"word":"battleground","sentence":"You are in a battleground, where this cannot be done."},
+                          {"word":"travelling","sentence":"You are in flight; this cannot be done until you land."},
+                          {"word":"dead","sentence":"You are dead."},
+                          {"word":"not_in_group","sentence":"The one who asked is not in your group."},
+                          {"word":"unknown_name","sentence":"You know nothing by that name."}],
               "effect":"none","done":"at_once","state":"marking {target}","event":"BridgeAct","limit":0})"),
           "an act row, field for field");
     Check(catalogue.at("rows").at(10) == Json::parse(R"({"kind":"topic","name":"route","sentence":"Your route.",
@@ -1094,11 +1094,11 @@ void Watches()
         char const* code;
         char const* text;
     };
-    Words const words[] = {{CommandRefusal::NotFighting, "not_fighting", "I am not fighting anything right now."},
-                           {CommandRefusal::NotBusy, "not_busy", "I am not busy with anything."},
-                           {CommandRefusal::WaitTooShort, "wait_too_short", "That is hardly worth waiting for."},
-                           {CommandRefusal::WaitTooLong, "wait_too_long", "I cannot wait that long."},
-                           {CommandRefusal::PutOff, "put_off", "I have put this off long enough already."},
+    Words const words[] = {{CommandRefusal::NotFighting, "not_fighting", "You are not fighting anything."},
+                           {CommandRefusal::NotBusy, "not_busy", "You are not busy with anything."},
+                           {CommandRefusal::WaitTooShort, "wait_too_short", "That wait is too short to be worth it."},
+                           {CommandRefusal::WaitTooLong, "wait_too_long", "That wait is too long."},
+                           {CommandRefusal::PutOff, "put_off", "You have already put this off as long as you can."},
                            {CommandRefusal::CannotNow, "cannot_now", nullptr}};
     for (auto const& w : words)
     {
@@ -1326,7 +1326,7 @@ void SteppedResults()
 {
     Check(SetAbilityIndex(TestStepAbilityIndex()) > 0, "the stepped double installs");
     ChannelStepResult const ok{ChannelOutcome::Applied, "", ""};
-    ChannelStepResult const place{ChannelOutcome::Rejected, "unknown_place", "I do not know that place."};
+    ChannelStepResult const place{ChannelOutcome::Rejected, "unknown_place", "You do not know that place."};
     Json const three = Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
                                     Step("go_to", {{"place", "Goldshire"}}), Step("stay")});
     auto const old = Finish(Json(), ChannelOutcome::Applied, {}, CommandRefusal::None);
@@ -1342,10 +1342,10 @@ void SteppedResults()
     auto const second = Finish(three, ChannelOutcome::Rejected, {ok, place}, CommandRefusal::CannotNow);
     Check(second.error == ChannelError::None && second.json.at("outcome") == "rejected" &&
               second.json.at("reason") == "unknown_place" &&
-              second.json.at("reasonText") == "I do not know that place." &&
+              second.json.at("reasonText") == "You do not know that place." &&
               second.json.at("steps") == Json::parse(R"([{"act":"mark","outcome":"applied"},
                   {"act":"go_to","outcome":"rejected","reason":"unknown_place",
-                   "reasonText":"I do not know that place."},{"act":"stay","outcome":"skipped"}])"),
+                   "reasonText":"You do not know that place."},{"act":"stay","outcome":"skipped"}])"),
           "a refused step ends the order with its words; the steps after it are skipped");
     auto const failedWords = DescribeRefusal(CommandRefusal::Failed);
     auto const failed = Finish(three, ChannelOutcome::Failed, {{ChannelOutcome::Failed, "", ""}}, CommandRefusal::None);
