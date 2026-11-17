@@ -12,6 +12,7 @@
             "file": "bridge-channel-dispatch-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "sources": [
@@ -26,6 +27,7 @@
             "file": "bridge-channel-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "sources": [
@@ -41,6 +43,7 @@
             "file": "bridge-command-dispatch-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "sources": [
@@ -59,6 +62,7 @@
             "file": "bridge-intent-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "sources": [
@@ -73,6 +77,7 @@
             "file": "bridge-listener-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "sources": [
@@ -91,6 +96,7 @@
             "file": "bridge-plan-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "success": "PASS \\d+ checks"
@@ -103,6 +109,7 @@
             "file": "bridge-query-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "sources": [
@@ -125,6 +132,7 @@
             "file": "bridge-watch-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "success": "PASS \\d+ watch table checks"
@@ -133,6 +141,7 @@
             "file": "bridge-world-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "flags": [
@@ -154,6 +163,7 @@
             "file": "lab-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "success": "lab selftest: \\d+ checks passed"
@@ -170,6 +180,7 @@
             "file": "persona-card-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps",
                 "{core}/deps/utf8cpp"
             ],
@@ -182,6 +193,7 @@
             "file": "persona-store-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps",
                 "{core}/deps/utf8cpp"
             ],
@@ -195,6 +207,7 @@
             "file": "reply-split-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps"
             ],
             "success": "\\d+ reply split checks passed"
@@ -203,6 +216,7 @@
             "file": "trait-words-selftest.cpp",
             "includes": [
                 "src",
+                "../mod-playerbots/src/Bot",
                 "deps",
                 "{playerbots}/src/Ai/World/Rpg"
             ],
