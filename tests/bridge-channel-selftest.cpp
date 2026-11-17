@@ -556,6 +556,15 @@ bool Keys(Json const& entry, std::set<std::string> const& keys)
     return found == keys;
 }
 
+// LCB1e: a topic's limit is its installed catalogue row's.
+std::size_t RowLimit(StateTopic topic)
+{
+    for (auto const& row : Abilities().rows)
+        if (row.topic && row.code == static_cast<uint8_t>(topic))
+            return row.limit;
+    return 0;
+}
+
 void Topics()
 {
     Fixture f;
@@ -626,31 +635,32 @@ void Topics()
               entries.at(19).at("where") == "bag" && entries.at(1).at("count") == 1000,
           "inventory values bounded and named");
 
-    // Quests: 25 entries, done never above needed.
+    // Quests: the row's limit of entries, done never above needed.
     std::vector<StateEntry> quests{{"Odd status", "abandoned", 1, 2}};
-    for (int i = 0; i < 30; ++i)
+    for (int i = 0; i < 50; ++i)
         quests.push_back({"Quest " + std::to_string(i),
                           i % 3 == 0   ? "complete"
                           : i % 3 == 1 ? "failed"
                                        : "active",
                           i == 0 ? 99 : -4, i == 0 ? 8 : 20000});
     entries = Topic(f, "quests", StateTopic::Quests, quests);
-    Check(entries.size() == 25 && Keys(entries.at(0), {"title", "status", "done", "needed"}),
-          "quests at most 25 with fixed keys");
+    Check(entries.size() == RowLimit(StateTopic::Quests) && entries.size() == 40 &&
+              Keys(entries.at(0), {"title", "status", "done", "needed"}),
+          "quests at most the row's limit with fixed keys");
     Check(entries.at(0).at("title") == "Quest 0" && entries.at(0).at("done") == 8 && entries.at(0).at("needed") == 8 &&
               entries.at(0).at("status") == "complete" && entries.at(1).at("status") == "failed" &&
               entries.at(2).at("status") == "active" && entries.at(1).at("done") == 0 &&
               entries.at(1).at("needed") == 10000,
           "quest progress bounded");
 
-    // Cooldowns: 20 entries, only positive seconds, capped at a week.
+    // Cooldowns: the row's limit of entries, only positive seconds, capped at a week.
     std::vector<StateEntry> cooldowns{{"Ready", "", 0, 0}};
-    for (int i = 0; i < 30; ++i)
-        cooldowns.push_back({"Spell " + std::to_string(i), "", i == 0 ? 100000000 : 30 - i, 0});
+    for (int i = 0; i < 50; ++i)
+        cooldowns.push_back({"Spell " + std::to_string(i), "", i == 0 ? 100000000 : 60 - i, 0});
     entries = Topic(f, "cooldowns", StateTopic::Cooldowns, cooldowns);
-    Check(entries.size() == 20 && Keys(entries.at(0), {"name", "seconds"}) && entries.at(0).at("name") == "Spell 0" &&
+    Check(entries.size() == RowLimit(StateTopic::Cooldowns) && entries.size() == 40 && Keys(entries.at(0), {"name", "seconds"}) && entries.at(0).at("name") == "Spell 0" &&
               entries.at(0).at("seconds") == 604800,
-          "cooldowns at most 20, ready spells dropped, seconds capped");
+          "cooldowns at most the row's limit, ready spells dropped, seconds capped");
 
     // Strategies: whitelist, kinds, repeats dropped.
     entries = Topic(f, "strategies", StateTopic::Strategies,
@@ -674,30 +684,6 @@ void Topics()
               entries.at(1).at("rank") == 0 && entries.at(2).at("rank") == 3,
           "spells at most 40, rank bounded");
 
-    // WT18b: the planner's topics share one row shape; the row word comes from StateTopicRow, other rows dropped.
-    struct RowWords
-    {
-        StateTopic topic;
-        std::vector<std::string> words;
-    };
-    RowWords const tables[] = {{StateTopic::Plan, {"goal", "source", "reason", "stop"}},
-                               {StateTopic::Options, {"option", "current"}},
-                               {StateTopic::Route, {"total", "leg", "failed"}},
-                               {StateTopic::QuestPlan, {"take", "task", "turn_in", "carried", "deferred"}},
-                               {StateTopic::Bags, {"free", "sell", "bag"}},
-                               {StateTopic::Places, {"hearth", "flight_here", "flight_elsewhere"}},
-                               {StateTopic::History, {"event", "zone", "dungeon", "boss"}},
-                               {StateTopic::Lately, {"deed"}},
-                               {StateTopic::Known, {"bot"}}};
-    for (auto const& table : tables)
-        for (std::size_t code = 0; code < 8; ++code)
-            Check(std::string(StateTopicRow(table.topic, static_cast<uint8_t>(code))) ==
-                      (code < table.words.size() ? table.words[code] : std::string()),
-                  "each planner row code has its word, an unknown code none");
-    for (std::size_t t = 0; t <= static_cast<std::size_t>(StateTopic::Spells); ++t)
-        Check(!*StateTopicRow(static_cast<StateTopic>(t), 0) && !*StateTopicRow(static_cast<StateTopic>(t), 1),
-              "older topics have no row words");
-    Check(!*StateTopicRow(static_cast<StateTopic>(StateTopicCount), 0), "an unknown topic has no row words");
     Check(std::string(StateTopicName(StateTopic::Plan)) == "plan" &&
               std::string(StateTopicName(StateTopic::Options)) == "options" &&
               std::string(StateTopicName(StateTopic::Route)) == "route" &&
@@ -705,16 +691,10 @@ void Topics()
               std::string(StateTopicName(StateTopic::Bags)) == "bags" &&
               std::string(StateTopicName(StateTopic::Places)) == "places",
           "planner topic names");
-    Check(StateTopicLimit(StateTopic::Plan) == 8 && StateTopicLimit(StateTopic::Options) == 5 &&
-              StateTopicLimit(StateTopic::Route) == 12 && StateTopicLimit(StateTopic::QuestPlan) == 12 &&
-              StateTopicLimit(StateTopic::Bags) == 6 && StateTopicLimit(StateTopic::Places) == 24,
-          "planner topic limits as playerbots keeps them");
     Check(std::string(StateTopicName(StateTopic::History)) == "history" &&
               std::string(StateTopicName(StateTopic::Lately)) == "lately" &&
-              std::string(StateTopicName(StateTopic::Known)) == "known" &&
-              StateTopicLimit(StateTopic::History) == 24 && StateTopicLimit(StateTopic::Lately) == 12 &&
-              StateTopicLimit(StateTopic::Known) == 12,
-          "LC7: record topic names and limits as playerbots keeps them");
+              std::string(StateTopicName(StateTopic::Known)) == "known",
+          "LC7: record topic names");
     entries = Topic(f, "plan", StateTopic::Plan,
                     {{"rpg_travel", "goal", 120, 600},
                      {"planner", "source", -5, 5000000000LL},
@@ -722,38 +702,58 @@ void Topics()
                      {"Kobold Camp Cleanup", "stop", 3, 250},
                      {"bogus", "option", 1, 1},
                      {"none", "", 0, 0},
-                     {"", "goal", 1, 1}});
-    Check(entries.size() == 4 && Keys(entries.at(0), {"row", "name", "value", "extra"}) &&
+                     {"", "goal", 1, 1},
+                     {"spaced", "Not a word", 1, 1},
+                     {"long", std::string(65, 'w'), 1, 1},
+                     {"bad sentence", "goal", 2, 2, "Bad\nline"}});
+    Check(entries.size() == 6 && Keys(entries.at(0), {"row", "name", "value", "extra"}) &&
               entries.at(0).at("row") == "goal" && entries.at(0).at("name") == "rpg_travel" &&
               entries.at(0).at("value") == 120 && entries.at(0).at("extra") == 600 &&
               entries.at(1).at("row") == "source" && entries.at(1).at("value") == 0 &&
               entries.at(1).at("extra") == 4294967295LL && entries.at(2).at("name") == "near quests" &&
-              entries.at(3).at("row") == "stop" && entries.at(3).at("name") == "Kobold Camp Cleanup",
-          "plan rows: row word, name, value and extra bounded; another topic's row word and an empty name dropped");
-    for (auto const& table : tables)
+              entries.at(3).at("row") == "stop" && entries.at(3).at("name") == "Kobold Camp Cleanup" &&
+              entries.at(4).at("row") == "option" && entries.at(5).at("name") == "bad sentence" &&
+              Keys(entries.at(5), {"row", "name", "value", "extra"}),
+          "plan rows: the game's row word whichever it is, name, value and extra bounded; no word, a word not of "
+          "[a-z_] 1..64 and an empty name dropped; a bad sentence left out");
+    // LCB1e: the rows past bags' old three (the mail, the kept items) reach the wire, each with the game's sentence.
+    entries = Topic(f, "bags", StateTopic::Bags,
+                    {{"free", "free", 6, 16},
+                     {"Linen Cloth", "sell", 3, 40},
+                     {"mail", "mail_waiting", 1, 0, "Mail waits at the mailbox."},
+                     {"Copper Ore", "kept_bank", 2, 0, "Copper Ore, kept in the bank."}});
+    Check(entries.size() == 4 && !entries.at(0).contains("text") && entries.at(2).at("row") == "mail_waiting" &&
+              entries.at(2).at("text") == "Mail waits at the mailbox." &&
+              Keys(entries.at(2), {"row", "name", "text", "value", "extra"}) &&
+              entries.at(3).at("row") == "kept_bank" && entries.at(3).at("text") == "Copper Ore, kept in the bank.",
+          "bags: the mail and kept rows pass with their sentences; a row without one has none");
+    for (StateTopic const topic : {StateTopic::Plan, StateTopic::Options, StateTopic::Route, StateTopic::QuestPlan,
+                                   StateTopic::Bags, StateTopic::Places, StateTopic::History, StateTopic::Lately,
+                                   StateTopic::Known})
     {
         std::vector<StateEntry> rows;
         for (int i = 0; i < 30; ++i)
-            rows.push_back({"word " + std::to_string(i), table.words.at(i % table.words.size()), i, i, "Words."});
-        auto const limited = Topic(f, std::string("limit-") + StateTopicName(table.topic), table.topic, rows);
-        Check(limited.size() == StateTopicLimit(table.topic) &&
-                  limited.at(1).at("row") == table.words.at(1 % table.words.size()),
-              "a planner topic keeps its row words and stops at its limit");
+            rows.push_back({"word " + std::to_string(i), i % 2 ? "row_odd" : "row_even", i, i, "Words."});
+        auto const limited = Topic(f, std::string("limit-") + StateTopicName(topic), topic, rows);
+        Check(limited.size() == RowLimit(topic) && limited.size() > 1 && limited.at(1).at("row") == "row_odd" &&
+                  limited.at(1).at("text") == "Words.",
+              "a planner or record topic keeps the game's row words and sentences and stops at its row's limit");
     }
 
     // LC7: a record topic's entry carries its sentence in its own field, cut at its own cap; no sentence, no entry.
     entries = Topic(f, "history", StateTopic::History,
                     {{"kill", "event", 3, 0, "You slew Hogger, an elite creature, in Elwynn Forest."},
                      {"Westfall", "zone", 2, 0, "You have spent time in Westfall."},
-                     {"kill", "deed", 1, 0, "A row word of another topic."},
+                     {"kill", "deed", 1, 0, "A row word the module does not know."},
                      {"quest", "event", 1, 0, ""},
                      {"level", "event", 1, 0, "Bad\nline"},
                      {"spell", "event", 0, 0, std::string(300, 's')}});
-    Check(entries.size() == 3 && Keys(entries.at(0), {"row", "name", "text", "value", "extra"}) &&
+    Check(entries.size() == 4 && Keys(entries.at(0), {"row", "name", "text", "value", "extra"}) &&
               entries.at(0).at("text") == "You slew Hogger, an elite creature, in Elwynn Forest." &&
               entries.at(0).at("name") == "kill" && entries.at(1).at("row") == "zone" &&
-              entries.at(2).at("text") == std::string(ChannelMaxTopicText, 's'),
-          "history rows: row, name, text, value, extra; a missing or bad sentence drops the entry, a long one is cut");
+              entries.at(2).at("row") == "deed" && entries.at(3).at("text") == std::string(ChannelMaxTopicText, 's'),
+          "history rows: row (any word the game sends), name, text, value, extra; a missing or bad sentence drops the "
+          "entry, a long one is cut");
     entries = Topic(f, "known", StateTopic::Known,
                     {{"Aldric", "bot", 0, 2, "Aldric, a human paladin, fought beside you."}, {"Brug", "bot", 1, 1, ""}});
     Check(entries.size() == 1 && entries.at(0).at("name") == "Aldric" && entries.at(0).at("extra") == 2,
@@ -783,11 +783,11 @@ void Topics()
                              topic == StateTopic::Inventory    ? "equipped"
                              : topic == StateTopic::Quests     ? "complete"
                              : topic == StateTopic::Strategies ? "non_combat"
-                                                               : StateTopicRow(topic, 0),
+                                                               : "row_word",
                              topic == StateTopic::Inventory ? 5 : 604800, 10000,
                              std::string(ChannelMaxTopicText, 'w')});
         auto const result = Topic(f, "worst-" + std::to_string(t), topic, worst);
-        Check(result.size() == (topic == StateTopic::Strategies ? 0 : StateTopicLimit(topic)), "worst case count");
+        Check(result.size() == (topic == StateTopic::Strategies ? 0 : RowLimit(topic)), "worst case count");
     }
 
     // Terminal once, unknown topic value refused, wrong work refused.
@@ -1521,11 +1521,8 @@ void OpenRows()
           "an open act's step is named by its row and refused in playerbots' words");
 
     // A topic past the fourteen: its argument under the row's parameter name, its entries in the lines form.
-    Check(StateTopicLimit(static_cast<StateTopic>(TestOpenTopic)) == 6 &&
-              std::string(StateTopicRow(static_cast<StateTopic>(TestOpenTopic), 3)) == "deeds_of" &&
-              !*StateTopicRow(static_cast<StateTopic>(TestOpenTopic + 1), 0) &&
-              !StateTopicLimit(static_cast<StateTopic>(TestOpenTopic + 1)),
-          "an open topic's limit is its row's, its row word its own; a topic the index lacks has neither");
+    Check(RowLimit(static_cast<StateTopic>(TestOpenTopic)) == 6 && !RowLimit(static_cast<StateTopic>(TestOpenTopic + 1)),
+          "an open topic's limit is its row's; a topic the index lacks has none");
     {
         Fixture f;
         f.Open();
@@ -1559,7 +1556,7 @@ void OpenRows()
               "the open topic and its argument");
         std::string const longText(ChannelMaxTopicText + 40, 't');
         std::vector<StateEntry> entries = {
-            {"Hogger", StateTopicRow(query.topic, 0), 3, 4, "Hogger slew a wolf."},
+            {"Hogger", "deeds_of", 3, 4, "Hogger slew a wolf."},
             {"Hogger", "deed", -5, 5000000000LL, longText},
             {"Hogger", "Bad Word", 1, 1, "Dropped."},
             {"Hogger", "deed", 1, 1, ""},

@@ -104,12 +104,8 @@ enum class StateTopic : uint8_t
 // TopicRow past Known, its BotStateTopic value) is answered in the lines form; handler.cpp pins these fourteen values.
 constexpr std::size_t StateTopicCount = 14;
 
+// The installed catalogue's word for a topic. LCB1e: a result carries at most its catalogue row's limit of entries.
 char const* StateTopicName(StateTopic topic);
-// Most entries a topic result carries; an open topic's is its row's limit (0 for a topic the index lacks).
-std::size_t StateTopicLimit(StateTopic topic);
-// WT18b: the row word of a planner or record topic's raw code ("" for an unknown code or an older topic). LC16c:
-// playerbots gives an open topic's entries no row word, so each reads as the topic's own word.
-char const* StateTopicRow(StateTopic topic, uint8_t code);
 
 // LC3: the ability catalogue as plain data, mod-playerbots' one table of acts and topics (PlayerbotBridge::Catalogue)
 // with its hash. The game adapter installs it once on the world thread before the channel takes requests; a selftest
@@ -197,10 +193,11 @@ bool CatalogueInstalled();  // Whether a catalogue query has an answer.
 //   cooldowns:  name, first = seconds left
 //   strategies: name (whitelisted), kind "combat"/"non_combat"
 //   spells:     name, first = rank (0 = none)
-//   plan, options, route, quest_plan, bags, places (WT18b): kind = the row word (StateTopicRow), name (words, or a
-//               quest title or bind area), first = value, second = extra (0..4294967295 each)
+//   plan, options, route, quest_plan, bags, places (WT18b): kind = the game's row word (LCB1e: any wire word, the
+//               bridge decides what it shows), name (words, or a quest title or bind area), first = value, second =
+//               extra (0..4294967295 each), text = the game's sentence when it sends one
 //   history, lately, known (LC7): the planner shape and text = one sentence (1..ChannelMaxTopicText bytes)
-//   any other topic of the index (LC16c): history's shape, kind = any wire word (StateTopicRow gives the topic's)
+//   any other topic of the index (LC16c): history's shape, kind = the game's row word
 struct StateEntry
 {
     std::string name;

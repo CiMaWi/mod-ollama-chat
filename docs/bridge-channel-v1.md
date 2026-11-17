@@ -64,7 +64,11 @@ bot's planner a goal through playerbots' plausibility gate; they need no group, 
 plan, no restore) and are refused with not_planner, goal_held, unknown_place, no_route, no_such_quest, nothing_here or
 already_there. A bot_state query names one topic; route, and only route, also names its place (WT18b), which the
 world thread hands to playerbots' topic reader as a value. The planner topics (plan, options, route, quest_plan, bags,
-places) share one entry shape: row (a fixed word per topic, from `StateTopicRow`), name, value and extra.
+places) share one entry shape: row, name, value and extra, and text when the game sends a sentence for the row.
+LCB1e: the row word is the game's (playerbots' `BotStateItem::word`, its words in `BridgeTexts.h`), forwarded as
+it comes: any word of 1..64 characters `[a-z_]` passes, an entry without one or with another word is dropped, and the
+bridge decides what each word shows. A topic's result holds at most its catalogue row's limit of entries (the
+`limit` of the catalogue answer) within the 8 KB bound; the module keeps no word or limit table of its own.
 The record topics (LC7: history, lately, known) add text, one in-world sentence of 1..200 bytes
 (`ChannelMaxTopicText`, cut on a character boundary); an entry without one is dropped.
 Retirement selects no new epoch until every retired plan is restored or dropped.

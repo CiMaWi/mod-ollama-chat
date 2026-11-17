@@ -415,18 +415,6 @@ std::string TopicText(std::string const& text, std::size_t max)
     return Text(result, max) ? result : std::string();
 }
 
-// WT18b: a planner topic's row word, as StateTopicRow names it.
-bool PlannerRow(StateTopic topic, std::string const& kind)
-{
-    for (uint8_t code = 0; code < 8; ++code)
-    {
-        std::string const word = StateTopicRow(topic, code);
-        if (!word.empty() && word == kind)
-            return true;
-    }
-    return false;
-}
-
 // Gameplay strategies the bot can talk about; every other playerbots strategy name is dropped.
 bool StrategyAllowed(std::string const& name)
 {
@@ -562,19 +550,25 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
         case StateTopic::QuestPlan:
         case StateTopic::Bags:
         case StateTopic::Places:
-            if (!PlannerRow(topic, entry.kind))
+        {
+            // LCB1e: the game's row word, whichever it is, and its sentence when it sends one.
+            if (!Word(entry.kind))
                 return false;
             value = {{"row", entry.kind},
                      {"name", name},
                      {"value", std::clamp<int64_t>(entry.first, 0, UINT32_MAX)},
                      {"extra", std::clamp<int64_t>(entry.second, 0, UINT32_MAX)}};
+            auto text = TopicText(entry.text, ChannelMaxTopicText);
+            if (!text.empty())
+                value["text"] = std::move(text);
             return true;
+        }
         case StateTopic::History:  // LC7: the planner shape and the entry's sentence in its own field.
         case StateTopic::Lately:
         case StateTopic::Known:
         {
             auto const text = TopicText(entry.text, ChannelMaxTopicText);
-            if (!PlannerRow(topic, entry.kind) || text.empty())
+            if (!Word(entry.kind) || text.empty())
                 return false;
             value = {{"row", entry.kind},
                      {"name", name},
@@ -715,85 +709,6 @@ char const* StateTopicName(StateTopic topic)
 {
     auto const* row = TopicRowOf(topic);
     return row ? row->name.c_str() : "";
-}
-
-char const* StateTopicRow(StateTopic topic, uint8_t code)
-{
-    static constexpr char const* plan[] = {"goal", "source", "reason", "stop"};
-    static constexpr char const* options[] = {"option", "current"};
-    static constexpr char const* route[] = {"total", "leg", "failed"};
-    static constexpr char const* questPlan[] = {"take", "task", "turn_in", "carried", "deferred"};
-    static constexpr char const* bags[] = {"free", "sell", "bag"};
-    static constexpr char const* places[] = {"hearth", "flight_here", "flight_elsewhere"};
-    static constexpr char const* history[] = {"event", "zone", "dungeon", "boss"};
-    static constexpr char const* lately[] = {"deed"};
-    static constexpr char const* known[] = {"bot"};
-    auto const pick = [code](auto const& words) -> char const* { return code < std::size(words) ? words[code] : ""; };
-    switch (topic)
-    {
-        case StateTopic::Plan:
-            return pick(plan);
-        case StateTopic::Options:
-            return pick(options);
-        case StateTopic::Route:
-            return pick(route);
-        case StateTopic::QuestPlan:
-            return pick(questPlan);
-        case StateTopic::Bags:
-            return pick(bags);
-        case StateTopic::Places:
-            return pick(places);
-        case StateTopic::History:
-            return pick(history);
-        case StateTopic::Lately:
-            return pick(lately);
-        case StateTopic::Known:
-            return pick(known);
-        case StateTopic::Inventory:
-        case StateTopic::Quests:
-        case StateTopic::Cooldowns:
-        case StateTopic::Strategies:
-        case StateTopic::Spells:
-            break;
-    }
-    return static_cast<std::size_t>(topic) >= StateTopicCount ? StateTopicName(topic) : "";
-}
-
-std::size_t StateTopicLimit(StateTopic topic)
-{
-    switch (topic)
-    {
-        case StateTopic::Inventory:
-            return 40;
-        case StateTopic::Quests:
-            return 25;
-        case StateTopic::Cooldowns:
-            return 20;
-        case StateTopic::Strategies:
-            return 40;
-        case StateTopic::Spells:
-            return 40;
-        case StateTopic::Plan:  // WT18b: the limits playerbots' topic readers keep.
-            return 8;
-        case StateTopic::Options:
-            return 5;
-        case StateTopic::Route:
-            return 12;
-        case StateTopic::QuestPlan:
-            return 12;
-        case StateTopic::Bags:
-            return 6;
-        case StateTopic::Places:
-            return 24;
-        case StateTopic::History:  // LC7: the limits playerbots' record readers keep.
-            return 24;
-        case StateTopic::Lately:
-            return 12;
-        case StateTopic::Known:
-            return 12;
-    }
-    auto const* row = TopicRowOf(topic);  // LC16c: an open topic's own limit.
-    return row ? row->limit : 0;
 }
 
 char const* ChannelErrorName(ChannelError error)
@@ -1225,19 +1140,21 @@ ChannelError ChannelPolicy::FinishTopic(ChannelEnvelope const& envelope, WorldSc
                                         std::vector<StateEntry> const& entries, Clock now, std::string& body)
 {
     body.clear();
-    if (!TopicRowOf(topic))
+    AbilityRow const* const row = TopicRowOf(topic);
+    if (!row)
         return ChannelError::Invalid;  // LC16c: a topic the installed index lists, any of its values.
     if (!Current(envelope, current, now) || _requests.at(envelope.requestId).work != ChannelWork::Query)
         return ChannelError::Stale;
     try
     {
-        // Entries in the game's order, unusable and repeated ones dropped, cut at the topic's count and byte bounds.
+        // Entries in the game's order, unusable and repeated ones dropped, cut at the catalogue row's limit (LCB1e) and
+        // the byte bound.
         Json list = Json::array();
         std::set<std::string> seen;
         std::size_t bytes = 2;  // The enclosing brackets.
         for (auto const& entry : entries)
         {
-            if (list.size() >= StateTopicLimit(topic))
+            if (list.size() >= row->limit)
                 break;
             Json value;
             if (!TopicEntry(topic, entry, value))

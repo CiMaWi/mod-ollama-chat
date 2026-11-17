@@ -91,14 +91,6 @@ public:
     }
 
 private:
-    // The same conservative participant-observable unit check as handler.cpp's BridgeVisibleUnit.
-    static bool VisibleUnit(Player* observer, Unit* unit, float distance)
-    {
-        return observer && observer->IsInWorld() && unit && unit->IsInWorld() && distance > 0.0f &&
-               observer->IsInMap(unit) && observer->InSamePhase(unit) && observer->IsWithinDistInMap(unit, distance) &&
-               observer->CanSeeOrDetect(unit, false, true);
-    }
-
     static uint64_t GroupGuid(Player* player)
     {
         Group* group = player->GetGroup();
@@ -199,7 +191,6 @@ private:
             return EffectResult::Rejected;
         }
 
-        float const distance = g_SayDistance;  // The whisper/party radius BridgeCapture uses.
         IntentContext facts;
         facts.controllerGuid = ticket.scope.controllerGuid;
         facts.botGuid = ticket.scope.botGuid;
@@ -218,7 +209,6 @@ private:
             probe.Operation = PlayerbotBridge::Intent::Position;
             probe.Bot = ticket.scope.botGuid;
             probe.Controller = ticket.scope.controllerGuid;
-            probe.VisibilityDistance = distance;
             probe.MapId = candidate->mapId;
             probe.X = candidate->x;
             probe.Y = candidate->y;
@@ -228,9 +218,9 @@ private:
         }
         if (uint64_t const candidate = EffectTargetGuid(command, facts.ownTargetGuid))
         {
-            Unit* unit = ObjectAccessor::GetUnit(*bot, ObjectGuid(candidate));
-            // DS.14: the bot acts on its own perception; the partner need not see the target.
-            if (VisibleUnit(bot, unit, distance))
+            // DS.14: the bot acts on its own perception; the partner need not see the target. LCB1e: what the bot
+            // perceives is the game's one rule (playerbots checks it when the act runs), so any unit it resolves counts.
+            if (ObjectAccessor::GetUnit(*bot, ObjectGuid(candidate)))
                 facts.eligibleVisibleTargetGuid = candidate;
         }
         auto const effect = BuildEffectOrder(command, facts, &why);
@@ -308,7 +298,6 @@ private:
         order.Group = effect->groupGuid;
         order.Target = effect->targetGuid;
         order.Icon = effect->icon;
-        order.VisibilityDistance = distance;
         order.MapId = effect->position.mapId;
         order.X = effect->position.x;
         order.Y = effect->position.y;
@@ -428,7 +417,6 @@ private:
             order.Bot = ticket.scope.botGuid;
             order.Controller = ticket.scope.controllerGuid;
             order.Group = guard.groupGuid;
-            order.VisibilityDistance = g_SayDistance;  // The whisper/party radius BridgeCapture uses.
             order.Target = step.targetGuid;
             order.TargetName = step.targetName;
             order.QuestId = step.questId;
