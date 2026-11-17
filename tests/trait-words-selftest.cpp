@@ -73,7 +73,7 @@ void CheckFormatters()
     Check(FormatCardTraits(words) == "careful, devout, bookish", "three words without adverbs");
     Check(FormatCardTraits({"a loner", "fiercely loyal"}) == "loner, loyal", "article and adverb stripped");
     Check(FormatCardTraits({"careful"}) == "careful", "one word");
-    Check(FormatCardTraits({"stiffly formal", "an old campaigner"}) == "formal, old campaigner",
+    Check(FormatCardTraits({"deeply devout", "an old campaigner"}) == "devout, old campaigner",
           "adverbs and articles stripped");
     Check(FormatCardTraits({}).empty(), "empty card words");
     std::string const longWord(30, 'x');
