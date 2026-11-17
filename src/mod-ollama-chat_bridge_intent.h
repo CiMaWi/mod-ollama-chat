@@ -8,6 +8,8 @@
 #include <variant>
 #include <vector>
 
+#include "BridgeTexts.h"
+
 namespace OllamaBridge
 {
 enum class ChannelIntent : uint8_t
@@ -258,14 +260,13 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
         case CommandRefusal::None:
             return {"", ""};
         case CommandRefusal::NotSupported:
-            return {"not_supported", "That is not something I can do on command yet."};
+            return {"not_supported", BridgeTexts::Refusals::NOT_SUPPORTED};
         case CommandRefusal::StandingNotSupported:
-            return {"standing_not_supported",
-                    "I can follow or stay until you say otherwise, but I cannot take it as a standing order."};
+            return {"standing_not_supported", BridgeTexts::Refusals::STANDING_NOT_SUPPORTED};
         case CommandRefusal::TooSoon:
-            return {"too_soon", "I just took an order; give me a moment."};
+            return {"too_soon", BridgeTexts::Refusals::TOO_SOON};
         case CommandRefusal::Unavailable:
-            return {"unavailable", "I cannot take orders right now."};
+            return {"unavailable", BridgeTexts::Refusals::UNAVAILABLE};
         case CommandRefusal::Dead:
             return {"dead", "I am in no state to do anything right now."};
         case CommandRefusal::Battleground:
@@ -285,21 +286,21 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
         case CommandRefusal::Unreachable:
             return {"unreachable", "I cannot get to that spot from here."};
         case CommandRefusal::Busy:
-            return {"busy", "I am still finishing an earlier order; ask me again shortly."};
+            return {"busy", BridgeTexts::Refusals::BUSY};
         case CommandRefusal::NotFighting:
-            return {"not_fighting", "I am not fighting anything right now."};
+            return {"not_fighting", BridgeTexts::Refusals::NOT_FIGHTING};
         case CommandRefusal::NotBusy:
-            return {"not_busy", "I am not busy with anything."};
+            return {"not_busy", BridgeTexts::Refusals::NOT_BUSY};
         case CommandRefusal::WaitTooShort:
-            return {"wait_too_short", "That is hardly worth waiting for."};
+            return {"wait_too_short", BridgeTexts::Refusals::WAIT_TOO_SHORT};
         case CommandRefusal::WaitTooLong:
-            return {"wait_too_long", "I cannot wait that long."};
+            return {"wait_too_long", BridgeTexts::Refusals::WAIT_TOO_LONG};
         case CommandRefusal::PutOff:
-            return {"put_off", "I have put this off long enough already."};
+            return {"put_off", BridgeTexts::Refusals::PUT_OFF};
         case CommandRefusal::CannotNow:
             return {"cannot_now", "I cannot do that right now."};
         case CommandRefusal::Failed:
-            return {"failed", "I tried, but it did not work."};
+            return {"failed", BridgeTexts::Refusals::FAILED};
         case CommandRefusal::NotPlanner:
             return {"not_planner", "My own plans are not mine to change right now."};
         case CommandRefusal::GoalHeld:
