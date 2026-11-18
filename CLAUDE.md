@@ -3,6 +3,9 @@
 Guidance for working in this module. The repo-level `CLAUDE.md` at the
 AzerothCore root still applies; this adds module-specific rules.
 
+This fork no longer follows upstream (DustinHendrickson): since LC.42 the bridge is
+the only generation path and upstream is reference only.
+
 ## The one rule that matters most
 
 **Worker threads do HTTP and string work only. Every read or write of a
@@ -19,14 +22,15 @@ scan from it. That is what `mod-ollama-chat_dispatch.{h,cpp}` exists to prevent.
 
 How to add a new kind of bot utterance:
 
-1. Build the prompt **on the world thread**, where the `Player*` is live.
-2. Fill an `OllamaChatRequest` — resolve every value you need (names, guids,
-   scope key) into it now, so the worker never has to touch a `Player`.
-3. `OllamaDispatch_Submit(std::move(request))`.
+1. Decide it **on the world thread**, where the `Player*` is live.
+2. Fill an `OllamaChatRequest` and the bridge context -- resolve every value you
+   need (names, guids, scope key, facts) into them now, so the worker never has
+   to touch a `Player`.
+3. `OllamaDispatch_SubmitBridge(...)` (as `BridgeSubmit` in the handler does).
 4. Delivery happens for you in `OllamaDispatch_Update()`, on the world thread.
 
-Do **not** call `QueryOllama()` directly from anywhere that could be the world
-thread — it blocks for a full LLM round trip.
+Do **not** call `QueryOllamaBridge()` from anywhere that could be the world
+thread -- it blocks for a full bridge round trip.
 
 `EventProcessor::AddEvent` (`bot->m_Events`) is **not** a way around this. It
 mutates a container that `Player::Update` walks, so calling it off-thread is the
@@ -34,9 +38,8 @@ same race it looks like it avoids.
 
 ## The second rule: workers never read config strings directly
 
-A worker thread must not touch `g_OllamaUrl`, `g_OllamaModel`,
-`g_OllamaSystemPrompt`, `g_OllamaStop`, `g_OllamaSeed`, `g_OllamaApiKey`,
-`g_SentimentAnalysisPrompt` or any other `std::string` global.
+A worker thread must not touch `g_OllamaBridgeSettings` or any other
+`std::string` global.
 
 `.ollama reload` reassigns those on the world thread. Reassigning a
 `std::string` frees the old buffer, and a worker copying it at that moment
@@ -46,24 +49,13 @@ pointed at the HTTP client rather than at the actual cause.
 
 The pattern to follow:
 
-- endpoint settings go through `OllamaConfig_Snapshot()`, published under a
-  mutex by `OllamaConfig_Publish()` at the end of `LoadOllamaChatConfig()`
-- anything else a worker needs is formatted on the world thread at submit time
-  and carried in the task (see `BuildSentimentPrompt`,
-  `Memory_BuildCondensationPrompt`)
+- bridge settings go through `OllamaConfig_Snapshot()`, published under a
+  mutex by `OllamaConfig_Publish()` in `LoadOllamaChatConfig()`
+- anything else a worker needs is resolved on the world thread at submit time
+  and carried in the task
 
 POD globals (`bool`, `uint32_t`, `float`) are a benign racy read and are fine
 to touch directly.
-
-## Provider support lives in one file
-
-`OllamaChat.Provider` (`ollama` / `openai` / `anthropic`) only changes how a
-request is encoded and decoded inside `mod-ollama-chat_api.cpp`: one builder,
-one parser and one header function per provider, selected on
-`OllamaEndpointSettings::provider`. Nothing outside that file should branch on
-the provider except the capability probe, which is skipped for non-Ollama
-providers because a live probe there is a billed request. Add a provider by
-adding a builder/parser pair and an enum value; do not teach callers about it.
 
 ## Channels are resolved by id, never by name
 
@@ -102,8 +94,7 @@ repetition history.
 ## Performance traps specific to this module
 
 - Never walk `Map::GetCreatureBySpawnIdStore()` — it is every spawn on the map.
-  Use `Cell::VisitObjects` with a searcher, as `topics.cpp` and `handler.cpp`
-  now do.
+  Use `Cell::VisitObjects` with a searcher, as `handler.cpp` does.
 - `Acore::AnyUnitInObjectRangeCheck` filters out anything not alive. Where dead
   creatures matter (corpse topics), use the local `NearbyCreatureCheck` structs.
 - Watch for nested `ObjectAccessor::GetPlayers()` loops; that is quadratic in
@@ -111,19 +102,12 @@ repetition history.
 
 ## Prompt content
 
-Whatever is most concrete and quotable in the prompt is what the model will
-talk about. Historically the module pasted every off-cooldown spell a bot knew
-into the prompt, which is exactly why bots kept talking about their spellbook.
-`OllamaChat.Snapshot.IncludeSpells` defaults to `0` for this reason.
-
-`{bot_personality}` comes from the bot's trait words and interests (mod-playerbots `ReadBotPersonality`, formatted by
-`mod-ollama-chat_trait_words.h`, words only, never numbers), then from the RP personality prompt when the bot has no
-traits. The bridge card's `traits` fact is the three strongest words. Both are independent of `EnableRPPersonalities`;
-the RP code stays, switched off.
-
-When adding prompt material, prefer things outside the bot — people nearby,
-what just happened, where they are — over facts about the bot itself. The
-weights in `OllamaChat.Topic.*` encode this deliberately.
+The bridge builds the prompt; the module sends facts. Whatever is most concrete
+and quotable in them is what the model will talk about, so prefer things outside
+the bot -- people nearby, what just happened, where they are -- over facts about
+the bot itself. The bridge card's `traits` fact is the bot's three strongest
+trait words (mod-playerbots `ReadBotPersonality`, formatted by
+`mod-ollama-chat_trait_words.h`, words only, never numbers).
 
 ## Conventions
 
