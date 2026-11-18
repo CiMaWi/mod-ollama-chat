@@ -91,7 +91,8 @@ depth is capped (`OllamaChat.MaxQueueDepth`).
 The direct path's tables (`mod_ollama_chat_personality`, `mod_ollama_chat_personality_templates`,
 `mod_ollama_chat_history`, `mod_ollama_chat_bot_player_sentiments`, `mod_ollama_chat_memories`,
 `mod_ollama_chat_relationships`) keep their SQL files and rows, but nothing reads or writes them any more.
-`mod_ollama_chat_voice` (roleplay voices) and the persona card tables are in use.
+`mod_ollama_chat_voice` (roleplay voices) is still read at startup. The persona card table is dropped by
+`data/sql/characters/updates/2026_11_18_drop_persona_cards.sql`.
 
 ## License
 

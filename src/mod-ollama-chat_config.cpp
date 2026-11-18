@@ -5,7 +5,6 @@
 #include "mod-ollama-chat_api.h"
 #include "mod-ollama-chat_bridge_listener.h"
 #include "mod-ollama-chat_dispatch.h"
-#include "mod-ollama-chat_persona_db.h"
 #include "mod-ollama-chat_roleplay.h"
 
 // --------------------------------------------
@@ -218,9 +217,6 @@ void LoadOllamaChatConfig()
     // g_OllamaBridgeSettings directly -- reassigning it here would free the
     // buffers under a worker mid-request.
     OllamaConfig_Publish();
-    bool const personaCardsEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.PersonaCardsEnabled", false);
-    OllamaPersona::DiscardStagedPersonaWrites();
-    OllamaPersona::WorldStore().Configure(g_Enable && personaCardsEnabled);
     // Explicit world-thread load/reload notification also retires work when the module is disabled.
     // In that state the world tick still restores the retired lasting plans and does nothing else.
     bool const channelEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ChannelEnabled", false);
@@ -247,16 +243,12 @@ OllamaChatConfigWorldScript::OllamaChatConfigWorldScript() : WorldScript("Ollama
 void OllamaChatConfigWorldScript::OnStartup()
 {
     LoadOllamaChatConfig();
-    OllamaPersona::StartPersonaDb();
     Roleplay_Load();
 }
-
-void OllamaChatConfigWorldScript::OnUpdate(uint32 /*diff*/) { OllamaPersona::PumpPersonaDb(); }
 
 void OllamaChatConfigWorldScript::OnShutdown()
 {
     // Stop accepting work and join the workers before anything they touch goes
     // away. Detached threads had no such guarantee.
     OllamaDispatch_Stop();
-    OllamaPersona::StopPersonaDb();
 }
