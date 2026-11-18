@@ -223,7 +223,7 @@ unsigned ocRequests = 0;    // Lines the ProcessChat bridge gate lets through to
 Completion* nested = nullptr;
 void DeliverBridgeAgain(Completion const& c);
 
-// handler.cpp ProcessChat: `!g_Enable || !BridgeHuman(player) || chainDepth || channel || source not in the four`.
+// handler.cpp ProcessChat: `!g_Enable || !BridgeHuman(player) || channel || source not in the four`.
 bool OcBridgeGate(Player* sender, int source, bool channel)
 {
     return sender && OllamaIsRealPlayer(sender) && !channel &&

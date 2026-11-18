@@ -449,9 +449,6 @@ bool Submit(bool addressed = true, std::string memory = {}, int64_t lifetimeMs =
     request.source = SRC_PARTY_LOCAL;
     request.directAddress = addressed;
     request.scopeKey = "party-99";
-    request.recordHistory = request.updateSentiment = request.triggerBotReplies = true;
-    request.prompt = "FORBIDDEN LEGACY PROMPT";
-    request.originMessage = "FORBIDDEN LEGACY HISTORY";
     OllamaBridge::Context input;
     input.speakerGuid = 33;
     input.channel = "party";
@@ -534,15 +531,6 @@ void AdmissionTests()
     g_bridgeObserver = nullptr;
     Check(!Submit() && !apiCalls && !OllamaBridge::DispatchSlot::Used(), "unbound fails closed");
     g_bridgeObserver = Observe;
-    OllamaChatRequest legacy;
-    legacy.botGuid = 11;
-    legacy.prompt = "legacy";
-    Check(!OllamaDispatch_Submit(legacy), "prompt-only Bridge rejected");
-    config.provider = OllamaProvider::Ollama;
-    Check(OllamaDispatch_Submit(legacy), "legacy admission preserved");
-    g_queue.clear();
-    legacy.bridgeGeneration = 123;
-    Check(!OllamaDispatch_Submit(legacy), "forged bridge tag rejected");
     Check(!Submit(true, std::string(8193, 'x')), "actual builder rejects oversize context");
     Check(Submit(), "bound request admitted");
     auto const original = config;
@@ -553,9 +541,6 @@ void AdmissionTests()
               observedSettings.systemPrompt == original.systemPrompt,
           "worker uses immutable full snapshot");
     Check(!cleanupCalls && !filterCalls, "worker skips world cleanup/filter");
-    Check(done.request.prompt.empty() && done.request.originMessage.empty() && !done.request.recordHistory &&
-              !done.request.updateSentiment && !done.request.triggerBotReplies,
-          "legacy context and effects excluded");
     g_bridgeWorld.Configured(true, config.bridge, "epoch-2");
     g_bridgeGeneration = 0;
     Check(!PrepareBridge(done) && !cleanupCalls && !routeCalls, "token reload rejects before cleanup");

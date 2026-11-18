@@ -47,15 +47,6 @@ void ApplySentimentAnalysis(uint64_t botGuid, uint64_t playerGuid,
 std::string BuildSentimentPrompt(const std::string& message);
 
 /**
- * Queue a sentiment update for a player's message to a bot.
- *
- * Non-blocking: hands the work to the dispatcher. The old version called
- * AnalyzeMessageSentiment() inline, which would stall whichever thread it ran
- * on for a full LLM round trip.
- */
-void UpdateBotPlayerSentiment(Player* bot, Player* player, const std::string& message);
-
-/**
  * Get sentiment prompt addition for including in bot responses
  * @param bot The bot
  * @param player The player they're responding to

@@ -12,7 +12,6 @@
 #include "mod-ollama-chat_lab.h"
 #include "Log.h"
 #include "DatabaseEnv.h"
-#include <thread>
 #include "Chat.h"
 #include "Config.h"
 #include "ObjectAccessor.h"
@@ -55,7 +54,6 @@ ChatCommandTable OllamaChatConfigCommand::GetCommands() const
     {
         { "reload",      HandleOllamaReloadCommand,  SEC_ADMINISTRATOR, Console::Yes },
         { "status",      HandleOllamaStatusCommand,  SEC_ADMINISTRATOR, Console::Yes },
-        { "test",        HandleOllamaTestCommand,    SEC_ADMINISTRATOR, Console::Yes },
         { "sentiment",   ollamaSentimentCommandTable },
         { "personality", ollamaPersonalityCommandTable },
         { "lab",         ollamaLabCommandTable }
@@ -540,49 +538,5 @@ bool OllamaChatConfigCommand::HandleOllamaStatusCommand(ChatHandler* handler)
     else
         handler->PSendSysMessage("Last error: none");
 
-    return true;
-}
-
-bool OllamaChatConfigCommand::HandleOllamaTestCommand(ChatHandler* handler, Acore::ChatCommands::Tail prompt)
-{
-    std::string text(prompt);
-    if (text.empty())
-    {
-        handler->SendSysMessage("Usage: .ollama test <prompt>");
-        handler->SetSentErrorMessage(true);
-        return false;
-    }
-
-    handler->PSendSysMessage("[Ollama Chat] Sending test prompt, please wait...");
-
-    // Blocking HTTP must not run on the world thread, so do the round trip on
-    // a scratch thread and report from there. Turns "the bots are quiet" into
-    // a one-command diagnosis: you see the raw output and the cleaned output
-    // side by side.
-    std::thread([text]()
-    {
-        OllamaApiResult api = QueryOllama(text, OllamaRequestKind::ChatReply);
-
-        if (!api.ok)
-        {
-            LOG_INFO("module.ollamachat", "[Ollama Chat] TEST FAILED after {}ms: {}",
-                     api.latencyMs, api.error.empty() ? "unknown error" : api.error);
-            return;
-        }
-
-        uint32_t emote = 0;
-        const std::string cleaned = ProcessLlmResponse(api.text, "Tester", &emote, g_MaxReplyLength);
-
-        LOG_INFO("module.ollamachat", "[Ollama Chat] TEST ok in {}ms (think={}).",
-                 api.latencyMs, api.thinkUsed ? "yes" : "no");
-        LOG_INFO("module.ollamachat", "[Ollama Chat] TEST raw     : {}", api.text);
-        LOG_INFO("module.ollamachat", "[Ollama Chat] TEST cleaned : {}", cleaned);
-        if (emote)
-            LOG_INFO("module.ollamachat", "[Ollama Chat] TEST emote   : {}", emote);
-        if (!api.thinking.empty())
-            LOG_INFO("module.ollamachat", "[Ollama Chat] TEST thinking: {}", api.thinking);
-    }).detach();
-
-    handler->PSendSysMessage("[Ollama Chat] Result will appear in the server log (module.ollamachat).");
     return true;
 }

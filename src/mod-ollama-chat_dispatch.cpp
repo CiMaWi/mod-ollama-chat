@@ -4,12 +4,10 @@
 #include "mod-ollama-chat_config.h"
 #include "mod-ollama-chat_expression.h"
 #include "mod-ollama-chat_governor.h"
-#include "mod-ollama-chat_memory.h"
 #include "mod-ollama-chat_persona_bridge.h"
 #include "mod-ollama-chat_reply_split.h"
 #include "mod-ollama-chat_response.h"
 #include "mod-ollama-chat_roleplay.h"
-#include "mod-ollama-chat_sentiment.h"
 #include "mod-ollama-chat-utilities.h"
 #include "mod-ollama-chat_world.h"
 
@@ -46,25 +44,10 @@ namespace
 {
     using Clock = std::chrono::steady_clock;
 
-    enum class TaskType : uint8_t { ChatReply, Sentiment, Condense, Relationship };
-
     struct Task
     {
         OllamaBridge::DispatchSlot bridgeSlot;
-        TaskType type = TaskType::ChatReply;
         OllamaChatRequest request;
-
-        // Sentiment-only payload.
-        uint64_t    sentimentBotGuid    = 0;
-        uint64_t    sentimentPlayerGuid = 0;
-        std::string sentimentMessage;
-        std::string sentimentPrompt;
-
-        // Memory / relationship payload.
-        uint64_t    memoryBotGuid   = 0;
-        uint64_t    memoryOtherGuid = 0;
-        std::string memoryOtherName;
-        std::string memoryPrompt;
     };
 
     struct Completion
@@ -178,80 +161,6 @@ void RunBridgeTask(Task& task)
         g_done.push_back(std::move(completion));
 }
 
-    void RunChatTask(Task& task)
-    {
-        if (task.request.bridgeGeneration)
-        {
-            RunBridgeTask(task);
-            return;
-        }
-        OllamaApiResult api = QueryOllama(task.request.prompt, task.request.kind);
-
-        if (!api.ok)
-        {
-            RecordError(api.error);
-            return;
-        }
-
-        uint32_t emoteId = 0;
-        std::string text = ProcessLlmResponse(api.text, task.request.botName, &emoteId, g_MaxReplyLength);
-
-        // Roleplay mode rejects lines carrying out-of-world vocabulary rather
-        // than mangling the sentence around the offending word.
-        if (!text.empty())
-        {
-            std::string filtered = Roleplay_FilterMetaTerms(text);
-            if (filtered.empty() && !text.empty() && g_DebugEnabled)
-            {
-                LOG_INFO("module.ollamachat",
-                         "[Ollama Chat] Bot {} reply rejected by roleplay filter: '{}'",
-                         task.request.botName, text);
-            }
-            text = std::move(filtered);
-        }
-
-        if (text.empty())
-        {
-            ++g_droppedEmpty;
-            if (g_DebugEnabled)
-                LOG_INFO("module.ollamachat",
-                         "[Ollama Chat] Bot {} produced nothing usable after cleanup.",
-                         task.request.botName);
-            return;
-        }
-
-        Completion completion;
-        completion.request = task.request;
-        completion.text    = std::move(text);
-        completion.emoteId = emoteId;
-
-        uint32_t delayMs = 0;
-        if (g_EnableTypingSimulation)
-        {
-            delayMs = g_TypingSimulationBaseDelay +
-                      static_cast<uint32_t>(completion.text.length()) * g_TypingSimulationDelayPerChar;
-            if (g_TypingSimulationMaxDelay > 0 && delayMs > g_TypingSimulationMaxDelay)
-                delayMs = g_TypingSimulationMaxDelay;
-        }
-
-        // A delay, not a sleep. The old code held a whole thread hostage here.
-        completion.deliverAt = Clock::now() + std::chrono::milliseconds(delayMs);
-
-        std::lock_guard<std::mutex> lock(g_doneMutex);
-        if (completion.request.bridgeGeneration && completion.request.bridgeGeneration != g_bridgeGeneration.load())
-            return;
-        g_done.push_back(std::move(completion));
-    }
-
-    void RunSentimentTask(const Task& task)
-    {
-        // Sentiment touches only mutex-guarded in-memory state and async DB
-        // writes, so it completes here rather than round-tripping to the
-        // world thread.
-        ApplySentimentAnalysis(task.sentimentBotGuid, task.sentimentPlayerGuid,
-                               task.sentimentMessage, task.sentimentPrompt);
-    }
-
     void WorkerLoop()
     {
         for (;;)
@@ -279,22 +188,7 @@ void RunBridgeTask(Task& task)
 
                 try
                 {
-                    switch (task.type)
-                    {
-                        case TaskType::Sentiment:
-                            RunSentimentTask(task);
-                            break;
-                        case TaskType::Condense:
-                            Memory_RunCondensation(task.memoryBotGuid, task.memoryPrompt);
-                            break;
-                        case TaskType::Relationship:
-                            Memory_RunRelationshipUpdate(task.memoryBotGuid, task.memoryOtherGuid, task.memoryOtherName,
-                                                         task.memoryPrompt);
-                            break;
-                        default:
-                            RunChatTask(task);
-                            break;
-                    }
+                    RunBridgeTask(task);
                 }
                 catch (std::exception const& e)
                 {
@@ -581,120 +475,6 @@ bool PrepareBridge(Completion& c)
         ProposeBridgeCard(c);
     }
     // END BRIDGE CARD DELIVERY
-
-    void Deliver(Completion const& c, OllamaWorldSnapshot const& world)
-    {
-        if (c.request.bridgeGeneration)
-        {
-            DeliverBridge(c, world);
-            return;
-        }
-        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(c.request.botGuid));
-        if (!bot || !bot->IsInWorld())
-            return;
-
-        PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-        if (!botAI)
-            return;
-
-        const ObjectGuid botGuid = bot->GetGUID();
-
-        // Direct address: the bot owes this person an answer, so it skips the
-        // suppressions that exist to pace ambient chatter. Decided at submit
-        // time in ProcessChat, where the Group was live to consult.
-        const bool directAddress = c.request.directAddress;
-
-        // Repetition is checked at delivery rather than at submission, because
-        // we only know what the model actually said now.
-        //
-        // Skipped for direct address. Ask a bot the same question twice and
-        // the same answer is correct -- suppressing it leaves the asker
-        // staring at silence, which reads as the bot being broken rather than
-        // as anti-repetition working.
-        if (!directAddress && Governor_IsRepetitive(botGuid, c.request.scopeKey, c.text))
-        {
-            ++g_droppedGovernor;
-            if (g_DebugEnabled)
-                LOG_INFO("module.ollamachat",
-                         "[Ollama Chat] Bot {} reply suppressed as repetitive: '{}'",
-                         bot->GetName(), c.text);
-            return;
-        }
-
-        if (!Governor_TryConsumeSend(botGuid, c.request.scopeKey, directAddress))
-        {
-            ++g_droppedGovernor;
-            if (g_DebugEnabled)
-                LOG_INFO("module.ollamachat",
-                         "[Ollama Chat] Bot {} reply suppressed by cooldown/rate limit.",
-                         bot->GetName());
-            return;
-        }
-
-        Channel* channel = nullptr;
-        if (!RouteMessage(bot, botAI, c, c.text, world, channel))
-        {
-            if (g_DebugEnabled)
-                LOG_INFO("module.ollamachat",
-                         "[Ollama Chat] Bot {} had nowhere to send its reply ({}).",
-                         bot->GetName(), ChatChannelSourceLocalStr[c.request.source]);
-            return;
-        }
-
-        Governor_RecordUtterance(botGuid, c.request.scopeKey, c.text);
-        ++g_totalDelivered;
-
-        // This bot is now in a conversation with whoever it just answered, so
-        // their next line in this scope is a turn in it rather than ambient
-        // chatter. Only against a real person: an open conversation bypasses
-        // pacing, and letting two bots open one with each other is how a
-        // bot-to-bot loop would escape every brake in the governor.
-        if (c.request.targetGuid)
-        {
-            Player* addressee = ObjectAccessor::FindConnectedPlayer(ObjectGuid(c.request.targetGuid));
-            if (OllamaIsRealPlayer(addressee))
-                Governor_NoteConversation(botGuid, ObjectGuid(c.request.targetGuid),
-                                          c.request.scopeKey);
-        }
-
-        // Body language. Safe here and only here: this is the world thread.
-        ScheduleBotExpression(bot, ObjectGuid(c.request.targetGuid), c.emoteId,
-                              g_BotExpressionDelayMs);
-
-        if (c.request.recordHistory && c.request.targetGuid)
-        {
-            AppendBotConversation(c.request.botGuid, c.request.targetGuid,
-                                  c.request.originMessage, c.text);
-
-            // Counts name mentions and, past a threshold, queues a
-            // condensation or relationship revision. World thread.
-            Player* target = ObjectAccessor::FindConnectedPlayer(ObjectGuid(c.request.targetGuid));
-            Memory_NoteExchange(c.request.botGuid, c.request.targetGuid,
-                                target ? target->GetName() : std::string(),
-                                c.request.originMessage, c.text);
-        }
-
-        if (c.request.updateSentiment && c.request.targetGuid &&
-            !c.request.originMessage.empty())
-        {
-            OllamaDispatch_SubmitSentiment(c.request.botGuid, c.request.targetGuid,
-                                           c.request.originMessage);
-        }
-
-        if (g_DebugEnabled)
-            LOG_INFO("module.ollamachat", "[Ollama Chat] {} ({}, depth {}): {}",
-                     bot->GetName(), ChatChannelSourceLocalStr[c.request.source],
-                     c.request.chainDepth, c.text);
-
-        // Let other bots hear it -- with the chain depth advanced, which is
-        // what stops the reply loop that had no brakes before.
-        if (c.request.triggerBotReplies &&
-            c.request.source != SRC_WHISPER_LOCAL)
-        {
-            ProcessBotChatMessage(bot, c.text, c.request.source, channel,
-                                  static_cast<uint8_t>(c.request.chainDepth + 1));
-        }
-    }
 }
 
 // --------------------------------------------------------------------------
@@ -858,51 +638,13 @@ void OllamaDispatch_Stop()
     LOG_INFO("module.ollamachat", "[Ollama Chat] Dispatcher stopped.");
 }
 
-bool OllamaDispatch_Submit(OllamaChatRequest request)
-{
-    if (request.bridgeGeneration)
-        return false;
-    if (request.prompt.empty() || request.botGuid == 0)
-        return false;
-
-    Task task;
-    task.type    = TaskType::ChatReply;
-    task.request = std::move(request);
-
-    {
-        std::lock_guard<std::mutex> lock(g_queueMutex);
-
-        if (!g_running)
-            return false;
-
-        if (task.request.bridgeGeneration && task.request.bridgeGeneration != g_bridgeGeneration.load())
-            return false;
-
-        if (g_MaxQueueDepth > 0 && g_queue.size() >= g_MaxQueueDepth)
-        {
-            ++g_droppedQueueFull;
-            if (g_DebugEnabled)
-                LOG_INFO("module.ollamachat",
-                         "[Ollama Chat] Queue full ({}); dropping request for {}.",
-                         g_queue.size(), task.request.botName);
-            return false;
-        }
-
-        g_queue.push_back(std::move(task));
-    }
-
-    ++g_totalSubmitted;
-    g_queueCv.notify_one();
-    return true;
-}
-
 bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldScope const& scope,
                                  OllamaBridge::Context input, OllamaBridge::DispatchGuard guard, int64_t lifetimeMs)
 {
     using namespace OllamaBridge;
-    if (!g_bridgeObserver || request.chainDepth || request.kind != OllamaRequestKind::ChatReply ||
-        request.botGuid != scope.botGuid || request.targetGuid != input.speakerGuid || request.botName.size() > 128 ||
-        request.scopeKey.size() > 256 || request.directAddress != input.directAddress)
+    if (!g_bridgeObserver || request.kind != OllamaRequestKind::ChatReply || request.botGuid != scope.botGuid ||
+        request.targetGuid != input.speakerGuid || request.botName.size() > 128 || request.scopeKey.size() > 256 ||
+        request.directAddress != input.directAddress)
         return false;
     DispatchSource source = DispatchSource::Unsupported;
     switch (request.source)
@@ -939,13 +681,8 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
     request.bridgeSettings = std::move(settings);
     request.bridgeTicket = ticket;
     request.bridgeGuard = std::move(guard);
-    request.prompt.clear();
-    request.originMessage.clear();
     request.channelName.clear();
     request.channelId = 0;
-    request.recordHistory = false;
-    request.updateSentiment = false;
-    request.triggerBotReplies = false;
     Completion pending;
     pending.request = std::move(request);
     pending.bridgeSlot = std::move(slot);
@@ -990,40 +727,6 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
     ++g_totalSubmitted;
     g_queueCv.notify_one();
     return true;
-}
-
-void OllamaDispatch_SubmitSentiment(uint64_t botGuid, uint64_t playerGuid,
-                                    const std::string& message)
-{
-    if (!g_EnableSentimentTracking || message.empty())
-        return;
-
-    // Built here, on the world thread: the template is config state that
-    // reload rewrites, so a worker must never read it.
-    std::string prompt = BuildSentimentPrompt(message);
-    if (prompt.empty())
-        return;
-
-    Task task;
-    task.type                = TaskType::Sentiment;
-    task.sentimentBotGuid    = botGuid;
-    task.sentimentPlayerGuid = playerGuid;
-    task.sentimentMessage    = message;
-    task.sentimentPrompt     = std::move(prompt);
-
-    {
-        std::lock_guard<std::mutex> lock(g_queueMutex);
-        if (!g_running)
-            return;
-
-        // Sentiment is best-effort; never let it crowd out actual chat.
-        if (g_MaxQueueDepth > 0 && g_queue.size() >= g_MaxQueueDepth / 2)
-            return;
-
-        g_queue.push_back(std::move(task));
-    }
-
-    g_queueCv.notify_one();
 }
 
 // J12: generation intents and one-shot effects are synchronous; lasting plans are the only other obligation, so the
@@ -1144,8 +847,8 @@ void OllamaDispatch_Update(uint32_t /*diff*/, PlayerbotBridge::PostMapJoin const
     const auto now = Clock::now();
     LogBridgeCommands(now);
 
-    // Move due completions out under the lock, then deliver without it: the
-    // delivery path re-enters ProcessBotChatMessage, which submits new work.
+    // Move due completions out under the lock, then deliver without it: a completion that is not due yet goes
+    // back under the lock.
     std::vector<Completion> due;
 
     {
@@ -1175,110 +878,33 @@ void OllamaDispatch_Update(uint32_t /*diff*/, PlayerbotBridge::PostMapJoin const
 
     for (Completion& c : due)
     {
-        if (c.request.bridgeGeneration && c.request.bridgeGeneration != g_bridgeGeneration.load())
+        if (c.request.bridgeGeneration != g_bridgeGeneration.load())
             continue;
         try
         {
-            if (c.request.bridgeGeneration)
+            if (!c.bridgePrepared && !PrepareBridge(c))
             {
-                if (!c.bridgePrepared && !PrepareBridge(c))
-                {
-                    g_bridgeWorld.Cancel(c.request.bridgeTicket);
-                    continue;
-                }
-                if (!BridgeCurrent(c))
-                {
-                    g_bridgeWorld.Cancel(c.request.bridgeTicket);
-                    continue;
-                }
-                if (c.deliverAt > Clock::now())
-                {
-                    std::lock_guard<std::mutex> lock(g_doneMutex);
-                    g_done.push_back(std::move(c));
-                    continue;
-                }
+                g_bridgeWorld.Cancel(c.request.bridgeTicket);
+                continue;
             }
-            Deliver(c, world);
+            if (!BridgeCurrent(c))
+            {
+                g_bridgeWorld.Cancel(c.request.bridgeTicket);
+                continue;
+            }
+            if (c.deliverAt > Clock::now())
+            {
+                std::lock_guard<std::mutex> lock(g_doneMutex);
+                g_done.push_back(std::move(c));
+                continue;
+            }
+            DeliverBridge(c, world);
         }
         catch (const std::exception& e)
         {
             LOG_ERROR("module.ollamachat", "[Ollama Chat] Delivery exception: {}", e.what());
         }
     }
-}
-
-void OllamaChat_DispatchEmoteReaction(Player* bot, Player* player, uint32_t textEmote)
-{
-    if (!bot || !player)
-        return;
-
-    OllamaChatRequest request;
-    request.botGuid    = bot->GetGUID().GetRawValue();
-    request.targetGuid = player->GetGUID().GetRawValue();
-    request.source     = SRC_SAY_LOCAL;
-    request.chainDepth = 0;
-    request.botName    = bot->GetName();
-    request.kind       = OllamaRequestKind::EventChatter;
-    request.scopeKey   = Governor_MakeScopeKey("Say", 0, "", 0, bot->GetZoneId());
-    request.triggerBotReplies = false;
-    // Someone emoted at this bot by name. Its own debounce paces this;
-    // the ambient say cooldown has no business also silencing it.
-    request.directAddress = true;
-
-    request.prompt = BuildEmoteReactionPrompt(bot, player, textEmote);
-    if (request.prompt.empty())
-        return;
-
-    OllamaDispatch_Submit(std::move(request));
-}
-
-namespace
-{
-    // Background upkeep must never crowd out actual chat, so it gets a
-    // stricter queue allowance than a reply does.
-    bool SubmitBackground(Task&& task)
-    {
-        std::lock_guard<std::mutex> lock(g_queueMutex);
-        if (!g_running)
-            return false;
-        if (g_MaxQueueDepth > 0 && g_queue.size() >= g_MaxQueueDepth / 2)
-            return false;
-
-        g_queue.push_back(std::move(task));
-        return true;
-    }
-}
-
-void OllamaDispatch_SubmitCondensation(uint64_t botGuid, const std::string& prompt)
-{
-    if (botGuid == 0 || prompt.empty())
-        return;
-
-    Task task;
-    task.type          = TaskType::Condense;
-    task.memoryBotGuid = botGuid;
-    task.memoryPrompt  = prompt;
-
-    if (SubmitBackground(std::move(task)))
-        g_queueCv.notify_one();
-}
-
-void OllamaDispatch_SubmitRelationship(uint64_t botGuid, uint64_t otherGuid,
-                                       const std::string& otherName,
-                                       const std::string& prompt)
-{
-    if (botGuid == 0 || otherGuid == 0 || prompt.empty())
-        return;
-
-    Task task;
-    task.type            = TaskType::Relationship;
-    task.memoryBotGuid   = botGuid;
-    task.memoryOtherGuid = otherGuid;
-    task.memoryOtherName = otherName;
-    task.memoryPrompt    = prompt;
-
-    if (SubmitBackground(std::move(task)))
-        g_queueCv.notify_one();
 }
 
 OllamaDispatchStats OllamaDispatch_GetStats()

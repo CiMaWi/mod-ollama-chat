@@ -528,155 +528,6 @@ void DeleteBotConversationHistoryFromDB(uint64_t botGuid)
         "DELETE FROM mod_ollama_chat_history WHERE bot_guid = {}", botGuid));
 }
 
-// Called when a bot sends a message (random chatter or other bot-initiated messages)
-// This triggers other bots to potentially reply
-void ProcessBotChatMessage(Player* bot, const std::string& msg, ChatChannelSourceLocal sourceLocal, Channel* channel, uint8_t chainDepth)
-{
-    if (!bot || msg.empty())
-        return;
-
-    // Bail before the (not cheap) eligibility validation below when the chain
-    // is already spent.
-    if (!Governor_ChainDepthAllowed(chainDepth))
-        return;
-
-        
-    // If channel is nullptr but this is a channel-type message, try to find the channel
-    if (!channel && sourceLocal == SRC_GENERAL_LOCAL)
-    {
-        // Look up the General channel for this bot's faction
-        std::string channelName = "General";
-        ChannelMgr* cMgr = ChannelMgr::forTeam(bot->GetTeamId());
-        if (cMgr)
-        {
-            channel = cMgr->GetChannel(channelName, bot);
-            if (g_DebugEnabled)
-            {
-                if (channel)
-                    LOG_INFO("module.ollamachat", "[Ollama Chat] ProcessBotChatMessage: Found General channel for bot {}", bot->GetName());
-                else
-                    LOG_ERROR("module.ollamachat", "[Ollama Chat] ProcessBotChatMessage: Could not find General channel for bot {}", bot->GetName());
-            }
-        }
-    }
-    
-    // Whether other bots may chain a reply to this line. The line itself has
-    // already been delivered by this point -- this only gates propagation.
-    bool canSendMessage = false;
-    switch (sourceLocal)
-    {
-        case SRC_SAY_LOCAL:
-        case SRC_YELL_LOCAL:
-            // Distance checks will be applied during eligibility filtering
-            canSendMessage = true;
-            break;
-            
-        case SRC_GENERAL_LOCAL:
-            // Must have a channel object
-            canSendMessage = (channel != nullptr);
-            if (!canSendMessage && g_DebugEnabled)
-                LOG_ERROR("module.ollamachat", "[Ollama Chat] No bot replies to {} in General - no channel found", bot->GetName());
-            break;
-            
-        case SRC_GUILD_LOCAL:
-        case SRC_OFFICER_LOCAL:
-            // Must be in a guild with at least one real player online
-            if (bot->GetGuildId() != 0)
-            {
-                Guild* guild = sGuildMgr->GetGuildById(bot->GetGuildId());
-                if (guild)
-                {
-                    OllamaWorldSnapshot world;
-                    world.Build();
-                    const bool hasRealPlayer = world.GuildHasRealPlayer(bot->GetGuildId());
-                    canSendMessage = hasRealPlayer;
-                    if (!canSendMessage && g_DebugEnabled)
-                        LOG_INFO("module.ollamachat", "[Ollama Chat] No bot replies to {} in Guild - no real players online in guild", bot->GetName());
-                }
-                else
-                {
-                    canSendMessage = false;
-                    if (g_DebugEnabled)
-                        LOG_ERROR("module.ollamachat", "[Ollama Chat] No bot replies to {} in Guild - guild not found", bot->GetName());
-                }
-            }
-            else
-            {
-                canSendMessage = false;
-                if (g_DebugEnabled)
-                    LOG_ERROR("module.ollamachat", "[Ollama Chat] No bot replies to {} in Guild - not in a guild", bot->GetName());
-            }
-            break;
-            
-        case SRC_PARTY_LOCAL:
-        case SRC_RAID_LOCAL:
-            // Must be in a group with at least one real player
-            if (bot->GetGroup())
-            {
-                Group* group = bot->GetGroup();
-                bool hasRealPlayer = false;
-                for (GroupReference* ref = group->GetFirstMember(); ref; ref = ref->next())
-                {
-                    Player* member = ref->GetSource();
-                    if (OllamaIsRealPlayer(member))
-                    {
-                        hasRealPlayer = true;
-                        break;
-                    }
-                }
-                canSendMessage = hasRealPlayer;
-                if (!canSendMessage && g_DebugEnabled)
-                    LOG_INFO("module.ollamachat", "[Ollama Chat] No bot replies to {} in Party - no real players in group", bot->GetName());
-            }
-            else
-            {
-                canSendMessage = false;
-                if (g_DebugEnabled)
-                    LOG_ERROR("module.ollamachat", "[Ollama Chat] No bot replies to {} in Party - not in a group", bot->GetName());
-            }
-            break;
-            
-        case SRC_WHISPER_LOCAL:
-            // Whispers are handled separately
-            canSendMessage = true;
-            break;
-            
-        default:
-            canSendMessage = true;
-            break;
-    }
-    
-    if (!canSendMessage)
-    {
-        if (g_DebugEnabled)
-            LOG_INFO("module.ollamachat",
-                     "[Ollama Chat] Not propagating {}'s {} line to other bots - no audience.",
-                     bot->GetName(), ChatChannelSourceLocalStr[sourceLocal]);
-        return;
-    }
-        
-    // Convert ChatChannelSourceLocal back to chat type for ProcessChat
-    uint32_t type = 0;
-    switch (sourceLocal)
-    {
-        case SRC_SAY_LOCAL: type = CHAT_MSG_SAY; break;
-        case SRC_YELL_LOCAL: type = CHAT_MSG_YELL; break;
-        case SRC_PARTY_LOCAL: type = CHAT_MSG_PARTY; break;
-        case SRC_RAID_LOCAL: type = CHAT_MSG_RAID; break;
-        case SRC_GUILD_LOCAL: type = CHAT_MSG_GUILD; break;
-        case SRC_OFFICER_LOCAL: type = CHAT_MSG_OFFICER; break;
-        case SRC_WHISPER_LOCAL: type = CHAT_MSG_WHISPER; break;
-        case SRC_GENERAL_LOCAL: type = CHAT_MSG_CHANNEL; break;
-        default: type = CHAT_MSG_SAY; break;
-    }
-    
-    std::string mutableMsg = msg; // ProcessChat takes non-const reference
-    uint32_t lang = bot->GetTeamId() == TEAM_ALLIANCE ? LANG_COMMON : LANG_ORCISH;
-    
-    // Call the main ProcessChat function with bot as sender
-    PlayerBotChatHandler::ProcessChat(bot, type, lang, mutableMsg, sourceLocal, channel, nullptr, chainDepth);
-}
-
 std::string GetBotHistoryPrompt(uint64_t botGuid, uint64_t playerGuid, std::string playerMessage)
 {
     if(!g_EnableChatHistory)
@@ -1814,7 +1665,7 @@ std::vector<BridgeBinding>::iterator BridgeObserveFresh(OllamaBridge::WorldTicke
 }
 
 bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, std::string const& text, bool addressed,
-                  std::string const& scopeKey, uint8_t chainDepth, OllamaBridge::Watch const* wake = nullptr)
+                  std::string const& scopeKey, OllamaBridge::Watch const* wake = nullptr)
 {
     using namespace OllamaBridge;
     DispatchSource origin = DispatchSource::Unsupported;
@@ -1835,7 +1686,7 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
         default:
             return false;
     }
-    if (chainDepth || text.empty() || text.size() > MaxTextBytes ||
+    if (text.empty() || text.size() > MaxTextBytes ||
         ((origin == DispatchSource::Say || origin == DispatchSource::Yell) && !addressed && !wake))
         return false;
     auto& cards = OllamaPersona::WorldStore();
@@ -2076,12 +1927,13 @@ bool OllamaChat_BridgeWake(OllamaBridge::Watch const& watch)
     if (!bot || !partner || !bot->IsInWorld() || !partner->IsInWorld())
         return false;
     // One generation like the partner's line: fixed in-world text, not addressed (a failure stays silent), 30 s.
-    return BridgeSubmit(bot, partner, source, WakeText(watch.condition), false, BridgeWakeScopeKey(partner, source), 0,
+    return BridgeSubmit(bot, partner, source, WakeText(watch.condition), false, BridgeWakeScopeKey(partner, source),
                         &watch);
 }
 // END BRIDGE WORLD ADAPTER
 
-void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32_t lang, std::string& msg, ChatChannelSourceLocal sourceLocal, Channel* channel, Player* receiver, uint8_t chainDepth)
+void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32_t lang, std::string& msg,
+                                       ChatChannelSourceLocal sourceLocal, Channel* channel, Player* receiver)
 {
     if (player == nullptr) {
         LOG_ERROR("module.ollamachat", "[Ollama Chat] ProcessChat: player is null");
@@ -2093,7 +1945,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     if (lang == LANG_ADDON) return;
     // Only a human's line opens a bridge request. A bot's own replies (BridgeHuman false) and bot chains never do,
     // so generated speech cannot feed back into the bridge or start a bot-to-bot loop.
-    if (!g_Enable || !BridgeHuman(player) || chainDepth || channel ||
+    if (!g_Enable || !BridgeHuman(player) || channel ||
         (sourceLocal != SRC_WHISPER_LOCAL && sourceLocal != SRC_PARTY_LOCAL && sourceLocal != SRC_SAY_LOCAL &&
          sourceLocal != SRC_YELL_LOCAL))
         return;
@@ -2195,17 +2047,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     }
     else
     {
-        // Bot-to-bot. Two brakes: an absolute depth ceiling, and the audience
-        // rule -- bots do not hold conversations with nobody listening.
-        if (!Governor_ChainDepthAllowed(chainDepth))
-        {
-            if (g_DebugEnabled)
-                LOG_INFO("module.ollamachat",
-                         "[Ollama Chat] Chain depth {} reached the limit; not continuing.",
-                         chainDepth);
-            return;
-        }
-
+        // Bot-to-bot: bots do not hold conversations with nobody listening.
         if (!Governor_HasRecentHuman(scopeKey))
         {
             if (g_DebugEnabled)
@@ -2524,17 +2366,11 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         chance = senderIsBot ? g_BotReplyChance_Say : g_PlayerReplyChance_Say;
     }
     
-    // Each bot->bot hop makes the next reply less likely, so a chain runs out
-    // of energy on its own well before it hits the hard depth ceiling. Never
-    // applied to a whisper: bot-to-bot whispers are refused long before this,
-    // so a whisper here is always a person talking to a bot directly.
-    if (senderIsBot && sourceLocal != SRC_WHISPER_LOCAL)
-        chance = Governor_ApplyChainDecay(chance, chainDepth);
-
     if(g_DebugEnabled)
     {
-        LOG_INFO("module.ollamachat", "[Ollama Chat] Sender: {} ({}), Channel: {}, Depth: {}, Reply Chance: {}%, Candidate Bots: {}",
-                player->GetName(), senderIsBot ? "BOT" : "PLAYER", ChatChannelSourceLocalStr[sourceLocal], chainDepth, chance, candidateBots.size());
+        LOG_INFO("module.ollamachat",
+                 "[Ollama Chat] Sender: {} ({}), Channel: {}, Reply Chance: {}%, Candidate Bots: {}", player->GetName(),
+                 senderIsBot ? "BOT" : "PLAYER", ChatChannelSourceLocalStr[sourceLocal], chance, candidateBots.size());
     }
 
     // Not just an optimisation: this return also used to swallow the name-
@@ -2735,7 +2571,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             continue;
         }
 
-        BridgeSubmit(bot, player, sourceLocal, msg, directAddress, scopeKey, chainDepth);
+        BridgeSubmit(bot, player, sourceLocal, msg, directAddress, scopeKey);
     }
 }
 
@@ -2864,186 +2700,6 @@ static bool IsBotEligibleForChatChannelLocal(Player* bot, Player* player, ChatCh
         default:
             return false;
     }
-}
-
-std::string GenerateBotPrompt(Player* bot, std::string playerMessage, Player* player)
-{  
-    if (!bot || !player) {
-        return "";
-    }
-    PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-    if (botAI == nullptr) {
-        return "";
-    }
-    ChatHelper* helper = botAI->GetChatHelper();
-    if (helper == nullptr) {
-        return "";
-    }
-    if (g_ChatPromptTemplate.empty()) {
-        LOG_ERROR("module.ollamachat", "[Ollama Chat] GenerateBotPrompt: template is empty");
-        return "";
-    }
-
-    AreaTableEntry const* botCurrentArea = botAI->GetCurrentArea();
-    AreaTableEntry const* botCurrentZone = botAI->GetCurrentZone();
-
-    uint64_t botGuid                = bot->GetGUID().GetRawValue();
-    uint64_t playerGuid             = player->GetGUID().GetRawValue();
-
-    std::string personality         = GetBotPersonality(bot);
-    std::string personalityPrompt   = GetBotPersonalityPrompt(bot, personality);
-    std::string botName             = bot->GetName();
-    uint32_t botLevel               = bot->GetLevel();
-    uint8_t botGenderByte           = bot->getGender();
-    std::string botAreaName         = botCurrentArea ? botAI->GetLocalizedAreaName(botCurrentArea): "UnknownArea";
-    std::string botZoneName         = botCurrentZone ? botAI->GetLocalizedAreaName(botCurrentZone): "UnknownZone";
-    std::string botMapName          = OllamaContinentName(bot);
-    std::string botClass            = botAI->GetChatHelper()->FormatClass(bot->getClass());
-    std::string botRace             = botAI->GetChatHelper()->FormatRace(bot->getRace());
-    std::string botRole             = CleanRoleForPrompt(ChatHelper::FormatClass(bot, AiFactory::GetPlayerSpecTab(bot)));
-    std::string botGender           = (botGenderByte == 0 ? "Male" : "Female");
-    std::string botFaction          = (bot->GetTeamId() == TEAM_ALLIANCE ? "Alliance" : "Horde");
-    std::string botGuild            = (bot->GetGuild() ? bot->GetGuild()->GetName() : "No Guild");
-    std::string botGroupStatus      = (bot->GetGroup() ? "In a group" : "Solo");
-    uint32_t botGold                = bot->GetMoney() / 10000;
-
-    std::string playerName          = player->GetName();
-    uint32_t playerLevel            = player->GetLevel();
-    std::string playerClass         = botAI->GetChatHelper()->FormatClass(player->getClass());
-    std::string playerRace          = botAI->GetChatHelper()->FormatRace(player->getRace());
-    std::string playerRole          = CleanRoleForPrompt(ChatHelper::FormatClass(player, AiFactory::GetPlayerSpecTab(player)));
-    uint8_t playerGenderByte        = player->getGender();
-    std::string playerGender        = (playerGenderByte == 0 ? "Male" : "Female");
-    std::string playerFaction       = (player->GetTeamId() == TEAM_ALLIANCE ? "Alliance" : "Horde");
-    std::string playerGuild         = (player->GetGuild() ? player->GetGuild()->GetName() : "No Guild");
-    std::string playerGroupStatus   = (player->GetGroup() ? "In a group" : "Solo");
-    uint32_t playerGold             = player->GetMoney() / 10000;
-    float playerDistance            = player->IsInWorld() && bot->IsInWorld() ? player->GetDistance(bot) : -1.0f;
-
-    std::string chatHistory         = GetBotHistoryPrompt(botGuid, playerGuid, playerMessage);
-    std::string sentimentInfo       = GetSentimentPromptAddition(bot, player);
-
-    // Retrieve RAG information if enabled
-    std::string ragInfo;
-    if (g_EnableRAG && g_RAGSystem) {
-        auto ragResults = g_RAGSystem->RetrieveRelevantInfo(playerMessage, g_RAGMaxRetrievedItems, g_RAGSimilarityThreshold);
-        std::string ragContent = g_RAGSystem->GetFormattedRAGInfo(ragResults);
-        if (!ragContent.empty()) {
-            ragInfo = SafeFormat(g_RAGPromptTemplate, fmt::arg("rag_info", ragContent));
-        }
-        if (g_DebugEnabled) {
-            LOG_INFO("module.ollamachat", "[Ollama Chat] RAG Debug - Enabled: {}, System: {}, Message: '{}', Results: {}, Content length: {}",
-                g_EnableRAG, (void*)g_RAGSystem, playerMessage, ragResults.size(), ragContent.length());
-        }
-    } else if (g_DebugEnabled) {
-        LOG_INFO("module.ollamachat", "[Ollama Chat] RAG Debug - Not enabled or no system - Enabled: {}, System: {}",
-            g_EnableRAG, (void*)g_RAGSystem);
-    }
-
-    std::string extraInfo = SafeFormat(
-        g_ChatExtraInfoTemplate,
-        fmt::arg("bot_race", botRace),
-        fmt::arg("bot_gender", botGender),
-        fmt::arg("bot_role", botRole),
-        fmt::arg("bot_faction", botFaction),
-        fmt::arg("bot_guild", botGuild),
-        fmt::arg("bot_group_status", botGroupStatus),
-        fmt::arg("bot_gold", Roleplay_GoldText(botGold)),
-        fmt::arg("player_race", playerRace),
-        fmt::arg("player_gender", playerGender),
-        fmt::arg("player_role", playerRole),
-        fmt::arg("player_faction", playerFaction),
-        fmt::arg("player_guild", playerGuild),
-        fmt::arg("player_group_status", playerGroupStatus),
-        fmt::arg("player_gold", Roleplay_GoldText(playerGold)),
-        fmt::arg("player_distance", Roleplay_DistanceText(playerDistance)),
-        fmt::arg("bot_area", botAreaName),
-        fmt::arg("bot_zone", botZoneName),
-        fmt::arg("bot_map", botMapName)
-    );
-    
-    std::string prompt = SafeFormat(
-        g_ChatPromptTemplate,
-        fmt::arg("bot_name", botName),
-        fmt::arg("bot_level", Roleplay_LevelText(botLevel)),
-        fmt::arg("bot_class", botClass),
-        fmt::arg("bot_personality", personalityPrompt),
-        fmt::arg("bot_personality_name", personality),
-        fmt::arg("player_level", Roleplay_LevelText(playerLevel)),
-        fmt::arg("player_class", playerClass),
-        fmt::arg("player_name", playerName),
-        fmt::arg("player_message", playerMessage),
-        fmt::arg("extra_info", extraInfo),
-        fmt::arg("chat_history", chatHistory),
-        fmt::arg("sentiment_info", sentimentInfo)
-    );
-
-    // Add RAG information to the prompt if available
-    if (!ragInfo.empty()) {
-        prompt += ragInfo + "\n";
-    }
-
-    if(g_EnableChatBotSnapshotTemplate)
-    {
-        prompt += GenerateBotGameStateSnapshot(bot);
-    }
-
-    // What this bot remembers, and how it feels about people. Bounded by
-    // their own token budgets, so this cannot grow the prompt without limit.
-    prompt += Memory_BuildPromptSection(bot, player);
-
-    // Race and class as a voice rather than as a stat line.
-    prompt += Roleplay_BuildVoicePrompt(bot);
-
-    // Let the model gesture. The tag is parsed back out and stripped before
-    // the line is spoken, so it never reaches chat as text.
-    prompt += Expression_BuildGesturePrompt();
-
-    // Debug logging for full prompt including RAG information
-    if (g_DebugEnabled && g_DebugShowFullPrompt) {
-        LOG_INFO("module.ollamachat", "[Ollama Chat] Full prompt sent to bot {} for player {}: {}", botName, playerName, prompt);
-    }
-
-    return prompt;
-}
-
-// --------------------------------------------------------------------------
-// Emote reactions
-// --------------------------------------------------------------------------
-
-std::string BuildEmoteReactionPrompt(Player* bot, Player* player, uint32_t textEmote)
-{
-    if (!bot || !player)
-        return "";
-
-    PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-    if (!botAI || !botAI->GetChatHelper())
-        return "";
-
-    std::string emoteName = LookupTextEmoteName(textEmote);
-    if (emoteName.empty())
-        emoteName = "gestures at";
-
-    const std::string personality       = GetBotPersonality(bot);
-    const std::string personalityPrompt = GetBotPersonalityPrompt(bot, personality);
-
-    std::string prompt = SafeFormat(
-        g_EmoteReactionPromptTemplate,
-        fmt::arg("bot_name", bot->GetName()),
-        fmt::arg("bot_level", Roleplay_LevelText(bot->GetLevel())),
-        fmt::arg("bot_class", botAI->GetChatHelper()->FormatClass(bot->getClass())),
-        fmt::arg("bot_race", botAI->GetChatHelper()->FormatRace(bot->getRace())),
-        fmt::arg("bot_personality", personalityPrompt),
-        fmt::arg("bot_personality_name", personality),
-        fmt::arg("player_name", player->GetName()),
-        fmt::arg("player_class", botAI->GetChatHelper()->FormatClass(player->getClass())),
-        fmt::arg("player_race", botAI->GetChatHelper()->FormatRace(player->getRace())),
-        fmt::arg("emote_name", emoteName));
-
-    if (g_RoleplayEnable)
-        prompt += Roleplay_BuildVoicePrompt(bot);
-
-    return prompt;
 }
 
 // --------------------------------------------------------------------------

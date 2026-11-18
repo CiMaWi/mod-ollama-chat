@@ -58,14 +58,6 @@ void Memory_Load();
 void Memory_SaveAll();
 void Memory_ForgetBot(ObjectGuid botGuid);
 
-// Called on the world thread after a bot exchange is recorded. Counts name
-// mentions and, when a threshold is crossed, queues a condensation or a
-// relationship update through the dispatcher.
-void Memory_NoteExchange(uint64_t botGuid, uint64_t otherGuid,
-                         const std::string& otherName,
-                         const std::string& incomingMessage,
-                         const std::string& botReply);
-
 // Prompt fragments. World thread only.
 //
 // `about` may be null; when set, that person's relationship line is listed

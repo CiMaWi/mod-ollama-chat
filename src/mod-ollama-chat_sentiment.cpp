@@ -130,18 +130,6 @@ void ApplySentimentAnalysis(uint64_t botGuid, uint64_t playerGuid,
     }
 }
 
-void UpdateBotPlayerSentiment(Player* bot, Player* player, const std::string& message)
-{
-    if (!g_EnableSentimentTracking || !bot || !player || message.empty())
-        return;
-
-    // Hand off rather than block. This used to run the LLM call inline, on
-    // whatever thread happened to be delivering the reply.
-    OllamaDispatch_SubmitSentiment(bot->GetGUID().GetRawValue(),
-                                   player->GetGUID().GetRawValue(),
-                                   message);
-}
-
 std::string GetSentimentPromptAddition(Player* bot, Player* player)
 {
     if (!g_EnableSentimentTracking || !bot || !player || g_SentimentPromptTemplate.empty())

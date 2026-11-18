@@ -60,7 +60,7 @@ bool OllamaIsOnChannel(Channel const* channel, ObjectGuid guid);
 
 struct OllamaChatRequest
 {
-    // Set only by SubmitBridge. Ordinary Submit rejects Bridge tags and unbound Bridge providers.
+    // Set by SubmitBridge, the only way in.
     uint64_t bridgeGeneration = 0;
     OllamaEndpointSettings bridgeSettings;
     OllamaBridge::WorldTicket bridgeTicket;
@@ -74,9 +74,7 @@ struct OllamaChatRequest
     std::string            channelName;
     uint32_t               channelId = 0;
 
-    // Loop control. Human-originated messages start at depth 0; each bot reply
-    // to a bot increments it.
-    uint8_t     chainDepth = 0;
+    // The governor's pacing scope.
     std::string scopeKey;
 
     // This line was aimed at this bot in particular -- whispered, named, or
@@ -87,23 +85,12 @@ struct OllamaChatRequest
     bool directAddress = false;
 
     // Generation.
-    std::string       prompt;
     OllamaRequestKind kind = OllamaRequestKind::ChatReply;
 
     // Resolved on the world thread before submission so the worker never has
     // to touch a Player to know these.
     std::string botName;
-    std::string originMessage;    // the message being replied to, if any
-
-    // Post-delivery behaviour.
-    bool triggerBotReplies = true;   // let other bots hear this line
-    bool recordHistory     = false;  // append to conversation history
-    bool updateSentiment   = false;  // run sentiment analysis on originMessage
 };
-
-// Submit a request. Returns false when the queue is at MaxQueueDepth, in which
-// case the caller should simply skip this bot rather than pile up backlog.
-bool OllamaDispatch_Submit(OllamaChatRequest request);
 
 // World-only adapter. Null by default: b2a cannot produce effects until b2b supplies real game validation.
 // Called afresh before cleanup and each effect; must not cache game pointers or accept wire-authored authority.
@@ -177,26 +164,6 @@ OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer
                                                          std::string_view body, uint64_t& receipt);
 OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, uint64_t receipt,
                                                       std::unique_ptr<OllamaBridge::ChannelPacket>& packet);
-
-// Fire-and-forget sentiment analysis. Runs entirely on a worker: the sentiment
-// store is mutex-guarded in-memory state plus async DB writes, so it never
-// needs the world thread -- and it must never run on it, because the analysis
-// is a blocking HTTP call.
-void OllamaDispatch_SubmitSentiment(uint64_t botGuid, uint64_t playerGuid,
-                                    const std::string& message);
-
-// Distil a bot's accumulated history into lasting memories, then clear it.
-// Fire-and-forget; runs entirely on a worker.
-void OllamaDispatch_SubmitCondensation(uint64_t botGuid, const std::string& prompt);
-
-// Write or revise how a bot feels about someone.
-void OllamaDispatch_SubmitRelationship(uint64_t botGuid, uint64_t otherGuid,
-                                       const std::string& otherName,
-                                       const std::string& prompt);
-
-// A player emoted at a bot and the bot decided to answer in words.
-// World thread only.
-void OllamaChat_DispatchEmoteReaction(Player* bot, Player* player, uint32_t textEmote);
 
 struct OllamaDispatchStats
 {
