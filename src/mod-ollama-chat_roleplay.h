@@ -7,15 +7,9 @@
 class Player;
 
 // --------------------------------------------------------------------------
-// Roleplay mode.
+// Roleplay mode: the voice part of the bridge's context.
 //
-// The old EnableRPPersonalities only swapped which personality string got
-// appended. Race and class were passed as bare facts -- "Tauren", "Druid" --
-// with no voice attached, while the shipped chatter variations actively pushed
-// the other way ("Complain about nerfed abilities", "Mention Death Knights
-// being OP"). That is player-forum talk, not in-world talk.
-//
-// This adds two data-driven voice packs and a strictness dial:
+// Two data-driven voice packs and a strictness dial:
 //
 //   race voice  -- speech register, cultural touchstones, what they call the
 //                  other faction.
@@ -23,9 +17,8 @@ class Player;
 //
 // Strictness 0 = flavour only, 1 = in character with meta terms filtered,
 // 2 = hard in character with mechanical numbers described rather than quoted,
-// 3 = in world: as 2, and the built-in instructions plus the numeric prompt
-//     placeholders (levels, level gaps, gold, distances, bag space) are
-//     rendered as words a person living in the world would use.
+// 3 = in world: as 2, and the instruction is worded without naming the things
+//     it forbids.
 // --------------------------------------------------------------------------
 
 void Roleplay_Load();     // seed defaults from conf, then overlay DB rows

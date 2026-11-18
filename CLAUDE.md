@@ -64,12 +64,11 @@ Zone channels are named `"General - Elwynn Forest"`, so
 (Trade, GuildRecruitment) only exist in cities. Names are localized, so any
 substring test on them breaks on a non-English realm.
 
-Use `OllamaResolveZoneChannel(bot, ChatChannelId::X)`, which matches on channel
-id plus zone-name containment the way `PlayerbotAI::SayToChannel` does, and
-carry the channel's *actual* name and id into the request. Getting this wrong
-silently loses ambient chatter, and also splits the governor's scope key so
-ambient lines and replies in the same channel stop sharing a cooldown and a
-repetition history.
+Match on channel id plus zone-name containment the way
+`PlayerbotAI::SayToChannel` does, and carry the channel's *actual* name and id
+into the request. Getting this wrong silently loses the line, and also splits
+the governor's scope key so lines in the same channel stop sharing a cooldown
+and a repetition history.
 
 ## Script registration facts (verified against this fork)
 
@@ -77,16 +76,14 @@ repetition history.
   `PlayerScript::PlayerScript` in the core: *"If empty - enable all available
   hooks."* Passing an explicit list is a performance nicety, not a requirement.
   Do not "fix" a bare `PlayerScript("Name")` thinking it registers nothing.
-- Always write `override` on hook overrides. Two hooks in this module silently
-  overrode nothing for a long time because they lacked it:
-  - `OnPlayerCompleteAchievement` — the core's name is
-    `OnPlayerAchievementComplete` (word order).
-  - `OnGameObjectUse` — not a `PlayerScript` hook at all.
-- There is no generic "player used a gameobject" hook. `ChatOnGameObjectUse`
-  uses `AllGameObjectScript::CanGameObjectGossipHello` and returns `false` so
-  normal handling continues.
-- There is no `OnGuildMemberLogin`. Guild login uses `PLAYERHOOK_ON_LOGIN` plus
-  a guild check; promote/demote come through `GuildScript::OnEvent`.
+- Always write `override` on hook overrides. Two hooks of the old event chatter
+  silently overrode nothing for a long time because they lacked it
+  (`OnPlayerCompleteAchievement`: the core's name is
+  `OnPlayerAchievementComplete`; `OnGameObjectUse`: not a `PlayerScript` hook).
+- There is no generic "player used a gameobject" hook
+  (`AllGameObjectScript::CanGameObjectGossipHello`, returning `false`, is the
+  usual stand-in) and no `OnGuildMemberLogin` (`PLAYERHOOK_ON_LOGIN` plus a
+  guild check; promote/demote come through `GuildScript::OnEvent`).
 - `urand(min, max)` is **inclusive on both ends**. `urand(0, 100) > 0` fires
   about 1 in 101 times, so a configured chance of 0 is not "never". Use
   `urand(1, 100) > chance` and check `chance <= 0` first.
@@ -94,9 +91,9 @@ repetition history.
 ## Performance traps specific to this module
 
 - Never walk `Map::GetCreatureBySpawnIdStore()` — it is every spawn on the map.
-  Use `Cell::VisitObjects` with a searcher, as `handler.cpp` does.
-- `Acore::AnyUnitInObjectRangeCheck` filters out anything not alive. Where dead
-  creatures matter (corpse topics), use the local `NearbyCreatureCheck` structs.
+  Use `Cell::VisitObjects` with a searcher, as `dispatch.cpp` does.
+- `Acore::AnyUnitInObjectRangeCheck` filters out anything not alive; write a
+  local check where dead creatures matter.
 - Watch for nested `ObjectAccessor::GetPlayers()` loops; that is quadratic in
   online characters, per message.
 

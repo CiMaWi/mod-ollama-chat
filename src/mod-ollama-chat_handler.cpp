@@ -153,25 +153,6 @@ static bool OllamaIsDirectAddress(Player* bot, Player* speaker, ChatChannelSourc
     return group->GetMembersCount() <= g_DirectAddressGroupSize;
 }
 
-namespace
-{
-    // Unlike Acore::AnyUnitInObjectRangeCheck this keeps dead creatures --
-    // a fresh corpse is worth commenting on.
-    struct OllamaNearbyCreatureCheck
-    {
-        OllamaNearbyCreatureCheck(WorldObject const* obj, float range)
-            : _obj(obj), _range(range) { }
-
-        bool operator()(Creature* c) const
-        {
-            return c && _obj->IsWithinDistInMap(c, _range);
-        }
-
-        WorldObject const* _obj;
-        float              _range;
-    };
-}
-
 // Helper function to format class name for any player
 static std::string FormatPlayerClass(uint8_t classId)
 {
@@ -365,7 +346,7 @@ void BridgeCardFacts(Player* bot, OllamaBridge::CardFacts& facts)
     if (PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot))
         if (AreaTableEntry const* zone = botAI->GetCurrentZone())
             facts.zone = botAI->GetLocalizedAreaName(zone);
-    // WT11b: the three strongest trait words (cache read, no query), whatever EnableRPPersonalities says.
+    // WT11b: the three strongest trait words (cache read, no query).
     PlayerbotBridge::BotPersonality traits;
     if (PlayerbotBridge::ReadBotPersonality(bot->GetGUID(), traits))
         facts.traits = OllamaTraitWords::FormatCardTraits(traits.words);

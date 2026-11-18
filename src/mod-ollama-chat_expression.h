@@ -33,10 +33,6 @@ uint32_t ExtractEmoteTag(std::string& response);
 // Resolve an emote name ("wave", "waves", "waving") to TEXT_EMOTE_*. 0 if unknown.
 uint32_t LookupTextEmoteId(const std::string& name);
 
-// Reverse lookup, for describing an inbound emote to the model in words.
-// Returns an empty string for ids not in the table.
-std::string LookupTextEmoteName(uint32_t id);
-
 // Play a real text emote from the bot, targeting targetGuid (may be empty).
 // Routes through WorldSession::HandleTextEmoteOpcode so the animation, the
 // localized SMSG_TEXT_EMOTE broadcast, per-race/gender variant numbering,

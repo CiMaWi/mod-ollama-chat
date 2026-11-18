@@ -4,7 +4,7 @@
 #include "ScriptMgr.h"
 #include "ObjectGuid.h"
 
-// Hosts the module's world tick: the dispatcher, the governor and the periodic saves are pumped from here.
+// Hosts the module's world tick: the dispatcher and the governor are pumped from here.
 class OllamaBotRandomChatter : public WorldScript
 {
 public:

@@ -21,8 +21,8 @@ reference only.
 - **Bridge only.** `OllamaChat.Enable` switches the bridge path on. An enabled module without valid bridge settings
   (`OllamaChat.Bridge.Instance`, `Endpoint`, `Token`) is idle: it logs one line at config load, listens on no port,
   starts no workers and generates nothing. The wire format is `docs/bridge-channel-v1.md`.
-- **Replies to people.** When a player speaks in say, yell, party, guild, whisper or a channel, eligible bots nearby
-  may answer; the reply chances, distances and the conversation governor decide who and how often.
+- **Replies to people.** When a player speaks in say, yell, party or a whisper, eligible bots may answer (say and yell
+  only when a bot is addressed); the reply chances, distances and the conversation governor decide who and how often.
 - **Embodiment.** Bots face whoever they answer, play gestures carried in a reply, and mirror or counter emotes aimed
   at them (no bridge call).
 - **Roleplay voice.** Race and class voices and faction attitude shape the bridge's voice instruction; out-of-world
@@ -57,12 +57,12 @@ section of the config file:
 
 | Brake | What it stops |
 |---|---|
-| **The audience rule** | Bots replying to *other bots* while no real player has spoken in that channel recently. |
 | **Cooldowns and rate limits** | One bot, or one crowd, dominating a channel. Per bot, per channel and server-wide. |
 | **Repetition scoring** | The same line twice, and the same *opening phrase* twice, scored against the bot's own recent lines and the channel's recent traffic. |
 
-The chain-depth brakes (`OllamaChat.BotConversation.MaxChainDepth`, `ChanceDecayPct`) stay in the governor for a
-later bot-to-bot step; nothing calls them now.
+Only a real player's line in say, yell, party or a whisper opens a bridge request. The bot-to-bot brakes (the
+audience rule `OllamaChat.BotConversation.RequireRecentHuman`, the chain depth `MaxChainDepth` and `ChanceDecayPct`)
+stay in the governor for a later bot-to-bot step; no path reaches them now.
 
 ## Roleplay Mode
 

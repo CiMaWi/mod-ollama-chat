@@ -37,17 +37,6 @@ class PostMapJoin;
 // only place delivery happens.
 // --------------------------------------------------------------------------
 
-// Resolve the zone-scoped instance of a numbered channel (General, Trade, ...)
-// for this bot.
-//
-// ChannelMgr keys channels by their FULL name, and zone channels are named
-// "General - Elwynn Forest", not "General" -- so GetChannel("General") always
-// returns nullptr. Matching is by channel id plus zone-name containment, the
-// same way PlayerbotAI::SayToChannel does it.
-//
-// World thread only.
-Channel* OllamaResolveZoneChannel(Player* bot, uint32_t chatChannelId);
-
 // Is this guid a member of this exact channel instance?
 //
 // The playerbots fork dropped Player::IsInChannel, and the core keeps

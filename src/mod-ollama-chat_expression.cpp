@@ -306,21 +306,6 @@ uint32_t LookupTextEmoteId(const std::string& name)
     return it == table.end() ? 0u : it->second;
 }
 
-std::string LookupTextEmoteName(uint32_t id)
-{
-    if (!id)
-        return "";
-
-    // The DBC carries no usable name string for text emotes, so reverse the
-    // same table the parser uses. First match wins, which is fine because the
-    // aliases all describe the same gesture.
-    for (const auto& [name, value] : EmoteNameTable())
-        if (value == id)
-            return name;
-
-    return "";
-}
-
 uint32_t ExtractEmoteTag(std::string& response)
 {
     uint32_t    found = 0;

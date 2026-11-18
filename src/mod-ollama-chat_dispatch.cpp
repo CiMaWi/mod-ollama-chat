@@ -440,7 +440,6 @@ bool PrepareBridge(Completion& c)
         ++g_totalDelivered;
         if (c.bridgeOutcome == OllamaBridge::WorldOutcome::Success && BridgeCurrent(c))
             OllamaChat_BridgeRemember(c.request.bridgeTicket, said);
-        // Neither outage nor success enters legacy memory, history, expression, sentiment or bot-chain paths.
     }
 
     // BEGIN BRIDGE CARD DELIVERY -- extracted verbatim by the offline persona bridge check.
@@ -607,7 +606,7 @@ void OllamaDispatch_Start()
 
 void OllamaDispatch_Stop()
 {
-    // Revoke before the existing terminal legacy-pool join. Reload/tick never joins workers.
+    // Revoke before the terminal worker join. Reload/tick never joins workers.
     g_bridgeGeneration = 0;
     g_bridgeListener.Stop();  // Bounded join of the 127.0.0.1 listener before the channel it feeds is revoked.
     g_bridgeChannel.Configure(false);
@@ -957,44 +956,4 @@ namespace
 bool OllamaIsOnChannel(Channel const* channel, ObjectGuid guid)
 {
     return channel && (channel->*ChannelIsOnPtr())(guid);
-}
-
-Channel* OllamaResolveZoneChannel(Player* bot, uint32_t chatChannelId)
-{
-    if (!bot)
-        return nullptr;
-
-    ChannelMgr* mgr = ChannelMgr::forTeam(bot->GetTeamId());
-    if (!mgr)
-        return nullptr;
-
-    PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(bot);
-    std::string zoneName;
-    if (botAI)
-        if (AreaTableEntry const* zone = botAI->GetCurrentZone())
-            zoneName = PlayerbotAI::GetLocalizedAreaName(zone);
-
-    for (auto const& [key, channel] : mgr->GetChannels())
-    {
-        if (!channel || channel->GetName().empty())
-            continue;
-        if (channel->GetChannelId() != chatChannelId)
-            continue;
-
-        // Global channels (LFG, WorldDefense) are not zone-scoped.
-        const bool zoneScoped = (chatChannelId != uint32_t(ChatChannelId::LOOKING_FOR_GROUP) &&
-                                 chatChannelId != uint32_t(ChatChannelId::WORLD_DEFENSE));
-
-        if (zoneScoped)
-        {
-            if (zoneName.empty())
-                continue;
-            if (channel->GetName().find(zoneName) == std::string::npos)
-                continue;
-        }
-
-        return channel;
-    }
-
-    return nullptr;
 }
