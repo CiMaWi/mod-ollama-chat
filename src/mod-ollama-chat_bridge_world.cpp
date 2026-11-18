@@ -451,6 +451,18 @@ bool DispatchGuardCurrent(WorldTicket const& ticket, DispatchGuard const& captur
     return ticket.scope.channel == "direct";
 }
 
+bool SameScopeAndAudience(BindingCapture const& bound, BindingCapture const& current)
+{
+    auto const& was = bound.guard;
+    auto const& now = current.guard;
+    return was.scope.instance == now.scope.instance && was.scope.provider == now.scope.provider &&
+           was.scope.epoch == now.scope.epoch && was.scope.botGuid == now.scope.botGuid &&
+           was.scope.controllerGuid == now.scope.controllerGuid && was.scope.channel == now.scope.channel &&
+           was.scope.contextId == now.scope.contextId && was.source == now.source &&
+           was.speakerGuid == now.speakerGuid &&
+           (was.source != DispatchSource::Party || was.groupGuid == now.groupGuid) && was.audience == now.audience;
+}
+
 TerminalAction DispatchTerminal(WorldOutcome outcome, bool addressedHuman)
 {
     switch (outcome)

@@ -81,6 +81,23 @@ struct DispatchGuard
 bool DispatchGuardCurrent(WorldTicket const& ticket, DispatchGuard const& captured, DispatchGuard const& current,
                           Clock now);
 
+// LCB3c: one capture of a conversation by the world adapter: the trusted guard and the context the bridge sees.
+// Facts, traits and state are read for each request and are never part of a capture.
+struct BindingCapture
+{
+    DispatchGuard guard;
+    Context context;
+};
+
+// LCB3c: the adapter captures a binding afresh once per heartbeat, not on every world tick.
+constexpr int64_t BindingHeartbeatMs = WorldLivenessMs;
+
+// LCB3c: a binding is its scope and audience. A fresh capture keeps the binding while the selected world, the bot,
+// the conversation (partner, channel, context id; for a party line its group) and the sorted audience are the same.
+// Everything else a capture carries (names, the group's other members and leader, map, phase, master) and the facts,
+// traits and state of a request are taken afresh and never end the binding, so a talk survives such changes.
+bool SameScopeAndAudience(BindingCapture const& bound, BindingCapture const& current);
+
 enum class TerminalAction : uint8_t
 {
     Silence,

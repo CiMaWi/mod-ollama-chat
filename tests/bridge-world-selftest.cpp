@@ -1,4 +1,5 @@
 // Offline production value-policy checks. No server, game objects, native observer or delivery proof.
+#include <functional>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
@@ -199,6 +200,88 @@ void NoCardOnTheWire()
     Check(!Parse(Config(), ticket.request, reply.dump(), now).ok, "card: a result with a card proposal is malformed");
 }
 
+// LCB3c: a binding is its scope and audience. Over 100 ticks the facts, traits and state, the names, the place and
+// phase, the master and (for a whisper) the group change on every tick while the scope and audience stay: the binding
+// is kept on every tick. Another listener, another partner, a new epoch or (for a party line) another group ends it,
+// and a binding that takes the new capture ends exactly once.
+void BindingRule()
+{
+    auto const capture = [](DispatchSource source)
+    {
+        BindingCapture made;
+        made.guard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "direct", "", "", ""};
+        made.guard.source = source;
+        made.guard.speakerGuid = 22;
+        made.guard.groupGuid = 99;
+        made.guard.audience = {11, 22};
+        if (source == DispatchSource::Party)
+        {
+            made.guard.scope.channel = "party";
+            made.guard.audience = {11, 22, 33};
+        }
+        made.context.speakerGuid = 22;
+        made.context.channel = made.guard.scope.channel;
+        return made;
+    };
+    for (auto const source : {DispatchSource::Whisper, DispatchSource::Party})
+    {
+        BindingCapture const bound = capture(source);
+        unsigned kept = 0;
+        for (unsigned tick = 1; tick <= 100; ++tick)
+        {
+            BindingCapture current = capture(source);
+            current.context.traits.words = {"trait-" + std::to_string(tick)};
+            current.context.facts.emplace().phrase = "fact-" + std::to_string(tick);
+            current.context.state.present = true;
+            current.context.state.healthPct = static_cast<float>(tick % 100);
+            current.context.observations = {"Your name is Bot" + std::to_string(tick) + "."};
+            current.context.speakerControlsBot = tick % 2 == 0;
+            current.guard.mapId = tick;
+            current.guard.instanceId = tick * 3;
+            current.guard.phaseMask = 1u << (tick % 8);
+            current.guard.nonRaid = tick % 2 == 0;
+            if (source != DispatchSource::Party)
+            {
+                current.guard.groupGuid = tick % 3 ? 99 + tick : 0;
+                current.context.groupScope = std::to_string(current.guard.groupGuid);
+            }
+            kept += SameScopeAndAudience(bound, current);
+        }
+        Check(kept == 100, "binding: facts, traits, state, place, master and group shape keep it for 100 ticks");
+    }
+    std::vector<std::function<void(BindingCapture&)>> const ends = {
+        [](BindingCapture& c) { c.guard.audience = {11, 22, 33, 44}; },
+        [](BindingCapture& c) { c.guard.audience = {11, 33}; },
+        [](BindingCapture& c) { c.guard.groupGuid = 98; },
+        [](BindingCapture& c) { c.guard.speakerGuid = c.guard.scope.controllerGuid = 33; },
+        [](BindingCapture& c) { c.guard.scope.contextId = "another"; },
+        [](BindingCapture& c) { c.guard.scope.epoch = "epoch-2"; },
+        [](BindingCapture& c) { c.guard.scope.provider = "other"; },
+        [](BindingCapture& c) { c.guard.scope.botGuid = 12; }};
+    for (auto const& end : ends)
+    {
+        BindingCapture bound = capture(DispatchSource::Party);
+        unsigned erased = 0;
+        for (unsigned tick = 1; tick <= 100; ++tick)
+        {
+            BindingCapture current = capture(DispatchSource::Party);
+            current.context.traits.words = {"trait-" + std::to_string(tick)};
+            if (tick >= 50)
+                end(current);
+            if (!SameScopeAndAudience(bound, current))
+            {
+                ++erased;
+                bound = current;
+            }
+        }
+        Check(erased == 1, "binding: a scope or audience change ends the binding exactly once");
+    }
+    BindingCapture const whisper = capture(DispatchSource::Whisper);
+    BindingCapture changed = whisper;
+    changed.guard.source = DispatchSource::Say;
+    Check(!SameScopeAndAudience(whisper, changed), "binding: another channel of the same partner is another binding");
+}
+
 int main()
 {
     try
@@ -207,6 +290,7 @@ int main()
         OutcomesAndScopes();
         Capacity();
         NoCardOnTheWire();
+        BindingRule();
         std::cout << "PASS " << checks << " production world-policy checks\n";
     }
     catch (std::exception const& error)
