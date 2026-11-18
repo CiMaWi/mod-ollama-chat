@@ -22,16 +22,6 @@
 #include "mod-ollama-chat_persona_db.h"
 #include "mod-ollama-chat_reply_split.h"
 
-enum class OllamaProvider
-{
-    Ollama,
-    Bridge
-};
-enum class OllamaRequestKind
-{
-    ChatReply,
-    EventChatter
-};
 enum ChatChannelSourceLocal
 {
     SRC_SAY_LOCAL = 1,
@@ -171,8 +161,6 @@ std::string Roleplay_FilterMetaTerms(std::string const& text)
     ++filterCalls;
     return filterEmpty ? "" : text;
 }
-void Memory_RunCondensation(uint64_t, std::string const&) {}
-void Memory_RunRelationshipUpdate(uint64_t, uint64_t, std::string const&, std::string const&) {}
 
 struct ObjectGuid
 {

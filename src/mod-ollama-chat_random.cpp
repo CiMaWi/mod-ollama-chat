@@ -3,8 +3,6 @@
 #include "mod-ollama-chat_dispatch.h"
 #include "mod-ollama-chat_governor.h"
 #include "mod-ollama-chat_handler.h"
-#include "mod-ollama-chat_sentiment.h"
-#include "mod-ollama-chat_memory.h"
 #include "mod-ollama-chat-utilities.h"
 
 #include "Channel.h"
@@ -58,34 +56,5 @@ void OllamaBotRandomChatter::OnUpdate(uint32 diff)
         maintenanceTimer -= diff;
     }
 
-    if (g_ConversationHistorySaveInterval > 0)
-    {
-        const time_t now = time(nullptr);
-        if (difftime(now, g_LastHistorySaveTime) >= g_ConversationHistorySaveInterval * 60)
-        {
-            SaveBotConversationHistoryToDB();
-            g_LastHistorySaveTime = now;
-        }
-    }
-
-    if (g_MemoryEnable && g_MemorySaveInterval > 0)
-    {
-        const time_t now = time(nullptr);
-        if (difftime(now, g_LastMemorySaveTime) >= g_MemorySaveInterval * 60)
-        {
-            Memory_SaveAll();
-            g_LastMemorySaveTime = now;
-        }
-    }
-
-    if (g_EnableSentimentTracking && g_SentimentSaveInterval > 0)
-    {
-        const time_t now = time(nullptr);
-        if (difftime(now, g_LastSentimentSaveTime) >= g_SentimentSaveInterval * 60)
-        {
-            SaveBotPlayerSentimentsToDB();
-            g_LastSentimentSaveTime = now;
-        }
-    }
 }
 

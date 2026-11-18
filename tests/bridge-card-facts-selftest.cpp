@@ -101,9 +101,6 @@ struct PlayerbotsMgr
 std::string FormatPlayerRace(uint8 race) { return race == 4 ? "Night Elf" : race == 11 ? "Draenei" : "Unknown"; }
 std::string FormatPlayerClass(uint8 cls) { return cls == 11 ? "Druid" : cls == 2 ? "Paladin" : "Unknown"; }
 
-bool g_EnableRPPersonalities = true;
-std::unordered_map<std::uint64_t, std::string> g_BotPersonalityList;
-
 // Stand-in for mod-playerbots BridgeBotTraits.h; the switch is "the bot has trait words".
 namespace PlayerbotBridge
 {
@@ -203,34 +200,16 @@ int main()
     Check(guildFacts.race == "Draenei" && guildFacts.className == "Paladin", "race and class of the second bot");
     Check(guildFacts.zone.empty(), "no bot AI leaves the zone empty");
 
-    // 4. Without trait words: the RP fallback, only from an existing, non-default assignment while RP is on.
-    g_BotPersonalityList[922] = "default";
-    OllamaBridge::CardFacts defaultFacts;
-    Facts(branlorne, defaultFacts, "a default personality's card facts");
-    Check(defaultFacts.traits.empty(), "the default personality gives no trait word");
-    g_EnableRPPersonalities = false;
-    g_BotPersonalityList[922] = "GRUMPY_VETERAN";
-    OllamaBridge::CardFacts offFacts;
-    Facts(branlorne, offFacts, "personalities off");
-    Check(offFacts.traits.empty(), "RP personalities off and no trait words give no trait word");
-    g_EnableRPPersonalities = true;
-    OllamaBridge::CardFacts rpFacts;
-    Facts(branlorne, rpFacts, "RP on, no trait words");
-    Check(!rpFacts.traits.empty(), "RP on and no trait words falls back to the RP key's word");
+    // 4. Without trait words the card has none (the RP personality fallback went with the direct path, LC.53).
+    OllamaBridge::CardFacts noTraits;
+    Facts(branlorne, noTraits, "no trait words");
+    Check(noTraits.traits.empty(), "no trait words give no trait word");
 
-    // 5. With trait words the card gets the three strongest, without intensity, with RP off and on.
+    // 5. With trait words the card gets the three strongest, without intensity.
     PlayerbotBridge::g_traitsPresent = true;
     OllamaBridge::CardFacts traitsOn;
-    Facts(branlorne, traitsOn, "trait words, RP on");
-    Check(traitsOn.traits == "careful, devout, bookish", "trait words give the three strongest words (RP on)");
-    g_EnableRPPersonalities = false;
-    OllamaBridge::CardFacts traitsOff;
-    Facts(branlorne, traitsOff, "trait words, RP off");
-    Check(traitsOff.traits == "careful, devout, bookish", "trait words give the three strongest words (RP off)");
-    g_BotPersonalityList.clear();
-    OllamaBridge::CardFacts traitsNoKey;
-    Facts(branlorne, traitsNoKey, "trait words, no RP key");
-    Check(traitsNoKey.traits == "careful, devout, bookish", "trait words need no RP assignment");
+    Facts(branlorne, traitsOn, "trait words");
+    Check(traitsOn.traits == "careful, devout, bookish", "trait words give the three strongest words");
 
     std::printf("PASS: %d checks passed\n", g_checks);
     return 0;

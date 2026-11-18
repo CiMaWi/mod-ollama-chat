@@ -60,7 +60,7 @@ void Check(bool condition, std::string const& message)
 
 // The selection step between "Candidates" and "Final" of ProcessChat, with its own locals.
 std::vector<Player*> Select(Player* player, std::vector<Player*> const& candidateBots,
-                            ChatChannelSourceLocal sourceLocal, bool bridgeProvider, bool senderIsBot,
+                            ChatChannelSourceLocal sourceLocal, bool bridgeLink, bool senderIsBot,
                             std::string const& trimmedMsg)
 {
     uint32_t const chance = 100;

@@ -642,9 +642,8 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
                                  OllamaBridge::Context input, OllamaBridge::DispatchGuard guard, int64_t lifetimeMs)
 {
     using namespace OllamaBridge;
-    if (!g_bridgeObserver || request.kind != OllamaRequestKind::ChatReply || request.botGuid != scope.botGuid ||
-        request.targetGuid != input.speakerGuid || request.botName.size() > 128 || request.scopeKey.size() > 256 ||
-        request.directAddress != input.directAddress)
+    if (!g_bridgeObserver || request.botGuid != scope.botGuid || request.targetGuid != input.speakerGuid ||
+        request.botName.size() > 128 || request.scopeKey.size() > 256 || request.directAddress != input.directAddress)
         return false;
     DispatchSource source = DispatchSource::Unsupported;
     switch (request.source)

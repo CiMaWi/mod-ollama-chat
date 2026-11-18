@@ -26,15 +26,6 @@ extern const char* ChatChannelSourceLocalStr[];
 std::string rtrim(const std::string& s);
 ChatChannelSourceLocal GetChannelSourceLocal(uint32_t type);
 
-void SaveBotConversationHistoryToDB();
-void DeleteBotConversationHistoryFromDB(uint64_t botGuid);
-void AppendBotConversation(uint64_t botGuid, uint64_t playerGuid,
-                           const std::string& playerMessage, const std::string& botReply);
-
-// Bounded, distance-sorted snapshot helpers used by the prompt builders and
-// the topic engine.
-std::string GenerateBotGameStateSnapshot(Player* bot);
-
 class PlayerBotChatHandler : public PlayerScript
 {
 public:

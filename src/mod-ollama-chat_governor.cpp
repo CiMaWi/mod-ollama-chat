@@ -36,7 +36,6 @@ namespace
     struct BotState
     {
         TimePoint             lastSend{};
-        TimePoint             lastEvent{};
         std::deque<Utterance> history;
         std::unordered_map<uint64_t, TimePoint> emoteReactions;  // player guid -> last
 
@@ -552,19 +551,6 @@ bool Governor_TryConsumeEmoteReaction(ObjectGuid botGuid, ObjectGuid playerGuid)
         return false;
 
     last = now;
-    return true;
-}
-
-bool Governor_TryConsumeEventCooldown(ObjectGuid botGuid)
-{
-    std::lock_guard<std::mutex> lock(g_mutex);
-    const TimePoint now = Clock::now();
-
-    BotState& bot = g_bots[botGuid.GetRawValue()];
-    if (SecondsSince(bot.lastEvent, now) < double(g_EventCooldownTime))
-        return false;
-
-    bot.lastEvent = now;
     return true;
 }
 

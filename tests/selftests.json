@@ -1,10 +1,6 @@
 {
     "tests": [
         {
-            "file": "api-selftest.cpp",
-            "baseline": "needs core headers (boost, IoContext) and a generated config-excerpt.inc; no runner in the repo"
-        },
-        {
             "file": "bridge-card-facts-selftest.cpp",
             "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
         },

@@ -24,16 +24,6 @@
 #include "mod-ollama-chat_persona_db.h"
 #include "mod-ollama-chat_reply_split.h"
 
-enum class OllamaProvider
-{
-    Ollama,
-    Bridge
-};
-enum class OllamaRequestKind
-{
-    ChatReply,
-    EventChatter
-};
 enum ChatChannelSourceLocal
 {
     SRC_SAY_LOCAL = 1,

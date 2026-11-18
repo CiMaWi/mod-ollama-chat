@@ -3,7 +3,6 @@
 #include "mod-ollama-chat_random.h"
 #include "mod-ollama-chat_command.h"
 #include "mod-ollama-chat_expression.h"
-#include "mod-ollama-chat_rag.h"
 #include "mod-ollama-chat_persona_db.h"
 #include "Log.h"
 

@@ -1,7 +1,6 @@
 #ifndef MOD_OLLAMA_CHAT_DISPATCH_H
 #define MOD_OLLAMA_CHAT_DISPATCH_H
 
-#include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_handler.h"
 #include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_world.h"
@@ -83,9 +82,6 @@ struct OllamaChatRequest
     // carried here so delivery does not have to guess it back from `source`.
     // Direct address skips the pacing cooldowns and repetition suppression.
     bool directAddress = false;
-
-    // Generation.
-    OllamaRequestKind kind = OllamaRequestKind::ChatReply;
 
     // Resolved on the world thread before submission so the worker never has
     // to touch a Player to know these.
