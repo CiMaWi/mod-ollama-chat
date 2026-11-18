@@ -219,13 +219,13 @@ struct Fixture
         Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::NoLiveCaptures), "select epoch");
         g_bridgeChannel.Configure(true);
         Check(g_bridgeChannel.Activate(), "activate production dispatcher mailbox");
-        BridgeView view;
+        BindingCapture view;
         Check(BridgeCapture(11, 22, DispatchSource::Whisper, view), "capture production game scope");
         auto& scope = view.guard.scope;
         scope.contextRevision = scope.membershipRevision = scope.perceptionScope = "rev1";
         guard = view.guard;
         Check(g_bridgeWorld.ObserveScope(scope, clockNow), "observe trusted scope");
-        g_bridgeBindings.push_back({g_bridgeWorld.Generation(), view, CaptureDeadline(clockNow, WorldLivenessMs),
+        g_bridgeBindings.push_back({g_bridgeWorld.Generation(), view, CaptureDeadline(clockNow, BindingHeartbeatMs),
                                     CaptureDeadline(clockNow, MaxLifetimeMs), ""});
         auto input = view.context;
         input.text = "What can we see?";

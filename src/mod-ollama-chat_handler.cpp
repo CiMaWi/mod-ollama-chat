@@ -397,7 +397,7 @@ static_assert(OllamaBridge::MaxStateDeedBytes == RecordWords::MAX_SENTENCE,
 static_assert(OllamaBridge::MaxStateAround == PlayerbotBridge::MaxAround, "the wire carries every listed name");
 
 // LC10: the bot's lasting facts (playerbots ReadBotFacts, world thread, in memory) with who it is from the bot's own
-// getters, and its trait words (cache read). Per request like the state, never in a capture or a signature;
+// getters, and its trait words (cache read). Per request like the state, never in a capture;
 // Build bounds every value and leaves out what is empty. No database access.
 void BridgeFactsAndTraits(Player* bot, OllamaBridge::Context& input)
 {
@@ -606,32 +606,19 @@ std::string BridgeWakeScopeKey(Player* partner, ChatChannelSourceLocal source)
 // BEGIN BRIDGE WORLD ADAPTER -- extracted verbatim by the offline game-adapter checks.
 namespace
 {
-struct BridgeView
-{
-    OllamaBridge::DispatchGuard guard;
-    OllamaBridge::Context context;
-    std::string signature;
-};
-
 struct BridgeBinding
 {
     uint64_t generation = 0;
-    BridgeView view;
-    OllamaBridge::Deadline heartbeat;
+    OllamaBridge::BindingCapture view;
+    OllamaBridge::Deadline heartbeat;  // LCB3c: the next capture is due then.
     OllamaBridge::Deadline idleUntil;
     std::string memory;
 };
 
-// World-thread only. Entries contain values, never Player/Group pointers. Refresh work is at most 64 * 40 members.
+// World-thread only. Entries contain values, never Player/Group pointers. A refresh captures a binding once per
+// heartbeat (at most 64 * 40 members), not on every world tick.
 std::vector<BridgeBinding> g_bridgeBindings;
 uint64_t g_bridgeRevision = 0;
-
-void BridgeField(std::string& signature, std::string_view value)
-{
-    signature += std::to_string(value.size());
-    signature += ':';
-    signature += value;
-}
 
 bool BridgeHuman(Player* player)
 {
@@ -719,8 +706,8 @@ public:
 };
 
 // J5e: `why` names the first failed rule; every false return sets it.
-bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::DispatchSource source, BridgeView& view,
-                   char const** why = nullptr)
+bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::DispatchSource source,
+                   OllamaBridge::BindingCapture& view, char const** why = nullptr)
 {
     using namespace OllamaBridge;
     auto const drop = [why](char const* reason)
@@ -792,13 +779,6 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
             guard.audience = members;
     }
     std::sort(guard.audience.begin(), guard.audience.end());
-    BridgeField(view.signature, std::to_string(guard.scope.controllerGuid));
-    BridgeField(view.signature, std::to_string(guard.groupGuid));
-    BridgeField(view.signature, group ? std::to_string(group->GetLeaderGUID().GetRawValue()) : "0");
-    BridgeField(view.signature, std::to_string(distance));
-    for (auto guid : members)
-        BridgeField(view.signature, std::to_string(guid));
-    BridgeField(view.signature, "audience");
     for (auto guid : guard.audience)
     {
         Player* participant = ObjectAccessor::FindConnectedPlayer(ObjectGuid(guid));
@@ -809,15 +789,7 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
             (source == DispatchSource::Party && participant->GetGroup() != group))
             return drop("audience");
         view.context.party.push_back({guid, participant->GetName(), "", -1, 0});
-        BridgeField(view.signature, std::to_string(guid));
-        BridgeField(view.signature, participant->GetName());
-        BridgeField(view.signature, std::to_string(participant->GetPhaseMask()));
-        BridgeField(view.signature, OllamaIsRealPlayer(participant) ? "human" : "bot");
     }
-    BridgeField(view.signature, std::to_string(speaker->GetPhaseMask()));
-    BridgeField(view.signature, std::to_string(guard.mapId));
-    BridgeField(view.signature, std::to_string(guard.instanceId));
-    BridgeField(view.signature, std::to_string(guard.phaseMask));
     view.context.speakerGuid = speakerGuid;
     view.context.channel = guard.scope.channel;
     view.context.groupScope = group ? std::to_string(guard.groupGuid) : "";
@@ -826,10 +798,20 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     return true;
 }
 
-bool BridgeSame(BridgeBinding const& binding, BridgeView const& current)
+// LCB3c: a binding lives while the world generation and its scope and audience hold (SameScopeAndAudience).
+bool BridgeSame(BridgeBinding const& binding, OllamaBridge::BindingCapture const& current)
 {
     return binding.generation == OllamaDispatch_BridgeWorld().Generation() &&
-           binding.view.guard.scope.epoch == current.guard.scope.epoch && binding.view.signature == current.signature;
+           OllamaBridge::SameScopeAndAudience(binding.view, current);
+}
+
+// LCB3c: a kept binding takes the fresh capture (names, group, place, whether the partner leads the bot) under its own
+// scope and revisions, and its next capture is one heartbeat away.
+void BridgeKeep(BridgeBinding& binding, OllamaBridge::BindingCapture&& current, OllamaBridge::Clock now)
+{
+    current.guard.scope = binding.view.guard.scope;
+    binding.view = std::move(current);
+    binding.heartbeat = OllamaBridge::CaptureDeadline(now, OllamaBridge::BindingHeartbeatMs);
 }
 
 void BridgeErase(std::vector<BridgeBinding>::iterator it)
@@ -839,8 +821,9 @@ void BridgeErase(std::vector<BridgeBinding>::iterator it)
     g_bridgeBindings.erase(it);
 }
 
-// Fresh capture of the ticket's binding. A failed or changed capture erases the binding and returns end.
-std::vector<BridgeBinding>::iterator BridgeObserveFresh(OllamaBridge::WorldTicket const& ticket, BridgeView& current)
+// Fresh capture of the ticket's binding. A failed capture or another scope or audience erases the binding and
+// returns end; a kept binding holds the fresh capture.
+std::vector<BridgeBinding>::iterator BridgeObserveFresh(OllamaBridge::WorldTicket const& ticket)
 {
     auto it = std::find_if(g_bridgeBindings.begin(), g_bridgeBindings.end(), [&](BridgeBinding const& item)
                            { return item.generation == ticket.generation && item.view.guard.scope == ticket.scope; });
@@ -848,13 +831,15 @@ std::vector<BridgeBinding>::iterator BridgeObserveFresh(OllamaBridge::WorldTicke
         return it;
     auto const now = OllamaBridge::Now();
     auto const& captured = it->view.guard;
-    bool const fresh = !OllamaBridge::Expired(it->heartbeat, now) && !OllamaBridge::Expired(it->idleUntil, now) &&
-                       BridgeCapture(captured.scope.botGuid, captured.speakerGuid, captured.source, current);
-    if (!fresh || !BridgeSame(*it, current))
+    OllamaBridge::BindingCapture current;
+    if (OllamaBridge::Expired(it->idleUntil, now) ||
+        !BridgeCapture(captured.scope.botGuid, captured.speakerGuid, captured.source, current) ||
+        !BridgeSame(*it, current))
     {
         BridgeErase(it);
         return g_bridgeBindings.end();
     }
+    BridgeKeep(*it, std::move(current), now);
     return it;
 }
 
@@ -883,8 +868,7 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     if (text.empty() || text.size() > MaxTextBytes ||
         ((origin == DispatchSource::Say || origin == DispatchSource::Yell) && !addressed && !wake))
         return false;
-    OllamaChat_BridgeRefresh();
-    BridgeView view;
+    BindingCapture view;
     char const* why = nullptr;
     if (!BridgeCapture(bot->GetGUID().GetRawValue(), speaker->GetGUID().GetRawValue(), origin, view, &why))
     {
@@ -919,17 +903,17 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
                                return item.view.guard.scope.botGuid == view.guard.scope.botGuid &&
                                       item.view.guard.scope.contextId == view.guard.scope.contextId;
                            });
-    // DS.14: speakerControlsBot is descriptive and stays out of the signature (a follow may make the partner the bot's
-    // master without ending the conversation), so a kept binding takes the fresh capture's value.
-    bool const speakerControlsBot = view.context.speakerControlsBot;
     auto const now = Now();
-    // A changed capture renews the binding: a new revision, a native context reset and no remembered exchange.
-    if (it != g_bridgeBindings.end() && !BridgeSame(*it, view))
+    // LCB3c: another scope or audience renews the binding: a new revision, a native context reset and no remembered
+    // exchange. A kept binding takes this capture; the line's own capture also counts as its heartbeat.
+    if (it != g_bridgeBindings.end() && (Expired(it->idleUntil, now) || !BridgeSame(*it, view)))
     {
         BridgeErase(it);
         it = g_bridgeBindings.end();
     }
-    if (it == g_bridgeBindings.end())
+    if (it != g_bridgeBindings.end())
+        BridgeKeep(*it, std::move(view), now);
+    else
     {
         if (g_bridgeBindings.size() >= MaxWorldScopes || g_bridgeRevision == UINT64_MAX)
             return false;
@@ -939,12 +923,11 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
         if (!OllamaDispatch_BridgeWorld().ObserveScope(scope, now))
             return false;
         g_bridgeBindings.push_back({OllamaDispatch_BridgeWorld().Generation(), std::move(view),
-                                    CaptureDeadline(now, WorldLivenessMs), CaptureDeadline(now, MaxLifetimeMs)});
+                                    CaptureDeadline(now, BindingHeartbeatMs), CaptureDeadline(now, MaxLifetimeMs)});
         it = std::prev(g_bridgeBindings.end());
     }
     it->idleUntil = CaptureDeadline(now, MaxLifetimeMs);
     auto input = it->view.context;
-    input.speakerControlsBot = speakerControlsBot;
     input.text = text;
     input.directAddress = addressed;
     // J6e-c: a chain starts at the player's line; a wake carries its watch's origin, depth and condition.
@@ -987,33 +970,36 @@ void OllamaChat_BridgeRefresh()
     OllamaDispatch_BridgeWorld().Expire(now);
     for (auto it = g_bridgeBindings.begin(); it != g_bridgeBindings.end();)
     {
-        BridgeView current;
-        auto const& guard = it->view.guard;
-        bool const fresh = !Expired(it->heartbeat, now) && !Expired(it->idleUntil, now) &&
-                           BridgeCapture(guard.scope.botGuid, guard.speakerGuid, guard.source, current);
-        if (!fresh || !BridgeSame(*it, current) || !OllamaDispatch_BridgeWorld().ObserveScope(guard.scope, now))
+        // Every tick: the world generation, the lifetime and the scope's liveness (cheap). LCB3c: the game capture
+        // only when the binding's heartbeat is due.
+        bool keep = it->generation == OllamaDispatch_BridgeWorld().Generation() && !Expired(it->idleUntil, now);
+        if (keep && Expired(it->heartbeat, now))
+        {
+            BindingCapture current;
+            auto const& guard = it->view.guard;
+            keep = BridgeCapture(guard.scope.botGuid, guard.speakerGuid, guard.source, current) &&
+                   BridgeSame(*it, current);
+            if (keep)
+                BridgeKeep(*it, std::move(current), now);
+        }
+        if (keep && OllamaDispatch_BridgeWorld().ObserveScope(it->view.guard.scope, now))
+            ++it;
+        else
         {
             auto const index = it - g_bridgeBindings.begin();
             BridgeErase(it);
             it = g_bridgeBindings.begin() + index;
-        }
-        else
-        {
-            it->heartbeat = CaptureDeadline(now, WorldLivenessMs);
-            ++it;
         }
     }
 }
 
 bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard)
 {
-    BridgeView current;
-    auto const it = BridgeObserveFresh(ticket, current);
+    auto const it = BridgeObserveFresh(ticket);
     if (it == g_bridgeBindings.end())
         return false;
     // Equality was established from fresh GUID resolution; revisions cannot be resurrected by matching values later.
-    guard = std::move(current.guard);
-    guard.scope = it->view.guard.scope;
+    guard = it->view.guard;
     return true;
 }
 

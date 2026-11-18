@@ -66,7 +66,7 @@ struct Participant
 };
 
 // DS.14/J5f: the bot's own state for one request, raw as playerbots read it on world (BridgeBotState). It changes
-// constantly, so it is never part of a capture signature. The envelope filters it
+// constantly, so it is never part of a capture. The envelope filters it
 // (the partner only in the bot's group or in its sight, only the bot's own visible victim) and bounds every value;
 // strings follow the fact rule (MaxFactBytes, no controls, valid UTF-8). Absent from the wire unless present.
 constexpr uint8_t StatePlanMovement = 1;  // Bits of BotState::plans, in PlanKind order.
@@ -183,7 +183,7 @@ struct Context
     std::vector<std::string> observations;
     std::vector<Participant> party;
     BotState state;  // Per request, filled at submit; never in a capture.
-    // LC10: per request like state, filled at submit; never in a capture or a signature.
+    // LC10: per request like state, filled at submit; never in a capture.
     std::optional<BotFacts> facts;
     BotTraits traits;
     // J6e-c: a wake request carries its condition and watch id as `input.wake`; depth and origin stay in the module

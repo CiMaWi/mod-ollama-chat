@@ -233,12 +233,14 @@ struct Channel
 struct OllamaWorldSnapshot
 {
 };
+unsigned findCalls = 0;  // LCB3c: game reads in adapter mode, to count captures.
 struct ObjectAccessor
 {
     static Player* FindConnectedPlayer(ObjectGuid guid)
     {
         if (adapterMode)
         {
+            ++findCalls;
             for (auto& player : players)
                 if (player.guid == guid.value && player.online)
                     return &player;
@@ -265,7 +267,7 @@ struct PlayerbotsMgr
     }
 };
 // J5f: the bot-state reader (playerbots, outside the extract) is a stand-in too. Each call reads 10 points less
-// health, the rest stays fixed; the marker zone shows whether state leaked into a signature or a prompt.
+// health, the rest stays fixed; the marker zone shows whether state leaked into a capture or a prompt.
 unsigned stateFactsCalls = 0;
 void BridgeBotStateFacts(Player*, Player*, OllamaBridge::BotState& state)
 {
@@ -275,13 +277,20 @@ void BridgeBotStateFacts(Player*, Player*, OllamaBridge::BotState& state)
     state.alive = true;
     state.zone = "MARKERZONE";
 }
-// LC10: the facts and traits gatherer (outside the extract) is a stand-in too; its marker shows a leak.
+// LC10: the facts and traits gatherer (outside the extract) is a stand-in too; its marker shows a leak. LCB3c: a
+// nonzero factsTick changes the facts and traits of every request.
 unsigned factsCalls = 0;
+unsigned factsTick = 0;
 void BridgeFactsAndTraits(Player*, OllamaBridge::Context& input)
 {
     ++factsCalls;
     input.facts.emplace().phrase = "MARKERFACT";
     input.traits.words = {"MARKERTRAIT"};
+    if (factsTick)
+    {
+        input.facts->phrase += std::to_string(factsTick);
+        input.traits.words.push_back("trait" + std::to_string(factsTick));
+    }
 }
 // J5f-b: the topic reader (playerbots, outside the extract); not exercised here.
 bool BridgeBotStateTopic(uint64_t, OllamaBridge::StateTopic, std::string const&,
@@ -924,11 +933,9 @@ void AdapterTests()
                                                      players[3].online = false;
                                                      party.members.push_back({ObjectGuid(44)});
                                                  },
-                                                 [] { players[2].name = "Renamed"; },
                                                  [] { g_DisableForParty = true; },
                                                  [] { g_Enable = false; },
-                                                 [] { g_bridgeBindings[0].heartbeat.unixMs = 1; },
-                                                 [] { g_bridgeBindings[0].heartbeat.steadyMs = 1; },
+                                                 [] { g_bridgeBindings[0].idleUntil.unixMs = 1; },
                                                  [] { g_bridgeBindings[0].idleUntil.steadyMs = 1; }};
     for (auto const& lose : losses)
     {
@@ -1088,7 +1095,7 @@ void AdapterTests()
     Check(!g_bridgeBindings.empty(), "J5e: the out-of-sight whisper binding survives a refresh");
     for (auto const source : {DispatchSource::Say, DispatchSource::Party})
     {
-        BridgeView view;
+        OllamaBridge::BindingCapture view;
         char const* why = nullptr;
         Check(!BridgeCapture(players[0].guid, players[2].guid, source, view, &why) && why &&
                   std::string(why) == "out_of_range",
@@ -1100,6 +1107,7 @@ void AdapterTests()
     done = Finish();
     auto const old = done.request.bridgeTicket;
     players[2].visible = false;
+    g_bridgeBindings[0].heartbeat.steadyMs = 1;  // LCB3c: the next capture is due.
     OllamaChat_BridgeRefresh();
     players[2].visible = true;
     Check(AdapterSubmit(), "fresh eligibility permits new request");
@@ -1114,7 +1122,7 @@ void AdapterTests()
     DeliverBridge(done, {});
     Check(g_bridgeBindings[0].memory.empty(), "outage is not an exchange memory");
     done = {};
-    for (unsigned loss = 0; loss < 5; ++loss)
+    for (unsigned loss = 0; loss < 4; ++loss)
     {
         AdapterFixture();
         Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Private memory marker"), "memory invalidation fixture");
@@ -1126,17 +1134,16 @@ void AdapterTests()
         if (loss == 0)
             players[2].inWorld = false;  // J5e: a whisper ignores distance and sight, not presence
         else if (loss == 1)
-            g_bridgeBindings[0].heartbeat.unixMs = 1;
+            g_bridgeBindings[0].idleUntil.unixMs = 1;
         else if (loss == 2)
-            g_bridgeBindings[0].heartbeat.steadyMs = 1;
-        else if (loss == 3)
-            party.members.push_back({ObjectGuid(44)});
+            g_bridgeBindings[0].idleUntil.steadyMs = 1;
         else
         {
             g_bridgeWorld.Configured(true, config.bridge, "new-epoch");
             Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::NoLiveCaptures), "reload selected");
             g_bridgeGeneration = g_bridgeWorld.Generation();
         }
+        g_bridgeBindings[0].heartbeat.steadyMs = 1;  // LCB3c: the next capture is due.
         OllamaChat_BridgeRefresh();
         Check(g_bridgeBindings.empty(), "loss or reload erases actual stored memory");
         players[2].inWorld = true;
@@ -1173,7 +1180,7 @@ void AdapterTests()
 
 // J5f (DS.14 (d)): the bot state is read on world for every request, outside the capture. Two messages whose
 // state differs only in health keep the same binding (BridgeSame, no renewal) and each request carries its own
-// reading; a refresh reads no state; no state value reaches the binding or its signature.
+// reading; a refresh reads no state; no state value reaches the binding.
 void StateTests()
 {
     AdapterFixture();
@@ -1191,16 +1198,89 @@ void StateTests()
     Check(second.scope == first.scope && g_bridgeBindings.size() == 1,
           "state: a health-only difference stays BridgeSame (no renewal)");
     auto const leaks = [](std::string const& text) { return text.find("MARKERZONE") != std::string::npos; };
-    Check(!leaks(g_bridgeBindings[0].view.signature) && g_bridgeBindings[0].view.context.state.zone.empty(),
-          "state: no state value in the binding or its signature");
-    auto const marked = [](std::string const& text)
-    { return text.find("MARKERFACT") != std::string::npos || text.find("MARKERTRAIT") != std::string::npos; };
+    Check(!leaks(g_bridgeBindings[0].view.context.state.zone), "state: no state value in the binding");
     Check(factsCalls == 2 && first.request.input.facts && second.request.input.facts &&
               second.request.input.facts->phrase == "MARKERFACT" && second.request.input.traits.words.size() == 1,
           "facts: each request reads the facts and traits at submit");
-    Check(!g_bridgeBindings[0].view.context.facts && g_bridgeBindings[0].view.context.traits.words.empty() &&
-              !marked(g_bridgeBindings[0].view.signature),
-          "facts: no fact or trait in the binding or its signature");
+    Check(!g_bridgeBindings[0].view.context.facts && g_bridgeBindings[0].view.context.traits.words.empty(),
+          "facts: no fact or trait in the binding");
+    g_queue.clear();
+}
+
+// LCB3c: a binding is its scope and audience. For 100 world ticks the facts and traits of every request, the bot's
+// place and phase, its master, its group's leader and members and the partner's distance change while the partner
+// and the audience of a whisper stay: one binding, one scope, its memory kept, and the refresh captured only on the
+// ticks whose heartbeat had lapsed (every tenth). Another listener on a party line then ends its binding once.
+void BindingTests()
+{
+    AdapterFixture();
+    gameAI.master = nullptr;
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Remember me."), "binding: whisper admitted");
+    auto const firstTraits = g_queue.back().request.bridgeTicket.request.input.traits.words;
+    Completion done = Finish();
+    Check(PrepareBridge(done), "binding: whisper prepared");
+    DeliverBridge(done, {});
+    Check(g_bridgeBindings.size() == 1 && !g_bridgeBindings[0].memory.empty(), "binding: the exchange is remembered");
+    auto const scope = g_bridgeBindings[0].view.guard.scope;
+    std::vector<std::string> lastTraits;
+    unsigned captures = 0;
+    bool offBeat = false;
+    for (unsigned tick = 1; tick <= 100; ++tick)
+    {
+        factsTick = tick;
+        players[0].map = players[2].map = tick;
+        players[0].phase = players[2].phase = 1u << (tick % 4);
+        players[2].distance = 30.0f * static_cast<float>(tick);
+        gameAI.master = tick % 3 == 0 ? &players[2] : tick % 3 == 1 ? &players[1] : nullptr;
+        party.leader = tick % 2 ? 22 : 33;
+        if (tick == 30)
+            party.members.push_back({ObjectGuid(44)});
+        if (tick == 60)
+            party.members.pop_back();
+        bool const due = tick % 10 == 0;
+        if (due)
+            g_bridgeBindings[0].heartbeat.steadyMs = 1;
+        unsigned const before = findCalls;
+        OllamaChat_BridgeRefresh();
+        if (findCalls != before)
+            ++captures;
+        offBeat = offBeat || (findCalls != before && !due);
+        if (tick % 25 == 0)
+        {
+            Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Still there?"), "binding: a later line admitted");
+            lastTraits = g_queue.back().request.bridgeTicket.request.input.traits.words;
+            done = Finish();
+            Check(PrepareBridge(done), "binding: a later line prepared");
+            DeliverBridge(done, {});
+        }
+        Check(g_bridgeBindings.size() == 1 && g_bridgeBindings[0].view.guard.scope == scope,
+              "binding: the binding survives facts, traits, place, master and group changes");
+    }
+    factsTick = 0;
+    Check(captures == 10 && !offBeat, "binding: the refresh captured once per lapsed heartbeat, never between");
+    Check(!g_bridgeBindings[0].memory.empty() && !lastTraits.empty() && lastTraits != firstTraits,
+          "binding: the memory survives while each request carried its own traits");
+    Check(g_bridgeBindings[0].view.guard.mapId == 100, "binding: a kept binding holds the fresh capture");
+    g_queue.clear();
+
+    AdapterFixture();
+    Check(AdapterSubmit(), "binding: party line admitted");
+    g_queue.clear();
+    auto const partyScope = g_bridgeBindings[0].view.guard.scope;
+    party.members.push_back({ObjectGuid(44)});  // players[3] joins the party: another listener.
+    unsigned erased = 0;
+    for (unsigned tick = 1; tick <= 20; ++tick)
+    {
+        bool const had = !g_bridgeBindings.empty();
+        if (had && tick % 10 == 0)
+            g_bridgeBindings[0].heartbeat.steadyMs = 1;
+        OllamaChat_BridgeRefresh();
+        erased += had && g_bridgeBindings.empty();
+    }
+    Check(erased == 1, "binding: another listener ends the party binding exactly once");
+    Check(AdapterSubmit() && !(g_bridgeBindings[0].view.guard.scope == partyScope) &&
+              g_bridgeBindings[0].view.guard.audience.size() == 4,
+          "binding: the new audience opens a new binding");
     g_queue.clear();
 }
 
@@ -1454,6 +1534,7 @@ int main()
         DrainTest();
         AdapterTests();
         StateTests();
+        BindingTests();
         g_queue.clear();
         g_done.clear();
         Check(!OllamaBridge::DispatchSlot::Used(), "final no leaked slots");
