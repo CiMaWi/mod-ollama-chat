@@ -88,7 +88,7 @@ static std::string FormatPlayerRace(uint8_t raceId)
 }
 
 // DS.14/J5f: the bot's own state for one request, read by playerbots on world (the chat hook, map threads idle), with
-// the bot's live bridge plans beside it; the envelope filters and bounds it. Outside the extracted adapter.
+// the bot's live bridge plans beside it; the envelope filters and bounds it.
 void BridgeBotStateFacts(Player* bot, Player* partner, OllamaBridge::Context& input)
 {
     input.statePlans = 0;
@@ -300,7 +300,6 @@ std::string BridgeWakeScopeKey(Player* partner, ChatChannelSourceLocal source)
                                  group ? group->GetGUID().GetCounter() : partner->GetZoneId());
 }
 
-// BEGIN BRIDGE WORLD ADAPTER -- extracted verbatim by the offline game-adapter checks.
 namespace
 {
 struct BridgeBinding
@@ -753,4 +752,3 @@ bool OllamaChat_BridgeWake(OllamaBridge::Watch const& watch)
     return BridgeSubmit(bot, partner, source, WakeText(watch.condition), false, BridgeWakeScopeKey(partner, source),
                         &watch);
 }
-// END BRIDGE WORLD ADAPTER

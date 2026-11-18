@@ -437,7 +437,6 @@ bool PrepareBridge(Completion& c)
             OllamaChat_BridgeRemember(c.request.bridgeTicket, said);
     }
 
-    // BEGIN BRIDGE DELIVERY -- extracted verbatim by the offline speech routing check.
     void DeliverBridge(Completion const& c, OllamaWorldSnapshot const& world)
     {
         if (!BridgeCurrent(c) || !g_bridgeWorld.Consume(c.request.bridgeTicket, OllamaBridge::Now()))
@@ -450,7 +449,6 @@ bool PrepareBridge(Completion& c)
         } release{c.request.bridgeTicket};
         DeliverBridgeLine(c, world);
     }
-    // END BRIDGE DELIVERY
 }
 
 // --------------------------------------------------------------------------
