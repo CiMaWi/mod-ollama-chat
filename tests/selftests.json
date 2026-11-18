@@ -112,7 +112,28 @@
         },
         {
             "file": "bridge-query-dispatch-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "includes": [
+                "tests/doubles",
+                "src",
+                "../mod-playerbots/src/Bot",
+                "{playerbots}/src/Bot/Debug",
+                "{core}/deps/fmt/include",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp",
+                "src/mod-ollama-chat_bridge_listener.cpp"
+            ],
+            "flags": [
+                "/DFMT_HEADER_ONLY",
+                "-Wno-mismatched-tags",
+                "-Wno-missing-field-initializers",
+                "ws2_32.lib"
+            ],
+            "success": "PASS \\d+ query dispatch checks"
         },
         {
             "file": "bridge-query-selftest.cpp",
@@ -147,7 +168,28 @@
         },
         {
             "file": "bridge-speech-routing-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "includes": [
+                "tests/doubles",
+                "src",
+                "../mod-playerbots/src/Bot",
+                "{playerbots}/src/Bot/Debug",
+                "{core}/deps/fmt/include",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp",
+                "src/mod-ollama-chat_bridge_listener.cpp"
+            ],
+            "flags": [
+                "/DFMT_HEADER_ONLY",
+                "-Wno-mismatched-tags",
+                "-Wno-missing-field-initializers",
+                "ws2_32.lib"
+            ],
+            "success": "\\d+ bridge speech routing checks passed"
         },
         {
             "file": "bridge-state-selftest.cpp",

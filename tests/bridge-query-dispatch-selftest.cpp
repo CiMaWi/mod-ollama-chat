@@ -1,18 +1,22 @@
-// Exact production Player/Group adapter and dispatcher channel glue, with controlled world objects.
-// Actual query/world/channel translation units and serialization; no server, native transport or provider.
+// The query route end to end: the world adapter and the dispatcher compiled whole (this file includes both production
+// .cpp files after its own doubles of the game; tests/doubles names the game headers), with the query, world and
+// channel units and serialization linked, and controlled world objects. No server, native transport or provider.
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <iostream>
 #include <list>
 #include <nlohmann/json.hpp>
+#include <span>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
+#include "SharedDefines.h"
 #include "mod-ollama-chat_bridge_query.h"
-
-using namespace OllamaBridge;
-using Json = nlohmann::json;
 
 namespace
 {
@@ -26,7 +30,9 @@ void Check(bool value, char const* label)
     if (!value)
         throw std::runtime_error(label);
 }
+}  // namespace
 
+// --- game doubles (tests/doubles/game-doubles.h) ---------------------------
 struct ObjectGuid
 {
     uint64_t value = 0;
@@ -37,6 +43,9 @@ struct ObjectGuid
 };
 struct Group;
 struct Player;
+struct Guild
+{
+};
 struct Unit
 {
     virtual ~Unit() = default;
@@ -74,6 +83,15 @@ struct Player : Unit
     Group* GetGroup() const { return group; }
     uint32_t GetTeamId() const { return team; }
     Player* ToPlayer() override { return this; }
+    uint8_t getRace() const { return RACE_HUMAN; }
+    uint8_t getClass() const { return CLASS_WARRIOR; }
+    uint8_t getGender() const { return GENDER_MALE; }
+    uint8_t GetLevel() const { return 10; }
+    uint32_t GetZoneId() const { return 12; }
+    bool InBattleground() const { return false; }
+    bool InArena() const { return false; }
+    Guild* GetGuild() const { return nullptr; }
+    uint32_t GetGuildId() const { return 0; }
 };
 struct Group
 {
@@ -94,15 +112,36 @@ struct Group
         return std::any_of(members.begin(), members.end(), [&](Slot const& item) { return item.guid == guid; });
     }
 };
-Player players[3];
-Unit enemy;
-Group party;
+// No check routes a chat line: every send is refused.
 struct PlayerbotAI
 {
     Player* master = nullptr;
     Player* GetMaster() { return master; }
     bool IsBotAI() const { return true; }
-} ai;
+    bool Say(std::string const&) { return false; }
+    bool Yell(std::string const&) { return false; }
+    bool Whisper(std::string const&, std::string const&) { return false; }
+    bool SayToParty(std::string const&) { return false; }
+    bool SayToRaid(std::string const&) { return false; }
+    bool SayToGuild(std::string const&) { return false; }
+};
+struct Channel
+{
+    bool IsOn(ObjectGuid) const { return false; }
+    void Say(ObjectGuid, std::string const&, uint32_t) {}
+};
+struct ChannelMgr
+{
+    static ChannelMgr* forTeam(uint32_t) { return nullptr; }
+    Channel* GetChannel(std::string const&, Player*) { return nullptr; }
+};
+namespace
+{
+Player players[3];
+Unit enemy;
+Group party;
+PlayerbotAI ai;
+}  // namespace
 struct PlayerbotsMgr
 {
     static PlayerbotsMgr& instance()
@@ -131,58 +170,127 @@ struct ObjectAccessor
         return FindConnectedPlayer(guid);
     }
 };
+namespace Acore
+{
+struct AnyPlayerInObjectRangeCheck
+{
+    AnyPlayerInObjectRangeCheck(Player*, float, bool, bool) {}
+};
+template <typename Check>
+struct PlayerListSearcher
+{
+    std::list<Player*>& found;
+    PlayerListSearcher(Player*, std::list<Player*>& list, Check&) : found(list) {}
+};
+namespace Crypto
+{
+template <std::size_t Size>
+std::array<uint8_t, Size> GetRandomBytes()
+{
+    return {};
+}
+}  // namespace Crypto
+}  // namespace Acore
+struct Cell
+{
+    template <typename Searcher>
+    static void VisitObjects(Player*, Searcher&, float)
+    {
+    }
+};
+#define OLLAMA_SELFTEST_GAME_DOUBLES
+
+// --- the production units ---------------------------------------------------
+#include "../src/mod-ollama-chat_bridge_adapter.cpp"
+#include "../src/mod-ollama-chat_dispatch.cpp"
+
+// --- doubles of the module's other units ------------------------------------
+bool g_DebugEnabled = false;
+bool g_EnableTypingSimulation = false;
+uint32_t g_TypingSimulationBaseDelay = 100;
+uint32_t g_TypingSimulationDelayPerChar = 10;
+uint32_t g_TypingSimulationMaxDelay = 1000;
+uint32_t g_MaxQueueDepth = 64;
+uint32_t g_DispatchWorkerThreads = 1;
+uint32_t g_MaxReplyLength = 240;
 bool g_Enable = true;
 bool g_EnableWhisperReplies = true;
-bool g_DisableForParty = false;
 bool g_DisableForSayYell = false;
-float g_SayDistance = 25;
-float g_YellDistance = 100;
-#define LOG_INFO(...) ((void)0)
-bool OllamaIsRealPlayer(Player* player) { return player && player->human; }
+bool g_DisableForParty = false;
+bool g_DisableForGuild = false;
+float g_SayDistance = 25.0f;
+float g_YellDistance = 100.0f;
+const char* ChatChannelSourceLocalStr[] = {"Undefined", "Say", "Party", "Raid", "Guild", "Officer", "Yell", "Whisper"};
 
-Clock clockNow;
-WorldPolicy g_bridgeWorld;
-}  // namespace
+OllamaEndpointSettings OllamaConfig_Snapshot() { return {}; }
+OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const&, OllamaBridge::Request const&) { return {}; }
+void OllamaBridge_SetActivation(OllamaBridge::Identity) {}
+std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t) { return text; }
+std::string Roleplay_FilterMetaTerms(std::string const& text) { return text; }
+bool OllamaIsBotPlayer(Player* player) { return !player->human; }
+bool OllamaGroupHasRealPlayer(Player*) { return true; }
+void OllamaWorldSnapshot::Build() {}
+bool OllamaWorldSnapshot::RealPlayerInChannel(Channel*) const { return true; }
+bool Governor_IsRepetitive(ObjectGuid, std::string const&, std::string const&) { return false; }
+bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool) { return true; }
+void Governor_RecordUtterance(ObjectGuid, std::string const&, std::string const&) {}
+std::string Governor_MakeScopeKey(char const*, uint32_t, std::string const&, uint32_t, uint32_t) { return "scope"; }
 
-QueryWorldSource& OllamaChat_BridgeQuerySource();
-bool OllamaChat_BridgeObserve(WorldTicket const&, DispatchGuard&);
-void OllamaChat_BridgeRefresh();
-// J5f-b: the topic reader (playerbots, outside the extract) is not part of these checks.
-bool BridgeBotStateTopic(uint64_t, StateTopic, std::string const&, std::vector<StateEntry>& entries)
+// The production channel names the world-only typed effect adapter (bridge_effect.cpp). This fixture stands in with
+// the closed release gate: every command is refused without a game read. No plan lives here.
+OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
 {
-    entries.clear();
-    return false;
-}
-// J6e-c: the watch fact reader (outside the extract) is not part of these checks.
-bool BridgeWatchFacts(uint64_t, uint64_t, WatchFacts& facts)
-{
-    facts = {};
-    return false;
-}
-WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
-// The production channel names the world-only typed effect adapter, which needs game headers. This fixture stands in
-// with the closed release gate: every command is refused without a game read.
-CommandExecutor& OllamaChat_BridgeCommandExecutor()
-{
-    struct Closed final : CommandExecutor
+    struct Closed final : OllamaBridge::CommandExecutor
     {
-        EffectResult Execute(EffectPhase const&, WorldTicket const&, DispatchGuard const&, ChannelCommand const&,
-                             std::function<bool()> const&) override
+        OllamaBridge::EffectResult Execute(OllamaBridge::EffectPhase const&, OllamaBridge::WorldTicket const&,
+                                           OllamaBridge::DispatchGuard const&, OllamaBridge::ChannelCommand const&,
+                                           std::function<bool()> const&) override
         {
-            return EffectResult::Rejected;
+            return OllamaBridge::EffectResult::Rejected;
         }
     };
     static Closed executor;
     return executor;
 }
+void OllamaChat_BridgePlansOpen(uint64_t) {}
+void OllamaChat_BridgePlansRetire() {}
+void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const&) {}
+bool OllamaChat_BridgePlansEmpty() { return true; }
+OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters() { return {}; }
+uint8_t OllamaChat_BridgePlanKinds(uint64_t) { return 0; }
+
+// --- doubles of playerbots' readers: the state, facts and traits are fixed; topics are not part of these checks --
+namespace PlayerbotBridge
+{
+bool ReadBotState(ObjectGuid const&, ObjectGuid const&, BotStateFacts& facts)
+{
+    facts.healthPct = 90.0f;
+    facts.alive = true;
+    return true;
+}
+bool ReadBotFacts(ObjectGuid const&, BotFacts&) { return true; }
+bool ReadBotPersonality(ObjectGuid const&, BotPersonality&) { return true; }
+bool ReadBotStateTopic(ObjectGuid const&, BotStateTopic, std::string const&, std::vector<BotStateItem>& items)
+{
+    items.clear();
+    return false;
+}
+std::span<AbilityRow const> AbilityRows() { return {}; }
+std::vector<AbilityData> Catalogue() { return {}; }
+uint64_t CatalogueHash(std::vector<AbilityData> const&) { return 0; }
+char const* KindWord(AbilityKind) { return ""; }
+char const* KindWord(ParamKind) { return ""; }
+char const* PartWord(Part) { return ""; }
+char const* CompletionWord(Completion) { return ""; }
+}  // namespace PlayerbotBridge
+
+using namespace OllamaBridge;
+using Json = nlohmann::json;
 
 namespace
 {
-auto g_bridgeObserver = ::OllamaChat_BridgeObserve;
+OllamaBridge::Clock clockNow;
 }  // namespace
-
-#include "dispatch-channel.inc"
-#include "handler-query.inc"
 
 namespace
 {
@@ -194,6 +302,7 @@ struct Fixture
     DispatchGuard guard;
     Fixture()
     {
+        g_bridgeObserver = OllamaChat_BridgeObserve;  // OllamaDispatch_Start's observer.
         onResolve = {};
         resolutions = 0;
         g_bridgeChannel.Retire();
@@ -293,11 +402,13 @@ void Queries()
     {
         Fixture f;
         auto receipt = f.Receive();
-        // CaptureQuery resolves three initial units and three validation units. The seventh lookup is
-        // Current AFTER actual FinishQuery serialization, immediately before mailbox publication.
+        // CaptureQuery resolves three initial units and three validation units; after FinishQuery serialization,
+        // Current lists the group again and resolves its units (lookups 7 to 9) before mailbox publication. A unit's
+        // change lands at lookup 7, before its own resolve; the membership change at lookup 6, the last read before
+        // serialization, since the recheck lists the members before its first lookup.
         onResolve = [change](unsigned count)
         {
-            if (count != 7)
+            if (count != (change == 7 ? 6u : 7u))
                 return;
             switch (change)
             {
@@ -448,7 +559,7 @@ int main()
         Queries();
         Events();
         Lifetimes();
-        std::cout << "PASS " << checks << " production query/dispatch/game-adapter checks\n";
+        std::cout << "PASS " << checks << " query dispatch checks (adapter and dispatcher compiled whole)\n";
     }
     catch (std::exception const& error)
     {

@@ -1,9 +1,10 @@
-// Generated bridge speech never reaches playerbots or mod-ollama-chat order parsing (J6b4a, hub J6b4-check runner).
-// Real: PrepareBridge, RouteMessage, DeliverBridgeLine, DeliverBridge and
-// OllamaDispatch_SubmitBridge (extracted verbatim), the bridge policy units and playerbots' ChatCommandLine.h. Models:
-// the playerbots whisper hook (a whisper to a bot parses a command line) and the ProcessChat bridge gate (only a
-// human's line opens a request). Game objects, the governor, the API and cleanup are stand-ins. No full dispatch TU or
-// live-game proof.
+// Generated bridge speech never reaches playerbots or mod-ollama-chat order parsing (J6b4a).
+// The dispatcher compiled whole: this file includes ../src/mod-ollama-chat_dispatch.cpp after its own doubles of the
+// game (tests/doubles names the game headers), so PrepareBridge, RouteMessage, DeliverBridgeLine, DeliverBridge and
+// OllamaDispatch_SubmitBridge are the production code; the bridge policy units and playerbots' ChatCommandLine.h are
+// real. Models: the playerbots whisper hook (a whisper to a bot parses a command line) and the ProcessChat bridge gate
+// (only a human's line opens a request). Game objects, the world adapter, the governor, the API and cleanup are
+// doubles. No live-game proof.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -18,27 +19,206 @@
 #include <vector>
 
 #include "ChatCommandLine.h"
+#include "SharedDefines.h"
 #include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_reply_split.h"
 
-enum ChatChannelSourceLocal
+namespace
 {
-    SRC_SAY_LOCAL = 1,
-    SRC_PARTY_LOCAL = 2,
-    SRC_RAID_LOCAL = 3,
-    SRC_GUILD_LOCAL = 4,
-    SRC_OFFICER_LOCAL = 5,
-    SRC_YELL_LOCAL = 6,
-    SRC_WHISPER_LOCAL = 7,
-    SRC_GENERAL_LOCAL = 17
-};
-using OllamaBridgeObserver = bool (*)(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&);
-#define LOG_INFO(...) ((void)0)
-#define LOG_ERROR(...) ((void)0)
+unsigned checks = 0;
+unsigned governorCalls = 0;
+unsigned recordCalls = 0;
+unsigned rememberCalls = 0;
+std::string recorded;    // LC10: the last utterance the governor recorded.
+std::string remembered;  // LC10: the last reply the one-exchange memory kept.
 
-// The channel glue the shared dispatch state names; this check opens no channel route (g_channelEnabled false).
+void Check(bool condition, std::string const& message)
+{
+    ++checks;
+    if (!condition)
+        throw std::runtime_error(message);
+}
+}  // namespace
+
+// --- game doubles (tests/doubles/game-doubles.h) ---------------------------
+struct ObjectGuid
+{
+    uint64_t value;
+    explicit ObjectGuid(uint64_t guid) : value(guid) {}
+    uint64_t GetRawValue() const { return value; }
+    uint32_t GetCounter() const { return static_cast<uint32_t>(value); }
+    bool operator==(ObjectGuid const&) const = default;
+};
+struct Group
+{
+};
+struct Guild
+{
+};
+struct Player;
+// Each send call is one of the chat hooks' inputs (Hear, below).
+struct PlayerbotAI
+{
+    Player* self = nullptr;
+    bool SayToGuild(std::string const& text);
+    bool SayToParty(std::string const& text);
+    bool SayToRaid(std::string const& text);
+    bool Yell(std::string const& text);
+    bool Say(std::string const& text);
+    bool Whisper(std::string const& text, std::string const& receiverName);
+};
+struct Player
+{
+    uint64_t guid = 0;
+    std::string name;
+    bool human = false;
+    bool online = true;
+    Group* group = nullptr;
+    Guild* guild = nullptr;
+    PlayerbotAI* ai = nullptr;  // Set for bots: the receivers whose playerbots whisper hook parses.
+    bool IsInWorld() const { return online; }
+    ObjectGuid GetGUID() const { return ObjectGuid(guid); }
+    std::string GetName() const { return name; }
+    Group* GetGroup() const { return group; }
+    Guild* GetGuild() const { return guild; }
+    uint32_t GetGuildId() const { return guild ? 5 : 0; }
+    uint32_t GetTeamId() const { return 0; }
+};
+// The General channel: what is said there reaches the hooks as a channel line.
+struct Channel
+{
+    bool IsOn(ObjectGuid) const { return true; }
+    void Say(ObjectGuid sender, std::string const& text, uint32_t);
+};
+namespace
+{
+Group party;
+Guild guild;
+PlayerbotAI botAI;
+PlayerbotAI otherAI;
+// The speaking bot, its human controller, the human speaker, and a second bot of the group.
+Player players[4];
+Player& bot = players[0];
+Player& otherBot = players[3];
+Channel general;
+}  // namespace
+struct ChannelMgr
+{
+    static ChannelMgr* forTeam(uint32_t)
+    {
+        static ChannelMgr manager;
+        return &manager;
+    }
+    Channel* GetChannel(std::string const&, Player*) { return &general; }
+};
+struct ObjectAccessor
+{
+    static Player* FindConnectedPlayer(ObjectGuid guid)
+    {
+        for (auto& player : players)
+            if (player.guid == guid.value && player.online)
+                return &player;
+        return nullptr;
+    }
+};
+struct PlayerbotsMgr
+{
+    static PlayerbotsMgr& instance()
+    {
+        static PlayerbotsMgr manager;
+        return manager;
+    }
+    PlayerbotAI* GetPlayerbotAI(Player* player) { return player ? player->ai : nullptr; }
+};
+// The grid search of a say or yell route: every online player of the fixture stands in range.
+namespace Acore
+{
+struct AnyPlayerInObjectRangeCheck
+{
+    AnyPlayerInObjectRangeCheck(Player*, float, bool, bool) {}
+};
+template <typename Check>
+struct PlayerListSearcher
+{
+    std::list<Player*>& found;
+    PlayerListSearcher(Player*, std::list<Player*>& list, Check&) : found(list) {}
+};
+namespace Crypto
+{
+template <std::size_t Size>
+std::array<uint8_t, Size> GetRandomBytes()
+{
+    return {};
+}
+}  // namespace Crypto
+}  // namespace Acore
+struct Cell
+{
+    template <typename Searcher>
+    static void VisitObjects(Player*, Searcher& searcher, float)
+    {
+        for (auto& player : players)
+            if (player.online)
+                searcher.found.push_back(&player);
+    }
+};
+#define OLLAMA_SELFTEST_GAME_DOUBLES
+
+// --- the production unit -----------------------------------------------------
+#include "../src/mod-ollama-chat_dispatch.cpp"
+
+// --- doubles of the module's other units ------------------------------------
+bool g_DebugEnabled = false;
+bool g_EnableTypingSimulation = false;
+uint32_t g_TypingSimulationBaseDelay = 100;
+uint32_t g_TypingSimulationDelayPerChar = 10;
+uint32_t g_TypingSimulationMaxDelay = 1000;
+uint32_t g_MaxQueueDepth = 64;
+uint32_t g_DispatchWorkerThreads = 1;
+uint32_t g_MaxReplyLength = 240;  // The legacy clamp; the bridge path never passes it.
+bool g_Enable = true;
+bool g_DisableForSayYell = false;
+bool g_DisableForParty = false;
+bool g_DisableForGuild = false;
+float g_SayDistance = 25.0f;
+float g_YellDistance = 100.0f;
+
+namespace
+{
+OllamaEndpointSettings config;
+OllamaApiResult apiResult;
+OllamaBridge::DispatchGuard gameGuard;
+}  // namespace
+
+OllamaEndpointSettings OllamaConfig_Snapshot() { return config; }
+OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const&, OllamaBridge::Request const&) { return apiResult; }
+void OllamaBridge_SetActivation(OllamaBridge::Identity) {}
+// The legacy clamp stand-in cuts at maxLen, so a bridge path that still clamped would lose its second message.
+std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t maxLen)
+{
+    return maxLen && text.size() > maxLen ? text.substr(0, maxLen) : text;
+}
+std::string Roleplay_FilterMetaTerms(std::string const& text) { return text; }
+bool OllamaIsBotPlayer(Player* player) { return !player->human; }
+bool OllamaGroupHasRealPlayer(Player* player) { return player->group != nullptr; }
+void OllamaWorldSnapshot::Build() {}
+bool OllamaWorldSnapshot::RealPlayerInChannel(Channel*) const { return true; }
+bool Governor_IsRepetitive(ObjectGuid, std::string const&, std::string const&) { return false; }
+bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool)
+{
+    ++governorCalls;
+    return true;
+}
+void Governor_RecordUtterance(ObjectGuid, std::string const&, std::string const& text)
+{
+    ++recordCalls;
+    recorded = text;
+}
+
+// The world adapter's exports (bridge_adapter.cpp, bridge_effect.cpp): this check opens no channel route and runs no
+// command; the dispatcher's observer is the test's own (Observe, below).
 OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource()
 {
     struct Blind final : OllamaBridge::QueryWorldSource
@@ -67,131 +247,24 @@ OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
     static Closed executor;
     return executor;
 }
-
-#include "dispatch-types.inc"
-
-OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
+bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&) { return false; }
+void OllamaChat_BridgeInstallAbilities() {}
+void OllamaChat_BridgePlansOpen(uint64_t) {}
+void OllamaChat_BridgePlansRetire() {}
+void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const&) {}
+bool OllamaChat_BridgePlansEmpty() { return true; }
+OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters() { return {}; }
+void OllamaChat_BridgeRefresh() {}
+void OllamaChat_BridgeReset() {}
+bool OllamaChat_BridgeWake(OllamaBridge::Watch const&) { return false; }
+void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const&, std::string const& reply)
+{
+    ++rememberCalls;
+    remembered = reply;
+}
 
 namespace
 {
-unsigned checks = 0;
-unsigned governorCalls = 0;
-unsigned recordCalls = 0;
-unsigned rememberCalls = 0;
-std::string recorded;             // LC10: the last utterance the governor recorded.
-std::string remembered;           // LC10: the last reply the one-exchange memory kept.
-uint32_t g_MaxReplyLength = 240;  // The legacy clamp; the bridge path never passes it.
-bool g_DebugEnabled = false;
-bool g_EnableTypingSimulation = false;
-uint32_t g_TypingSimulationBaseDelay = 100;
-uint32_t g_TypingSimulationDelayPerChar = 10;
-uint32_t g_TypingSimulationMaxDelay = 1000;
-uint32_t g_MaxQueueDepth = 64;
-bool g_DisableForGuild = false;
-bool g_DisableForParty = false;
-bool g_DisableForSayYell = false;
-float g_SayDistance = 25.0f;
-float g_YellDistance = 100.0f;
-constexpr uint32_t LANG_UNIVERSAL = 0;
-OllamaEndpointSettings config;
-OllamaApiResult apiResult;
-OllamaBridge::DispatchGuard gameGuard;
-
-void Check(bool condition, std::string const& message)
-{
-    ++checks;
-    if (!condition)
-        throw std::runtime_error(message);
-}
-
-OllamaEndpointSettings OllamaConfig_Snapshot() { return config; }
-OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const&, OllamaBridge::Request const&) { return apiResult; }
-// The legacy clamp stand-in cuts at maxLen, so a bridge path that still clamped would lose its second message.
-std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t maxLen)
-{
-    return maxLen && text.size() > maxLen ? text.substr(0, maxLen) : text;
-}
-std::string Roleplay_FilterMetaTerms(std::string const& text) { return text; }
-
-struct ObjectGuid
-{
-    uint64_t value;
-    explicit ObjectGuid(uint64_t guid) : value(guid) {}
-    uint64_t GetRawValue() const { return value; }
-    bool operator==(ObjectGuid const&) const = default;
-};
-struct Group
-{
-};
-struct Guild
-{
-};
-struct Player;
-struct PlayerbotAI
-{
-    Player* self = nullptr;
-    bool SayToGuild(std::string const& text);
-    bool SayToParty(std::string const& text);
-    bool SayToRaid(std::string const& text);
-    bool Yell(std::string const& text);
-    bool Say(std::string const& text);
-    bool Whisper(std::string const& text, std::string const& receiverName);
-};
-struct Player
-{
-    uint64_t guid = 0;
-    std::string name;
-    bool human = false;
-    bool online = true;
-    Group* group = nullptr;
-    Guild* guild = nullptr;
-    PlayerbotAI* ai = nullptr;  // Set for bots: the receivers whose playerbots whisper hook parses.
-    bool IsInWorld() const { return online; }
-    ObjectGuid GetGUID() const { return ObjectGuid(guid); }
-    std::string GetName() const { return name; }
-    Group* GetGroup() const { return group; }
-    Guild* GetGuild() const { return guild; }
-    uint32_t GetGuildId() const { return guild ? 5 : 0; }
-};
-Group party;
-Guild guild;
-PlayerbotAI botAI;
-PlayerbotAI otherAI;
-// The speaking bot, its human controller, the human speaker, and a second bot of the group.
-Player players[4];
-Player& bot = players[0];
-Player& otherBot = players[3];
-
-struct ObjectAccessor
-{
-    static Player* FindConnectedPlayer(ObjectGuid guid)
-    {
-        for (auto& player : players)
-            if (player.guid == guid.value && player.online)
-                return &player;
-        return nullptr;
-    }
-};
-struct PlayerbotsMgr
-{
-    static PlayerbotsMgr& instance()
-    {
-        static PlayerbotsMgr manager;
-        return manager;
-    }
-    PlayerbotAI* GetPlayerbotAI(Player* player) { return player ? player->ai : nullptr; }
-};
-struct Channel;
-struct OllamaWorldSnapshot
-{
-    bool RealPlayerInChannel(Channel*) const { return true; }
-    bool GuildHasRealPlayer(uint32_t) const { return true; }
-};
-bool OllamaIsRealPlayer(Player* player) { return player && player->human; }
-bool OllamaGroupHasRealPlayer(Player* player) { return player->group != nullptr; }
-bool OllamaIsOnChannel(Channel*, ObjectGuid) { return true; }
-bool AnyoneInRange(Player*, float) { return true; }
-
 // Everything a bot line reaches: the playerbots whisper hook and the ProcessChat bridge gate.
 struct Heard
 {
@@ -205,7 +278,14 @@ unsigned commandLines = 0;  // Lines playerbots would parse on any channel that 
 unsigned pbParses = 0;      // Lines the playerbots whisper hook really parses: a whisper to a bot receiver.
 unsigned ocRequests = 0;    // Lines the ProcessChat bridge gate lets through to a new bridge request.
 Completion* nested = nullptr;
-void DeliverBridgeAgain(Completion const& c);
+
+// The audience the deliveries see: the bot's guild has a human online.
+OllamaWorldSnapshot World()
+{
+    OllamaWorldSnapshot world;
+    world.guildsWithRealPlayer.insert(5);
+    return world;
+}
 
 // handler.cpp ProcessChat: `!g_Enable || !BridgeHuman(player) || channel || source not in the four`.
 bool OcBridgeGate(Player* sender, int source, bool channel)
@@ -233,18 +313,21 @@ void Hear(Player* sender, Player* receiver, int source, std::string const& text)
     {
         auto* again = nested;
         nested = nullptr;
-        DeliverBridgeAgain(*again);
+        DeliverBridge(*again, World());
     }
 }
-struct Channel
-{
-    void Say(ObjectGuid sender, std::string const& text, uint32_t)
-    {
-        Hear(ObjectAccessor::FindConnectedPlayer(sender), nullptr, SRC_GENERAL_LOCAL, text);
-    }
-} general;
-Channel* ResolveChannel(Player*, std::string const& name) { return name.empty() ? nullptr : &general; }
 
+bool Observe(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard& guard)
+{
+    guard = gameGuard;
+    return true;
+}
+}  // namespace
+
+void Channel::Say(ObjectGuid sender, std::string const& text, uint32_t)
+{
+    Hear(ObjectAccessor::FindConnectedPlayer(sender), nullptr, SRC_GENERAL_LOCAL, text);
+}
 bool PlayerbotAI::SayToGuild(std::string const& text)
 {
     Hear(self, nullptr, SRC_GUILD_LOCAL, text);
@@ -281,35 +364,8 @@ bool PlayerbotAI::Whisper(std::string const& text, std::string const& receiverNa
     return false;
 }
 
-bool Governor_IsRepetitive(ObjectGuid, std::string const&, std::string const&) { return false; }
-bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool)
-{
-    ++governorCalls;
-    return true;
-}
-void Governor_RecordUtterance(ObjectGuid, std::string const&, std::string const& text)
-{
-    ++recordCalls;
-    recorded = text;
-}
-void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const&, std::string const& reply)
-{
-    ++rememberCalls;
-    remembered = reply;
-}
-bool Observe(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard& guard)
-{
-    guard = gameGuard;
-    return true;
-}
-}  // namespace
-
-#include "speech-helpers.inc"
-
 namespace
 {
-void DeliverBridgeAgain(Completion const& c) { DeliverBridge(c, {}); }
-
 void Reset()
 {
     g_queue.clear();
@@ -439,7 +495,7 @@ void SpeechTests()
             auto done = Generate(generated, route.source, route.target);
             Check(PrepareBridge(done) && done.text == expected, label + ": prepared text neutralized");
             nested = &done;
-            DeliverBridge(done, {});
+            DeliverBridge(done, World());
             Check(!nested, label + ": the send fired the hooks");
             Check(heard.size() == 1 && heard[0].text == expected && heard[0].source == route.heardAs &&
                       heard[0].sender == 11 &&
@@ -491,7 +547,7 @@ void RejectionTests()
         g_DisableForSayYell = rejected.sayYellOff;
         if (rejected.source == SRC_GENERAL_LOCAL)
             done.request.channelName.clear();
-        DeliverBridge(done, {});
+        DeliverBridge(done, World());
         Check(heard.empty() && !recordCalls && !rememberCalls, std::string(rejected.label) + ": nothing sent");
         ExpectReleased(done, rejected.label);
     }
@@ -504,7 +560,7 @@ void RejectionTests()
             auto done = Generate("Ready.", route.source, route.target);
             Check(PrepareBridge(done) && done.text == "Ready.", label + ": prepared");
             done.text = text;
-            DeliverBridge(done, {});
+            DeliverBridge(done, World());
             Check(heard.empty() && !governorCalls && !recordCalls && !rememberCalls, label + ": dropped unsent");
             ExpectReleased(done, label);
         }
@@ -513,7 +569,7 @@ void RejectionTests()
     auto done = Generate("unused", SRC_WHISPER_LOCAL, 44);
     done.bridgeOutcome = OllamaBridge::WorldOutcome::Unavailable;
     Check(PrepareBridge(done) && done.text == OllamaBridge::DispatchOutageText(), "outage prepared");
-    DeliverBridge(done, {});
+    DeliverBridge(done, World());
     Check(heard.size() == 1 && heard[0].text == OllamaBridge::DispatchOutageText() && !pbParses, "outage delivered");
     ExpectReleased(done, "outage");
 }
@@ -536,7 +592,7 @@ void SplitTests()
             Check(g_MaxReplyLength == 240 && PrepareBridge(done) && done.text == first && done.secondText == expected,
                   label + ": prepared as two messages, uncut");
             nested = &done;
-            DeliverBridge(done, {});
+            DeliverBridge(done, World());
             Check(!nested, label + ": the send fired the hooks");
             Check(heard.size() == 2 && heard[0].text == first && heard[1].text == expected &&
                       heard[0].source == route.heardAs && heard[1].source == route.heardAs &&
@@ -559,7 +615,7 @@ void SplitTests()
         Check(PrepareBridge(done) && done.text == OllamaBridge::DispatchOutageText() && done.secondText.empty() &&
                   g_bridgeRefusedLong == refusals + 1,
               label + ": refused whole and counted; the outage line for the addressed human");
-        DeliverBridge(done, {});
+        DeliverBridge(done, World());
         Check(heard.size() == 1 && heard[0].text == OllamaBridge::DispatchOutageText() &&
                   g_bridgeRefusedLong == refusals + 1,
               label + ": none of the reply is sent");
@@ -578,7 +634,7 @@ int main()
         g_queue.clear();
         g_done.clear();
         Check(!OllamaBridge::DispatchSlot::Used(), "final no leaked slots");
-        std::cout << checks << " bridge speech routing checks passed (extracted delivery; game/hook models)\n";
+        std::cout << checks << " bridge speech routing checks passed (dispatcher compiled whole)\n";
         return 0;
     }
     catch (std::exception const& error)

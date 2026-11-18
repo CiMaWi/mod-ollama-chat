@@ -189,8 +189,8 @@ illustrates the handoff, but is not production dispatcher wiring, real game-obje
 integration or live J9C/X acceptance.
 
 `tests/bridge-query-dispatch-selftest.cpp` additionally links the production bridge/query/world/channel code and
-extracts the actual handler adapter, refresh and dispatcher channel bodies verbatim against controlled game-object
-stand-ins. It covers the runtime query joins and final publication checks offline. It does not prove a full
+compiles the world adapter and dispatcher units whole against the controlled game-object doubles of `tests/doubles`
+and its own. It covers the runtime query joins and final publication checks offline. It does not prove a full
 module build or live game delivery. The full J5 parent remains open pending independent review; native J11C/X
 adapters, J6 effects and live J9C/X delivery remain later work.
 
