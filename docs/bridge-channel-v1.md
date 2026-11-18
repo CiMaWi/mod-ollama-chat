@@ -18,7 +18,7 @@ exception text. The transport must bound bytes while receiving, authenticate eve
 All JSON objects have exact fields; numeric integer fields reject floating-point JSON representations.
 
 Every envelope has exactly `version:1`, `instance`, `provider`, `epoch`, `requestId`, `deadlineUnixMs`, `type`,
-plus the type's fields below. Identifiers use J2's ASCII syntax, 1..128 bytes. GUIDs are canonical decimal uint64
+plus the type's fields below. The game always sends `provider` as `claude` (no option sets it since LCP2a). Identifiers use J2's ASCII syntax, 1..128 bytes. GUIDs are canonical decimal uint64
 strings; zero cannot identify an actual game unit. Times are integral milliseconds within JavaScript's exact range.
 Expiry is at equality on either wall or captured monotonic clock. Maximum captured remaining lifetime is 120000 ms;
 work replies must preserve the original wall deadline exactly. Wall-clock rollback cannot extend monotonic expiry.
