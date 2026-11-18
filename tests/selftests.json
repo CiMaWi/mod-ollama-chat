@@ -121,6 +121,18 @@
             "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
         },
         {
+            "file": "bridge-state-selftest.cpp",
+            "includes": [
+                "src",
+                "../mod-playerbots/src/Bot",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp"
+            ],
+            "success": "PASS \\d+ state key checks"
+        },
+        {
             "file": "bridge-watch-selftest.cpp",
             "includes": [
                 "src",
