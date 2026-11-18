@@ -87,71 +87,17 @@ static std::string FormatPlayerRace(uint8_t raceId)
     }
 }
 
-// DS.14/J5f: the bot's own state for one request, read by playerbots on world (the chat hook, map threads idle) and
-// copied as plain values; the envelope filters and bounds it. Outside the extracted adapter.
-void BridgeBotStateFacts(Player* bot, Player* partner, OllamaBridge::BotState& state)
+// DS.14/J5f: the bot's own state for one request, read by playerbots on world (the chat hook, map threads idle), with
+// the bot's live bridge plans beside it; the envelope filters and bounds it. Outside the extracted adapter.
+void BridgeBotStateFacts(Player* bot, Player* partner, OllamaBridge::Context& input)
 {
-    PlayerbotBridge::BotStateFacts facts;
-    if (!PlayerbotBridge::ReadBotState(bot->GetGUID(), partner->GetGUID(), facts))
+    input.statePlans = 0;
+    if (!PlayerbotBridge::ReadBotState(bot->GetGUID(), partner->GetGUID(), input.state.emplace()))
+    {
+        input.state.reset();
         return;
-    state.present = true;
-    state.healthPct = facts.healthPct;
-    state.powerType = facts.powerType;
-    state.powerCurrent = facts.powerCurrent;
-    state.powerMax = facts.powerMax;
-    state.level = facts.level;
-    state.alive = facts.alive;
-    state.ghost = facts.ghost;
-    state.inCombat = facts.inCombat;
-    state.victim = facts.victim;
-    state.victimVisible = facts.victimVisible;
-    state.victimName = std::move(facts.victimName);
-    state.victimLevel = facts.victimLevel;
-    state.victimHealthPct = facts.victimHealthPct;
-    state.flying = facts.flying;
-    state.casting = facts.casting;
-    state.looting = facts.looting;
-    state.resting = facts.resting;
-    state.travelling = facts.travelling;
-    state.working = facts.working;
-    state.questTitle = std::move(facts.questTitle);
-    state.zone = std::move(facts.zone);
-    state.area = std::move(facts.area);
-    state.mapId = facts.mapId;
-    state.x = facts.x;
-    state.y = facts.y;
-    state.z = facts.z;
-    state.partnerOnline = facts.partnerOnline;
-    state.partnerInGroup = facts.partnerInGroup;
-    state.partnerVisible = facts.partnerVisible;
-    state.partnerSameMap = facts.partnerSameMap;
-    state.partnerYards = facts.partnerYards;
-    state.partnerZone = std::move(facts.partnerZone);
-    state.partnerX = facts.partnerX;
-    state.partnerY = facts.partnerY;
-    state.partnerZ = facts.partnerZ;
-    state.mounted = facts.mounted;
-    state.swimming = facts.swimming;
-    state.groupSize = facts.groupSize;
-    state.leads = facts.leads;
-    state.masterName = std::move(facts.masterName);
-    state.follow = facts.follow;
-    state.stay = facts.stay;
-    state.guard = facts.guard;
-    state.grind = facts.grind;
-    state.passive = facts.passive;
-    state.plans = OllamaChat_BridgePlanKinds(bot->GetGUID().GetRawValue());
-    state.freeBagSlots = facts.freeBagSlots;
-    state.money = facts.money;
-    // LC10: what it perceives, its servant and mount, its recent deeds; Build bounds them (deeds whole, LC7's cap).
-    state.around.clear();
-    state.around.reserve(facts.around.size());
-    for (PlayerbotBridge::AroundEntry& entry : facts.around)
-        state.around.push_back(
-            {std::move(entry.Name), PlayerbotBridge::AroundKindWord(entry.Kind), std::move(entry.Detail), entry.Count});
-    state.servant = std::move(facts.servantName);
-    state.mount = std::move(facts.mountName);
-    state.deeds = std::move(facts.deeds);
+    }
+    input.statePlans = OllamaChat_BridgePlanKinds(bot->GetGUID().GetRawValue());
 }
 
 static_assert(OllamaBridge::MaxStateDeedBytes == RecordWords::MAX_SENTENCE,
@@ -163,25 +109,15 @@ static_assert(OllamaBridge::MaxStateAround == PlayerbotBridge::MaxAround, "the w
 // Build bounds every value and leaves out what is empty. No database access.
 void BridgeFactsAndTraits(Player* bot, OllamaBridge::Context& input)
 {
-    input.facts.reset();
-    PlayerbotBridge::BotFacts facts;
-    if (PlayerbotBridge::ReadBotFacts(bot->GetGUID(), facts))
-    {
-        OllamaBridge::BotFacts& wire = input.facts.emplace();
-        wire.name = bot->GetName();
-        wire.race = FormatPlayerRace(bot->getRace());
-        wire.className = FormatPlayerClass(bot->getClass());
-        wire.gender = bot->getGender() == GENDER_FEMALE ? "female" : "male";
-        wire.level = bot->GetLevel();
-        wire.side = bot->GetTeamId() == TEAM_ALLIANCE ? "Alliance" : "Horde";
-        wire.phrase = std::move(facts.phrase);
-        wire.crafts = std::move(facts.crafts);
-        wire.useful = std::move(facts.useful);
-        wire.servants = std::move(facts.servants);
-        wire.standing = std::move(facts.standing);
-        wire.guild = std::move(facts.guild);
-        wire.relatives = std::move(facts.relatives);
-    }
+    if (PlayerbotBridge::ReadBotFacts(bot->GetGUID(), input.facts.emplace()))
+        input.who = {bot->GetName(),
+                     FormatPlayerRace(bot->getRace()),
+                     FormatPlayerClass(bot->getClass()),
+                     bot->getGender() == GENDER_FEMALE ? "female" : "male",
+                     bot->GetLevel(),
+                     static_cast<uint8_t>(bot->GetTeamId())};
+    else
+        input.facts.reset();
     PlayerbotBridge::BotPersonality traits;
     input.traits = {};
     if (PlayerbotBridge::ReadBotPersonality(bot->GetGUID(), traits))
@@ -346,9 +282,8 @@ bool BridgeWatchFacts(uint64_t botGuid, uint64_t partnerGuid, OllamaBridge::Watc
     Player* partner = ObjectAccessor::FindConnectedPlayer(ObjectGuid(partnerGuid));
     if (!bot || !partner || !bot->IsInWorld() || bot->InBattleground() || bot->InArena())
         return false;
-    OllamaBridge::BotState state;
-    BridgeBotStateFacts(bot, partner, state);
-    if (!state.present)
+    PlayerbotBridge::BotStateFacts state;
+    if (!PlayerbotBridge::ReadBotState(bot->GetGUID(), partner->GetGUID(), state))
         return false;
     facts.ready = true;
     facts.inCombat = state.inCombat;
@@ -707,7 +642,7 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     input.memory = it->memory;
     // DS.14/J5f: the bot's own state, read fresh for every request and kept out of the capture, so a change (health,
     // position) never renews a binding or a cached prompt prefix.
-    BridgeBotStateFacts(bot, speaker, input.state);
+    BridgeBotStateFacts(bot, speaker, input);
     BridgeFactsAndTraits(bot, input);  // LC10: the same rule for the lasting facts and the trait words.
     OllamaChatRequest request;
     request.botGuid = bot->GetGUID().GetRawValue();

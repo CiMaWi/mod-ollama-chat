@@ -232,8 +232,7 @@ void BindingRule()
             BindingCapture current = capture(source);
             current.context.traits.words = {"trait-" + std::to_string(tick)};
             current.context.facts.emplace().phrase = "fact-" + std::to_string(tick);
-            current.context.state.present = true;
-            current.context.state.healthPct = static_cast<float>(tick % 100);
+            current.context.state.emplace().healthPct = static_cast<float>(tick % 100);
             current.context.observations = {"Your name is Bot" + std::to_string(tick) + "."};
             current.context.speakerControlsBot = tick % 2 == 0;
             current.guard.mapId = tick;

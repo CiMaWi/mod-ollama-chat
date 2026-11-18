@@ -100,7 +100,7 @@ void OllamaChat_BridgePlansRetire();
 void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const& phase);
 bool OllamaChat_BridgePlansEmpty();
 OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters();
-// DS.14/J5f: OllamaBridge::BotState::plans bits (PlanKind order) of the bot's live bridge plans; world thread.
+// DS.14/J5f: OllamaBridge::Context::statePlans bits (PlanKind order) of the bot's live bridge plans; world thread.
 uint8_t OllamaChat_BridgePlanKinds(uint64_t botGuid);
 void OllamaChat_BridgeRefresh();
 void OllamaChat_BridgeReset();

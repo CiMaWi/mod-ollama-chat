@@ -8,10 +8,12 @@
 #include <map>
 #include <nlohmann/json.hpp>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <variant>
 
 namespace OllamaBridge
 {
@@ -171,18 +173,18 @@ constexpr std::size_t MaxFactRelatives = 8;
 
 // LC10 `input.facts`: who the bot is (the fact rule), how it fights, its crafts, standing and kin. False when who
 // or the phrase does not survive the bounds; the module then leaves the whole object out.
-bool FactsJson(BotFacts const& facts, nlohmann::json& json)
+bool FactsJson(BotWho const& bot, PlayerbotBridge::BotFacts const& facts, nlohmann::json& json)
 {
     nlohmann::json who = nlohmann::json::object();
-    PutFact(who, "name", facts.name);
-    PutFact(who, "race", facts.race);
-    PutFact(who, "class", facts.className);
-    if (facts.gender == "male" || facts.gender == "female")
-        who["gender"] = facts.gender;
-    if (facts.level)
-        who["level"] = std::min<uint32_t>(facts.level, 255);
-    if (facts.side == "Alliance" || facts.side == "Horde")
-        who["side"] = facts.side;
+    PutFact(who, "name", bot.name);
+    PutFact(who, "race", bot.race);
+    PutFact(who, "class", bot.className);
+    if (bot.gender == "male" || bot.gender == "female")
+        who["gender"] = bot.gender;
+    if (bot.level)
+        who["level"] = std::min<uint32_t>(bot.level, 255);
+    if (bot.team <= 1)
+        who["side"] = bot.team ? "Horde" : "Alliance";
     auto phrase = WireText(facts.phrase, MaxPhraseBytes);
     if (who.size() != 6 || !phrase)
         return false;
@@ -196,23 +198,61 @@ bool FactsJson(BotFacts const& facts, nlohmann::json& json)
     return true;
 }
 
-// LC10 `input.state.around`: nearest first, one entry per name (after the bounds), a known kind, count 1-255.
-nlohmann::json AroundJson(std::vector<BotState::Around> const& entries)
+// LCB4: whether an open row's key may go to the wire: [a-z][a-z_]{0,23} and not a key the envelope writes itself.
+bool OpenKey(std::string const& key, std::span<std::string_view const> shaped)
 {
-    static constexpr std::string_view kinds[] = {"hostile", "service", "task", "person", "object"};
+    return !key.empty() && key.size() <= 24 && key.front() >= 'a' && key.front() <= 'z' &&
+           std::all_of(key.begin(), key.end(), [](char c) { return (c >= 'a' && c <= 'z') || c == '_'; }) &&
+           std::find(shaped.begin(), shaped.end(), key) == shaped.end();
+}
+
+// LCB4: playerbots' open rows of one object, in their order, under the open-key rule (bridge.h); a bad row, a key
+// already written and every row past MaxOpenKeys are dropped alone.
+void PutOpenKeys(nlohmann::json& json, std::vector<PlayerbotBridge::StateKey> const& rows,
+                 std::span<std::string_view const> shaped)
+{
+    std::size_t kept = 0;
+    for (PlayerbotBridge::StateKey const& row : rows)
+    {
+        if (kept == MaxOpenKeys)
+            break;
+        if (!OpenKey(row.key, shaped) || json.contains(row.key))
+            continue;
+        if (bool const* flag = std::get_if<bool>(&row.value))
+            json[row.key] = *flag;
+        else if (int64_t const* number = std::get_if<int64_t>(&row.value))
+            json[row.key] = std::clamp(*number, -MaxOpenNumber, MaxOpenNumber);
+        else if (auto text = WireText(std::get<std::string>(row.value), MaxFactBytes))
+            json[row.key] = std::move(*text);
+        else
+            continue;
+        ++kept;
+    }
+}
+
+constexpr std::string_view AroundKeys[] = {"name", "kind", "detail", "count"};
+constexpr std::string_view StateKeys[] = {"health",  "power",   "level",    "alive", "combat",   "activity", "where",
+                                          "partner", "mounted", "swimming", "group", "movement", "plans",    "bags",
+                                          "money",   "around",  "servant",  "mount", "deeds"};
+
+// LC10 `input.state.around`: nearest first, one entry per name (after the bounds), a known kind, count 1-255; LCB4:
+// each entry's open rows beside its keys.
+nlohmann::json AroundJson(std::vector<PlayerbotBridge::AroundEntry> const& entries)
+{
     nlohmann::json around = nlohmann::json::array();
-    for (BotState::Around const& entry : entries)
+    for (PlayerbotBridge::AroundEntry const& entry : entries)
     {
         if (around.size() == MaxStateAround)
             break;
-        auto name = WireText(entry.name, MaxFactBytes);
-        if (!name || std::find(std::begin(kinds), std::end(kinds), entry.kind) == std::end(kinds) ||
+        auto name = WireText(entry.Name, MaxFactBytes);
+        if (!name || entry.Kind > PlayerbotBridge::AroundKind::Object ||
             std::any_of(around.begin(), around.end(),
                         [&name](nlohmann::json const& listed) { return listed.at("name") == *name; }))
             continue;
-        nlohmann::json item = {{"name", std::move(*name)}, {"kind", entry.kind}};
-        PutFact(item, "detail", entry.detail);
-        item["count"] = std::clamp<uint32_t>(entry.count, 1, 255);
+        nlohmann::json item = {{"name", std::move(*name)}, {"kind", PlayerbotBridge::AroundKindWord(entry.Kind)}};
+        PutFact(item, "detail", entry.Detail);
+        item["count"] = std::clamp<uint32_t>(entry.Count, 1, 255);
+        PutOpenKeys(item, entry.open, AroundKeys);
         around.push_back(std::move(item));
     }
     return around;
@@ -251,7 +291,7 @@ char const* StatePower(uint8_t type)
 }
 
 // The most absorbing thing the bot is doing.
-char const* StateActivity(BotState const& state)
+char const* StateActivity(PlayerbotBridge::BotStateFacts const& state)
 {
     if (!state.alive)
         return "idle";
@@ -272,7 +312,7 @@ char const* StateActivity(BotState const& state)
     return "idle";
 }
 
-char const* StateMovement(BotState const& state)
+char const* StateMovement(PlayerbotBridge::BotStateFacts const& state)
 {
     return state.stay      ? "stay"
            : state.follow  ? "follow"
@@ -282,8 +322,9 @@ char const* StateMovement(BotState const& state)
                            : "none";
 }
 
-// DS.14/J5f `input.state`: what the bot itself knows about its condition, place and doings.
-nlohmann::json StateJson(BotState const& state)
+// DS.14/J5f `input.state`: what the bot itself knows about its condition, place and doings; LCB4: playerbots' open
+// rows last.
+nlohmann::json StateJson(PlayerbotBridge::BotStateFacts const& state, uint8_t statePlans)
 {
     nlohmann::json json = nlohmann::json::object();
     json["health"] = StatePercent(state.healthPct);
@@ -346,7 +387,7 @@ nlohmann::json StateJson(BotState const& state)
     static char const* const planNames[] = {"movement", "formation", "save_mana", "focus_healing"};
     nlohmann::json plans = nlohmann::json::array();
     for (std::size_t kind = 0; kind < std::size(planNames); ++kind)
-        if (state.plans & (1u << kind))
+        if (statePlans & (1u << kind))
             plans.push_back(planNames[kind]);
     if (!plans.empty())
         json["plans"] = std::move(plans);
@@ -354,10 +395,11 @@ nlohmann::json StateJson(BotState const& state)
     json["money"] = state.money;
     if (nlohmann::json around = AroundJson(state.around); !around.empty())
         json["around"] = std::move(around);
-    PutFact(json, "servant", state.servant);
-    PutFact(json, "mount", state.mount);
+    PutFact(json, "servant", state.servantName);
+    PutFact(json, "mount", state.mountName);
     // Whole record sentences (LC7's cap), never the 64-byte fact rule.
     PutTextList(json, "deeds", state.deeds, MaxStateDeeds, MaxStateDeedBytes);
+    PutOpenKeys(json, state.open, StateKeys);
     return json;
 }
 }  // namespace
@@ -492,15 +534,15 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
                                      {"speakerControlsBot", input.speakerControlsBot},
                                      {"party", std::move(party)}}}};
         // LC10: the lasting facts and the trait words, each only when there is something to say.
-        if (nlohmann::json facts; input.facts && FactsJson(*input.facts, facts))
+        if (nlohmann::json facts; input.facts && FactsJson(input.who, *input.facts, facts))
             envelope["input"]["facts"] = std::move(facts);
         nlohmann::json traits = nlohmann::json::object();
         PutTraitWords(traits, input.traits);
         PutTextList(traits, "interests", input.traits.interests, MaxTraitInterests, MaxTraitBytes);
         if (!traits.empty())
             envelope["input"]["traits"] = std::move(traits);
-        if (input.state.present)
-            envelope["input"]["state"] = StateJson(input.state);
+        if (input.state)
+            envelope["input"]["state"] = StateJson(*input.state, input.statePlans);
         if (!input.wakeCondition.empty())  // J6e-c: a wake turn (never addressed); the watch that opened it.
             envelope["input"]["wake"] = {{"condition", input.wakeCondition}, {"watchId", input.wakeWatchId}};
         std::string encoded = envelope.dump();
@@ -662,7 +704,7 @@ Result Generate(Settings const& settings, Request const& request, Circuit& circu
     return result;
 }
 
-uint8_t ActivityCode(BotState const& state)
+uint8_t ActivityCode(PlayerbotBridge::BotStateFacts const& state)
 {
     constexpr std::string_view kinds[] = {"idle",    "flying",  "fighting", "casting",
                                           "looting", "resting", "questing", "travelling"};

@@ -9,6 +9,8 @@
 #include <utility>
 #include <vector>
 
+#include "BridgeBotFacts.h"
+#include "BridgeBotState.h"
 #include "mod-ollama-chat_httpclient.h"
 
 // Plain owned values only. The world owner supplies identity, permitted observations,
@@ -65,100 +67,31 @@ struct Participant
     uint64_t visibleTargetGuid = 0;
 };
 
-// DS.14/J5f: the bot's own state for one request, raw as playerbots read it on world (BridgeBotState). It changes
-// constantly, so it is never part of a capture. The envelope filters it
+// DS.14/J5f: the bot's own state for one request, raw as playerbots read it on world (PlayerbotBridge::BotStateFacts,
+// BridgeBotState.h). It changes constantly, so it is never part of a capture. The envelope filters it
 // (the partner only in the bot's group or in its sight, only the bot's own visible victim) and bounds every value;
-// strings follow the fact rule (MaxFactBytes, no controls, valid UTF-8). Absent from the wire unless present.
-constexpr uint8_t StatePlanMovement = 1;  // Bits of BotState::plans, in PlanKind order.
+// strings follow the fact rule (MaxFactBytes, no controls, valid UTF-8). Absent from the wire unless read.
+// LCB4: playerbots' open rows (StateKey) go to the wire as they are, each under the open-key rule: a key of
+// [a-z][a-z_]{0,23} the envelope does not write itself, at most MaxOpenKeys per object, text by the fact rule, whole
+// numbers clamped to +-MaxOpenNumber.
+constexpr std::size_t MaxOpenKeys = 8;
+constexpr int64_t MaxOpenNumber = 1000000000;
+constexpr uint8_t StatePlanMovement = 1;  // Bits of Context::statePlans, in PlanKind order.
 constexpr uint8_t StatePlanFormation = 2;
 constexpr uint8_t StatePlanSaveMana = 4;
 constexpr uint8_t StatePlanFocusHealing = 8;
 
-struct BotState
-{
-    bool present = false;
-    float healthPct = 0.0f;
-    uint8_t powerType = 0xFF;  // Game power code: 0 mana, 1 rage, 2 focus, 3 energy, 6 runic power; others omitted.
-    uint32_t powerCurrent = 0;
-    uint32_t powerMax = 0;
-    uint32_t level = 0;
-    bool alive = false;
-    bool ghost = false;
-    bool inCombat = false;
-    bool victim = false;  // The bot's own current victim.
-    bool victimVisible = false;
-    std::string victimName;
-    uint32_t victimLevel = 0;
-    float victimHealthPct = 0.0f;
-    bool flying = false;
-    bool casting = false;
-    bool looting = false;
-    bool resting = false;
-    bool travelling = false;
-    bool working = false;  // At its travel destination.
-    std::string questTitle;
-    std::string zone;
-    std::string area;
-    uint32_t mapId = 0;
-    float x = 0.0f;
-    float y = 0.0f;
-    float z = 0.0f;
-    bool partnerOnline = false;
-    bool partnerInGroup = false;
-    bool partnerVisible = false;
-    bool partnerSameMap = false;  // Yards and position are set only then.
-    float partnerYards = 0.0f;
-    std::string partnerZone;
-    float partnerX = 0.0f;
-    float partnerY = 0.0f;
-    float partnerZ = 0.0f;
-    bool mounted = false;
-    bool swimming = false;
-    uint32_t groupSize = 0;  // 0 when ungrouped.
-    bool leads = false;
-    std::string masterName;
-    bool follow = false;  // Non-combat movement strategies.
-    bool stay = false;
-    bool guard = false;
-    bool grind = false;
-    bool passive = false;
-    uint8_t plans = 0;
-    uint32_t freeBagSlots = 0;
-    uint32_t money = 0;
-    // LC10 (LC7, LC8): written after money, each only when not empty. `around` nearest first, one entry per name (a
-    // name repeated after the bound is left out), kind one of hostile, service, task, person, object; `deeds` newest
-    // first, each a whole sentence of at most MaxStateDeedBytes.
-    struct Around
-    {
-        std::string name;
-        std::string kind;
-        std::string detail;
-        uint32_t count = 0;
-    };
-    std::vector<Around> around;
-    std::string servant;
-    std::string mount;
-    std::vector<std::string> deeds;
-};
-
-// LC10 `input.facts`: the bot's lasting facts (playerbots ReadBotFacts) and who it is, as the wire has them. Absent
-// unless the reader succeeded; dropped whole when a required value (who, phrase) does not survive the bounds. Lists
-// keep the reader's order and are cut at their wire caps; an empty list is left out.
-struct BotFacts
+// LC10 `input.facts.who`: who the bot is, from the bot's own getters; the rest of `input.facts` are playerbots' lasting
+// facts (PlayerbotBridge::BotFacts, ReadBotFacts). The whole object is dropped when a value of who or the phrase does
+// not survive the bounds; lists keep the reader's order and are cut at their wire caps, an empty list is left out.
+struct BotWho
 {
     std::string name;
     std::string race;
     std::string className;
     std::string gender;  // male or female
     uint32_t level = 0;
-    std::string side;                                           // Alliance or Horde
-    std::string phrase;                                         // How it fights; required.
-    std::vector<std::pair<std::string, std::string>> crafts;    // Name, rank word; at most 8.
-    std::vector<std::string> useful;                            // At most 12.
-    std::vector<std::string> servants;                          // At most 8.
-    std::vector<std::pair<std::string, std::string>> standing;  // Faction, standing word; at most 6.
-    std::string guild;                                          // Empty: none.
-    std::vector<std::string> relatives;                         // At most 8.
+    uint8_t team = 2;  // The game's TeamId: 0 Alliance, 1 Horde; any other leaves the facts out.
 };
 
 // LC10 `input.traits` (playerbots ReadBotPersonality): every word and interest whole within MaxTraitBytes. Absent
@@ -182,9 +115,11 @@ struct Context
     bool speakerControlsBot = false;
     std::vector<std::string> observations;
     std::vector<Participant> party;
-    BotState state;  // Per request, filled at submit; never in a capture.
+    std::optional<PlayerbotBridge::BotStateFacts> state;  // Per request, filled at submit; never in a capture.
+    uint8_t statePlans = 0;  // StatePlan* bits of the bot's live bridge plans, read with the state.
     // LC10: per request like state, filled at submit; never in a capture.
-    std::optional<BotFacts> facts;
+    std::optional<PlayerbotBridge::BotFacts> facts;
+    BotWho who;  // Set with facts.
     BotTraits traits;
     // J6e-c: a wake request carries its condition and watch id as `input.wake`; depth and origin stay in the module
     // (a watch armed on this route opens wake depth + 1 and may not outlast origin + 10 minutes).
@@ -258,7 +193,7 @@ OllamaHttpHeaders Headers(Settings const& settings);
 bool Build(Settings const& settings, Request const& request, Clock now, std::string& body);
 // DS.14/J6e-c: the `input.state` activity kind as a code: 0 idle, 1 flying, 2 fighting, 3 casting, 4 looting,
 // 5 resting, 6 questing, 7 travelling (one classifier for the wire and the watches).
-uint8_t ActivityCode(BotState const& state);
+uint8_t ActivityCode(PlayerbotBridge::BotStateFacts const& state);
 Result Parse(Settings const& settings, Request const& request, std::string const& body, Clock now);
 
 // Reset is called ONLY by the trusted world activation owner after its retirement

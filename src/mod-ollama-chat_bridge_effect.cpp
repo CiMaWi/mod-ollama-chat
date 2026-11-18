@@ -335,7 +335,7 @@ OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters()
 uint8_t OllamaChat_BridgePlanKinds(uint64_t botGuid)
 {
     using OllamaBridge::PlanKind;
-    // The bits of OllamaBridge::BotState::plans follow PlanKind.
+    // The bits of OllamaBridge::Context::statePlans follow PlanKind.
     static_assert(OllamaBridge::StatePlanMovement == 1u << static_cast<unsigned>(PlanKind::Movement) &&
                   OllamaBridge::StatePlanFormation == 1u << static_cast<unsigned>(PlanKind::Formation) &&
                   OllamaBridge::StatePlanSaveMana == 1u << static_cast<unsigned>(PlanKind::SaveMana) &&

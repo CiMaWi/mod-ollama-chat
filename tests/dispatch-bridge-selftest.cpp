@@ -269,10 +269,10 @@ struct PlayerbotsMgr
 // J5f: the bot-state reader (playerbots, outside the extract) is a stand-in too. Each call reads 10 points less
 // health, the rest stays fixed; the marker zone shows whether state leaked into a capture or a prompt.
 unsigned stateFactsCalls = 0;
-void BridgeBotStateFacts(Player*, Player*, OllamaBridge::BotState& state)
+void BridgeBotStateFacts(Player*, Player*, OllamaBridge::Context& input)
 {
     ++stateFactsCalls;
-    state.present = true;
+    PlayerbotBridge::BotStateFacts& state = input.state.emplace();
     state.healthPct = 100.0f - 10.0f * static_cast<float>(stateFactsCalls);
     state.alive = true;
     state.zone = "MARKERZONE";
@@ -1192,13 +1192,14 @@ void StateTests()
     Check(stateFactsCalls == 1 && g_bridgeBindings.size() == 1, "state: a refresh reads no state");
     Check(AdapterSubmit(SRC_PARTY_LOCAL, "Where are you?"), "state: second message admitted");
     auto const second = g_queue.back().request.bridgeTicket;
-    Check(stateFactsCalls == 2 && first.request.input.state.present && second.request.input.state.present &&
-              first.request.input.state.healthPct == 90.0f && second.request.input.state.healthPct == 80.0f,
+    Check(stateFactsCalls == 2 && first.request.input.state && second.request.input.state &&
+              first.request.input.state->healthPct == 90.0f && second.request.input.state->healthPct == 80.0f,
           "state: each request carries its own fresh reading");
     Check(second.scope == first.scope && g_bridgeBindings.size() == 1,
           "state: a health-only difference stays BridgeSame (no renewal)");
     auto const leaks = [](std::string const& text) { return text.find("MARKERZONE") != std::string::npos; };
-    Check(!leaks(g_bridgeBindings[0].view.context.state.zone), "state: no state value in the binding");
+    Check(!g_bridgeBindings[0].view.context.state || !leaks(g_bridgeBindings[0].view.context.state->zone),
+          "state: no state value in the binding");
     Check(factsCalls == 2 && first.request.input.facts && second.request.input.facts &&
               second.request.input.facts->phrase == "MARKERFACT" && second.request.input.traits.words.size() == 1,
           "facts: each request reads the facts and traits at submit");
@@ -1356,7 +1357,7 @@ void WakeTests()
           "wake: the fixed in-world sentence and the watch's condition and id");
     Check(!input.directAddress && !wakeAddressed, "wake: never addressed, so a failure stays silent");
     Check(input.wakeDepth == 2 && input.originUnixMs == watch.originUnixMs, "wake: the chain's depth and origin");
-    Check(stateFactsCalls == 2 && input.state.present, "wake: the bot's state is read again for the wake");
+    Check(stateFactsCalls == 2 && input.state, "wake: the bot's state is read again for the wake");
     Check(input.facts && input.facts->phrase == "MARKERFACT", "wake: the facts are read for the wake too");
     Check(wakeScopeKey == "wake-scope" && wake.scope.botGuid == 77 && wake.scope.controllerGuid == players[2].guid &&
               wake.scope.contextId == line.scope.contextId,

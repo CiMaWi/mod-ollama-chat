@@ -1,11 +1,14 @@
 // LCB4: the bot's state, facts and wake exactly as Build encodes them in `input`. Links the production bridge unit
 // and calls Build and ActivityCode only; no game headers, no HTTP peer. Moved here from bridge-selftest (J5f, J6e-c,
-// LC10) so the wire of every state key is proven by a runnable test.
+// LC10) so the wire of every state key is proven by a runnable test. The state and the lasting facts are
+// playerbots' own structs (BridgeBotState.h, BridgeBotFacts.h); OpenKeyChecks proves that a key playerbots adds
+// reaches the wire with no module edit.
 #include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -52,10 +55,23 @@ OllamaBridge::Request Request()
 // J5f (DS.14 (d)): `input.state` exactly as Build encodes it. Absent unless present; every number bounded and every
 // string a card fact (64 bytes, no controls, valid UTF-8); the partner only in the bot's group or sight (yards and
 // position only on the same map); the combat target only the bot's own visible victim while alive and fighting.
-OllamaBridge::BotState FullState()
+using PlayerbotBridge::AroundKind;
+
+PlayerbotBridge::AroundEntry Around(std::string name, AroundKind kind, std::string detail, uint32_t count)
 {
-    OllamaBridge::BotState state;
-    state.present = true;
+    PlayerbotBridge::AroundEntry entry;
+    entry.Name = std::move(name);
+    entry.Kind = kind;
+    entry.Detail = std::move(detail);
+    entry.Count = count;
+    return entry;
+}
+
+constexpr uint8_t FullPlans = OllamaBridge::StatePlanMovement | OllamaBridge::StatePlanFocusHealing;
+
+PlayerbotBridge::BotStateFacts FullState()
+{
+    PlayerbotBridge::BotStateFacts state;
     state.healthPct = 73.4f;
     state.powerType = 0;
     state.powerCurrent = 4100;
@@ -90,24 +106,24 @@ OllamaBridge::BotState FullState()
     state.groupSize = 2;
     state.masterName = "Aldric";
     state.follow = true;
-    state.plans = OllamaBridge::StatePlanMovement | OllamaBridge::StatePlanFocusHealing;
     state.freeBagSlots = 14;
     state.money = 1234567;
     return state;
 }
 
 // The encoded `input.state`, or null when the envelope has none.
-nlohmann::json StateWire(OllamaBridge::BotState const& state)
+nlohmann::json StateWire(std::optional<PlayerbotBridge::BotStateFacts> const& state, uint8_t plans = FullPlans)
 {
     auto request = Request();
     request.input.state = state;
+    request.input.statePlans = plans;
     std::string body;
     Check(OllamaBridge::Build(Settings(), request, {1000000, 10000}, body), "state: build");
     auto const wire = nlohmann::json::parse(body);
     return wire["input"].contains("state") ? wire["input"]["state"] : nlohmann::json();
 }
 
-std::string StateActivityKind(OllamaBridge::BotState const& state)
+std::string StateActivityKind(PlayerbotBridge::BotStateFacts const& state)
 {
     return StateWire(state)["activity"]["kind"].get<std::string>();
 }
@@ -117,9 +133,7 @@ void StateChecks()
     using namespace OllamaBridge;
     float const nan = std::numeric_limits<float>::quiet_NaN();
     float const inf = std::numeric_limits<float>::infinity();
-    BotState absent = FullState();
-    absent.present = false;
-    Check(StateWire(absent).is_null() && StateWire(BotState()).is_null(), "state: absent unless present");
+    Check(StateWire(std::nullopt).is_null(), "state: absent unless read");
 
     Check(StateWire(FullState()) == nlohmann::json::parse(R"({"health":73,"power":{"kind":"mana","pct":50},"level":42,
         "alive":"alive","combat":{"target":{"name":"Defias Pillager","level":41,"health":35}},
@@ -253,13 +267,12 @@ void StateChecks()
     Check(StateWire(state)["movement"] == "passive", "state: passive");
     state.passive = false;
     Check(StateWire(state)["movement"] == "none", "state: no movement strategy");
-    state.plans = StatePlanMovement | StatePlanFormation | StatePlanSaveMana | StatePlanFocusHealing;
-    Check(StateWire(state)["plans"] == nlohmann::json({"movement", "formation", "save_mana", "focus_healing"}),
-          "state: plan bits in PlanKind order");
-    state.plans = StatePlanSaveMana;
-    Check(StateWire(state)["plans"] == nlohmann::json({"save_mana"}), "state: one plan");
-    state.plans = 0;
-    Check(!StateWire(state).contains("plans"), "state: no plans, no key");
+    Check(
+        StateWire(state, StatePlanMovement | StatePlanFormation | StatePlanSaveMana | StatePlanFocusHealing)["plans"] ==
+            nlohmann::json({"movement", "formation", "save_mana", "focus_healing"}),
+        "state: plan bits in PlanKind order");
+    Check(StateWire(state, StatePlanSaveMana)["plans"] == nlohmann::json({"save_mana"}), "state: one plan");
+    Check(!StateWire(state, 0).contains("plans"), "state: no plans, no key");
     for (auto const& [type, kind] : std::initializer_list<std::pair<uint8_t, char const*>>{
              {0, "mana"}, {1, "rage"}, {2, "focus"}, {3, "energy"}, {6, "runic"}})
     {
@@ -290,12 +303,11 @@ void StateChecks()
     state.partnerInGroup = state.partnerVisible = false;
     state.groupSize = 0;
     state.follow = false;
-    state.plans = 0;
-    sizes.push_back(StateWire(state).dump().size());  // Solo, partner unknown.
+    sizes.push_back(StateWire(state, 0).dump().size());  // Solo, partner unknown.
     state.travelling = false;
     state.questTitle.clear();
     state.area = state.zone;
-    sizes.push_back(StateWire(state).dump().size());  // Solo, idle.
+    sizes.push_back(StateWire(state, 0).dump().size());  // Solo, idle.
     state = FullState();
     state.inCombat = false;
     state.resting = true;
@@ -305,9 +317,8 @@ void StateChecks()
     state = FullState();
     state.victimName = state.questTitle = state.zone = state.area = state.partnerZone = state.masterName =
         std::string(80, 'w');
-    state.plans = 15;
     state.money = 4294967295u;
-    std::size_t const worst = StateWire(state).dump().size();
+    std::size_t const worst = StateWire(state, 15).dump().size();
     std::sort(sizes.begin(), sizes.end());
     std::cout << "bridge-state-selftest: input.state bytes p50 " << sizes[sizes.size() / 2] << ", max " << sizes.back()
               << " over " << sizes.size() << " fixtures; worst case (all strings at the cap) " << worst << '\n';
@@ -335,8 +346,8 @@ void WakeChecks()
     Check(body.find("987654321") == std::string::npos && !input.contains("wakeDepth") && !input.contains("depth"),
           "wake: depth and origin never on the wire");
 
-    auto const code = [](BotState const& state) { return static_cast<int>(ActivityCode(state)); };
-    BotState state = FullState();
+    auto const code = [](PlayerbotBridge::BotStateFacts const& state) { return static_cast<int>(ActivityCode(state)); };
+    auto state = FullState();
     Check(code(state) == 2, "activity code: fighting 2");
     state.flying = true;
     Check(code(state) == 1, "activity code: flying 1");
@@ -371,20 +382,28 @@ nlohmann::json InputWire(OllamaBridge::Request const& request)
     return nlohmann::json::parse(body)["input"];
 }
 
-OllamaBridge::BotFacts FullFacts()
+// Who the bot is (the adapter's getters) beside its lasting facts (playerbots' reader), as one request carries them.
+struct Facts
 {
-    OllamaBridge::BotFacts facts;
-    facts.name = "Thorgrim";
-    facts.race = "Dwarf";
-    facts.className = "Warrior";
-    facts.gender = "male";
-    facts.level = 42;
-    facts.side = "Alliance";
-    facts.phrase = "fights with a great axe in both hands";
-    facts.crafts = {{"Mining", "expert"}, {"Blacksmithing", "journeyman"}};
-    facts.useful = {"sharpening stones"};
-    facts.standing = {{"Ironforge", "honoured"}};
-    facts.guild = "Stonehearth";
+    OllamaBridge::BotWho who;
+    PlayerbotBridge::BotFacts lasting;
+};
+
+void PutFacts(OllamaBridge::Request& request, Facts const& facts)
+{
+    request.input.who = facts.who;
+    request.input.facts = facts.lasting;
+}
+
+Facts FullFacts()
+{
+    Facts facts;
+    facts.who = {"Thorgrim", "Dwarf", "Warrior", "male", 42, 0};
+    facts.lasting.phrase = "fights with a great axe in both hands";
+    facts.lasting.crafts = {{"Mining", "expert"}, {"Blacksmithing", "journeyman"}};
+    facts.lasting.useful = {"sharpening stones"};
+    facts.lasting.standing = {{"Ironforge", "honoured"}};
+    facts.lasting.guild = "Stonehearth";
     return facts;
 }
 
@@ -405,7 +424,7 @@ void FactsChecks()
                                            "speakerControlsBot", "speakerGuid", "text"},
           "lc10: without the new fields the input has exactly the old keys");
     auto request = Request();
-    request.input.facts = BotFacts();  // Present but without who or phrase: left out whole.
+    request.input.facts = PlayerbotBridge::BotFacts();  // Present but without who or phrase: left out whole.
     request.input.traits.words = {"", " \t", "\x01"};
     request.input.traits.interests = {"\xFF"};
     std::string body;
@@ -416,8 +435,8 @@ void FactsChecks()
     request.input.state = state;
     Check(Build(Settings(), request, {1000000, 10000}, body), "lc10: old state build");
     std::string const oldStateBody = body;
-    state.around = {{"", "hostile", "", 1}, {"Wolf", "beast", "", 1}};
-    state.servant = state.mount = " ";
+    state.around = {Around("", AroundKind::Hostile, "", 1), Around("Wolf", static_cast<AroundKind>(9), "", 1)};
+    state.servantName = state.mountName = " ";
     state.deeds = {"", "\xC3"};
     request.input.state = state;
     Check(Build(Settings(), request, {1000000, 10000}, body) && body == oldStateBody,
@@ -425,7 +444,7 @@ void FactsChecks()
 
     // Facts: who, phrase, the lists in the reader's order; empty lists and no guild left out.
     request = Request();
-    request.input.facts = FullFacts();
+    PutFacts(request, FullFacts());
     Check(InputWire(request)["facts"] == nlohmann::json::parse(R"({"who":{"name":"Thorgrim","race":"Dwarf",
         "class":"Warrior","gender":"male","level":42,"side":"Alliance"},
         "phrase":"fights with a great axe in both hands",
@@ -436,24 +455,24 @@ void FactsChecks()
     {
         auto facts = FullFacts();
         spoil(facts);
-        request.input.facts = facts;
+        PutFacts(request, facts);
         return !InputWire(request).contains("facts");
     };
-    Check(dropped([](BotFacts& f) { f.phrase = "  "; }) && dropped([](BotFacts& f) { f.name.clear(); }) &&
-              dropped([](BotFacts& f) { f.race = "\x01"; }) && dropped([](BotFacts& f) { f.className = "\xFF"; }) &&
-              dropped([](BotFacts& f) { f.gender = "other"; }) && dropped([](BotFacts& f) { f.level = 0; }) &&
-              dropped([](BotFacts& f) { f.side = "Scourge"; }),
+    Check(dropped([](Facts& f) { f.lasting.phrase = "  "; }) && dropped([](Facts& f) { f.who.name.clear(); }) &&
+              dropped([](Facts& f) { f.who.race = "\x01"; }) && dropped([](Facts& f) { f.who.className = "\xFF"; }) &&
+              dropped([](Facts& f) { f.who.gender = "other"; }) && dropped([](Facts& f) { f.who.level = 0; }) &&
+              dropped([](Facts& f) { f.who.team = 2; }),
           "lc10: facts left out whole when who or the phrase fails its rule");
     auto facts = FullFacts();
-    facts.level = 300;
-    facts.guild.clear();
-    facts.phrase = std::string(96, 'p');
-    facts.crafts = {{"Mining", ""}, {"", "expert"}, {"Herbalism", std::string(40, 'r')}};
-    facts.standing.clear();
-    facts.useful.assign(13, "torch");
-    facts.servants.assign(9, "Grimtooth");
-    facts.relatives = {"Brann", " "};
-    request.input.facts = facts;
+    facts.who.level = 300;
+    facts.lasting.guild.clear();
+    facts.lasting.phrase = std::string(96, 'p');
+    facts.lasting.crafts = {{"Mining", ""}, {"", "expert"}, {"Herbalism", std::string(40, 'r')}};
+    facts.lasting.standing.clear();
+    facts.lasting.useful.assign(13, "torch");
+    facts.lasting.servants.assign(9, "Grimtooth");
+    facts.lasting.relatives = {"Brann", " "};
+    PutFacts(request, facts);
     auto wire = InputWire(request)["facts"];
     Check(wire["who"]["level"] == 255 && !wire.contains("guild") && !wire.contains("standing") &&
               wire["phrase"] == std::string(96, 'p') &&
@@ -462,8 +481,8 @@ void FactsChecks()
               wire["useful"].size() == 12 && wire["servants"].size() == 8 &&
               wire["relatives"] == nlohmann::json::array({"Brann"}),
           "lc10: level capped, pairs need both texts (word cut at 32), lists at their caps, blanks dropped");
-    facts.phrase = std::string(97, 'p');
-    request.input.facts = facts;
+    facts.lasting.phrase = std::string(97, 'p');
+    PutFacts(request, facts);
     Check(InputWire(request)["facts"]["phrase"] == std::string(96, 'p'), "lc10: phrase cut at 96 bytes");
 
     // Traits: each word whole within 1024 bytes (never cut at 64), 32 words, 3 interests; one list alone is fine.
@@ -506,17 +525,17 @@ void FactsChecks()
     // deeds (whole sentences to 200 bytes, newest first, at most 3; a blank or invalid one dropped, not the state).
     request = Request();
     state = FullState();
-    state.around = {{"Defias Pillager", "hostile", "", 2},
-                    {"Wolf", "hostile", "", 0},
-                    {"Wolf\x01", "hostile", "", 1},
-                    {"Innkeeper Farley", "service", "innkeeper", 300},
-                    {"Strange Rock", "riddle", "", 1},
-                    {"\xFF", "object", "", 1},
-                    {std::string(70, 'n'), "person", std::string(70, 'd'), 1}};
+    state.around = {Around("Defias Pillager", AroundKind::Hostile, "", 2),
+                    Around("Wolf", AroundKind::Hostile, "", 0),
+                    Around("Wolf\x01", AroundKind::Hostile, "", 1),
+                    Around("Innkeeper Farley", AroundKind::Service, "innkeeper", 300),
+                    Around("Strange Rock", static_cast<AroundKind>(9), "", 1),
+                    Around("\xFF", AroundKind::Object, "", 1),
+                    Around(std::string(70, 'n'), AroundKind::Person, std::string(70, 'd'), 1)};
     for (int i = 0; i < 12; ++i)
-        state.around.push_back({"Kobold " + std::to_string(i), "hostile", "", 1});
-    state.servant = std::string(64, 's');
-    state.mount = std::string(65, 'm');
+        state.around.push_back(Around("Kobold " + std::to_string(i), AroundKind::Hostile, "", 1));
+    state.servantName = std::string(64, 's');
+    state.mountName = std::string(65, 'm');
     std::string const deed200 = std::string(199, 'd') + ".";
     std::string const deed201 = std::string(199, 'e') + "\xC3\xA9";  // Byte 200 inside a character.
     state.deeds = {deed200, " ", deed201, "\xC3\x28", std::string(201, 'f'), "A fourth deed."};
@@ -544,32 +563,40 @@ void FactsChecks()
 
     // Size: every new field at its cap (traits at 1024 bytes each) on the fixture request stays under the bound.
     request = Request();
-    BotFacts cap;
-    cap.name = cap.race = cap.className = cap.guild = std::string(64, 'x');
-    cap.gender = "female";
-    cap.level = 80;
-    cap.side = "Horde";
-    cap.phrase = std::string(96, 'p');
-    cap.crafts.assign(8, {std::string(64, 'c'), std::string(32, 'r')});
-    cap.useful.assign(12, std::string(64, 'u'));
-    cap.servants.assign(8, std::string(64, 's'));
-    cap.standing.assign(6, {std::string(64, 'f'), std::string(32, 'w')});
-    cap.relatives.assign(8, std::string(64, 'k'));
-    request.input.facts = cap;
+    Facts cap;
+    cap.who = {std::string(64, 'x'), std::string(64, 'x'), std::string(64, 'x'), "female", 80, 1};
+    cap.lasting.guild = std::string(64, 'x');
+    cap.lasting.phrase = std::string(96, 'p');
+    cap.lasting.crafts.assign(8, {std::string(64, 'c'), std::string(32, 'r')});
+    cap.lasting.useful.assign(12, std::string(64, 'u'));
+    cap.lasting.servants.assign(8, std::string(64, 's'));
+    cap.lasting.standing.assign(6, {std::string(64, 'f'), std::string(32, 'w')});
+    cap.lasting.relatives.assign(8, std::string(64, 'k'));
+    PutFacts(request, cap);
     request.input.traits.words.assign(32, "extremely careful");
     request.input.traits.interests.assign(3, "inns and ale");
     state = FullState();
     state.around.clear();
+    // LCB4: every object with its eight open rows at the bounds (24-byte keys, 64-byte texts).
+    std::vector<PlayerbotBridge::StateKey> openCap;
+    for (char key = 'a'; key < 'i'; ++key)
+        openCap.push_back({std::string(24, key), std::string(64, 'o')});
     for (int i = 0; i < 12; ++i)
-        state.around.push_back({std::string(60, 'a') + std::to_string(1000 + i), "hostile", std::string(64, 'd'), 255});
-    state.servant = state.mount = std::string(64, 'v');
+    {
+        state.around.push_back(
+            Around(std::string(60, 'a') + std::to_string(1000 + i), AroundKind::Hostile, std::string(64, 'd'), 255));
+        state.around.back().open = openCap;
+    }
+    state.open = openCap;
+    state.servantName = state.mountName = std::string(64, 'v');
     state.deeds.assign(3, std::string(200, 'z'));
     request.input.state = state;
     Check(Build(Settings(), request, {1000000, 10000}, body), "lc10: realistic traits build");
     std::size_t const realistic = body.size();
     auto const capped = nlohmann::json::parse(body)["input"];
     Check(capped["state"]["around"].size() == 12 && capped["facts"]["crafts"].size() == 8 &&
-              capped["state"]["deeds"].size() == 3,
+              capped["state"]["deeds"].size() == 3 && capped["state"].contains(std::string(24, 'h')) &&
+              capped["state"]["around"][11].contains(std::string(24, 'h')),
           "lc10: every list at its cap is sent whole");
     request.input.traits.words.assign(32, std::string(1024, 't'));
     request.input.traits.interests.assign(3, std::string(1024, 'i'));
@@ -577,6 +604,73 @@ void FactsChecks()
           "lc10: every new field at its cap stays under MaxRequestBytes");
     std::cout << "bridge-state-selftest: lc10 request bytes: old " << oldBody.size() << ", every new field at cap with "
               << "realistic traits " << realistic << ", with every trait at 1024 bytes " << body.size() << '\n';
+}
+
+// LCB4: a key playerbots adds as an open row reaches the wire with no module edit, on the state and on each around
+// entry, beside unchanged shaped keys. A row is dropped alone when its key is not [a-z][a-z_]{0,23}, is a key the
+// envelope writes itself or repeats a kept one, when its text does not survive the fact rule, or past the eighth
+// kept row of its object; numbers are clamped to +-1e9 and text follows the fact rule.
+void OpenKeyChecks()
+{
+    using PlayerbotBridge::StateKey;
+    auto state = FullState();
+    state.around = {Around("Wolf", AroundKind::Hostile, "", 2)};
+    auto const shaped = StateWire(state);
+    state.open.push_back({"probe", true});
+    state.around[0].open.push_back({"type", "beast"});
+    auto wire = StateWire(state);
+    Check(wire["probe"] == true && wire["around"][0]["type"] == "beast",
+          "open: a row added in playerbots reaches the state and an around entry");
+    wire.erase("probe");
+    wire["around"][0].erase("type");
+    Check(wire == shaped, "open: the shaped keys are unchanged beside the open rows");
+
+    state = FullState();
+    state.open = {{"Bad", true},
+                  {"9lives", true},
+                  {"has-dash", true},
+                  {std::string(25, 'k'), true},
+                  {"", true},
+                  {"health", 5},
+                  {"around", true},
+                  {"deeds", "x"},
+                  {"blank", " \t"},
+                  {"broken", "\xC3\x28"},
+                  {"first", 1},
+                  {"first", 2},
+                  {"big", int64_t{5000000000}},
+                  {"small", int64_t{-5000000000}},
+                  {"text", "a\x01" + std::string(70, 't')},
+                  {"flag", false},
+                  {std::string(24, 'k'), "keep"},
+                  {"under_score", 7},
+                  {"eighth", "last"},
+                  {"ninth", true}};
+    state.around = {Around("Wolf", AroundKind::Hostile, "", 2)};
+    state.around[0].open = {{"name", "x"}, {"count", 3}, {"kind", "y"}, {"detail", "z"}, {"type", "beast"}};
+    for (int i = 0; i < 8; ++i)
+        state.around[0].open.push_back({"extra_" + std::string(1, static_cast<char>('a' + i)), i});
+    wire = StateWire(state);
+    nlohmann::json open = nlohmann::json::object();
+    for (auto const& [key, value] : wire.items())
+        if (!shaped.contains(key))
+            open[key] = value;
+    Check(open == nlohmann::json({{"first", 1},
+                                  {"big", 1000000000},
+                                  {"small", -1000000000},
+                                  {"text", "a" + std::string(63, 't')},
+                                  {"flag", false},
+                                  {std::string(24, 'k'), "keep"},
+                                  {"under_score", 7},
+                                  {"eighth", "last"}}),
+          "open: bad keys, shaped keys, repeats, blank and invalid text and the ninth row dropped; bounds kept");
+    Check(wire["health"] == 73 && !wire.contains("deeds") && wire["around"][0]["name"] == "Wolf" &&
+              wire["around"][0]["count"] == 2 && wire["around"][0]["kind"] == "hostile" &&
+              !wire["around"][0].contains("detail"),
+          "open: a row never replaces a shaped key");
+    auto const& entry = wire["around"][0];
+    Check(entry.size() == 3 + 8 && entry["type"] == "beast" && entry.contains("extra_g") && !entry.contains("extra_h"),
+          "open: an around entry keeps its own eight rows");
 }
 }  // namespace
 
@@ -587,6 +681,7 @@ int main()
         StateChecks();
         WakeChecks();
         FactsChecks();
+        OpenKeyChecks();
         std::cout << "bridge-state-selftest: PASS " << checks << " state key checks\n";
         return 0;
     }
