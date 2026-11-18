@@ -1,5 +1,5 @@
 {
-    "tests": [
+    "tests": [
         {
             "file": "bridge-channel-dispatch-selftest.cpp",
             "includes": [
@@ -114,7 +114,19 @@
         },
         {
             "file": "bridge-selftest.cpp",
-            "baseline": "needs core headers (ScriptMgr.h) and stubs; no runner in the repo"
+            "includes": [
+                "tests/doubles",
+                "src",
+                "../mod-playerbots/src/Bot",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp"
+            ],
+            "flags": [
+                "ws2_32.lib"
+            ],
+            "success": "bridge-selftest: \\d+ checks passed"
         },
         {
             "file": "bridge-speech-routing-selftest.cpp",
@@ -161,7 +173,28 @@
         },
         {
             "file": "dispatch-bridge-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "includes": [
+                "tests/doubles",
+                "src",
+                "../mod-playerbots/src/Bot",
+                "{playerbots}/src/Bot/Debug",
+                "{core}/deps/fmt/include",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp",
+                "src/mod-ollama-chat_bridge_listener.cpp"
+            ],
+            "flags": [
+                "/DFMT_HEADER_ONLY",
+                "-Wno-mismatched-tags",
+                "-Wno-missing-field-initializers",
+                "ws2_32.lib"
+            ],
+            "success": "\\d+ dispatch bridge checks passed"
         },
         {
             "file": "lab-selftest.cpp",
@@ -171,7 +204,7 @@
                 "deps"
             ],
             "success": "lab selftest: \\d+ checks passed"
-        },
+        },
         {
             "file": "reply-split-selftest.cpp",
             "includes": [

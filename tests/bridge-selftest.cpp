@@ -24,7 +24,7 @@
 // The regular build compiles this source normally; no test API is exported.
 #include "../src/mod-ollama-chat_httpclient.cpp"
 
-// Standalone HTTP compilation supplies declarations via its forced-include fixture.
+// The unit's configuration values; tests/doubles stands in for the core headers its includes name.
 uint32_t g_HttpTimeoutSeconds = 0;
 bool g_DebugEnabled = true;
 
