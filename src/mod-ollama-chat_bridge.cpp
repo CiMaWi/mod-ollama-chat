@@ -452,6 +452,8 @@ bool ValidEndpoint(std::string const& value)
     return port > 0 && port <= 65535;
 }
 
+bool BridgeUsable(bool enabled, Settings const& settings) { return enabled && ValidSettings(settings); }
+
 bool ValidSettings(Settings const& settings)
 {
     // Provision at least 128 random bits as printable base64url/hex. Size cannot prove entropy.

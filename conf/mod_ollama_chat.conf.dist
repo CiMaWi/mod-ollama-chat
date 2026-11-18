@@ -33,79 +33,12 @@ OllamaChat.DebugShowFullPrompt = 0
 # OLLAMA LLM CONNECTION AND INFERENCE
 # --------------------------------------------
 
-# OllamaChat.Provider
-#     Description: Which API format OllamaChat.Url speaks. The module was
-#                  written for Ollama, but the only Ollama-specific part is
-#                  how one request is encoded, so other services can be used
-#                  by changing this, the Url, the Model and (usually) ApiKey.
-#
-#                  ollama     Ollama's native /api/generate endpoint. Default.
-#
-#                  openai     OpenAI Chat Completions format. This is the
-#                             de facto standard and covers OpenAI itself,
-#                             OpenRouter, Groq, Together, Mistral, DeepSeek,
-#                             xAI, Google Gemini (its OpenAI-compatible
-#                             endpoint), LM Studio, vLLM, llama.cpp server
-#                             and Ollama's own /v1/chat/completions route.
-#
-#                  anthropic  Anthropic Messages API, for Claude models
-#                             directly. (Claude is also reachable through
-#                             OpenRouter using the openai format.)
-#
-#                  bridge     Local native subscription bridge. Requires a game-bound
-#                             request and explicit local-link settings below. The
-#                             module never reads native credentials or selects models.
-#
-#                  Example settings for each:
-#
-#                    OpenAI
-#                      OllamaChat.Provider = openai
-#                      OllamaChat.Url      = https://api.openai.com/v1/chat/completions
-#                      OllamaChat.Model    = gpt-4o-mini
-#                      OllamaChat.ApiKey   = sk-...
-#
-#                    OpenRouter
-#                      OllamaChat.Provider = openai
-#                      OllamaChat.Url      = https://openrouter.ai/api/v1/chat/completions
-#                      OllamaChat.Model    = openai/gpt-4o-mini
-#                      OllamaChat.ApiKey   = sk-or-...
-#
-#                    Anthropic (Claude)
-#                      OllamaChat.Provider = anthropic
-#                      OllamaChat.Url      = https://api.anthropic.com/v1/messages
-#                      OllamaChat.Model    = claude-haiku-4-5-20251001
-#                      OllamaChat.ApiKey   = sk-ant-...
-#
-#                    LM Studio (local, no key)
-#                      OllamaChat.Provider = openai
-#                      OllamaChat.Url      = http://localhost:1234/v1/chat/completions
-#                      OllamaChat.Model    = <whatever LM Studio shows as the model id>
-#
-#                  Settings that have no equivalent on a provider are simply
-#                  not sent. For openai that is NumCtx, NumThreads,
-#                  RepeatPenalty, MinP and TopK; for anthropic it is those
-#                  plus TopP, Seed and the penalties. NumPredict is honoured
-#                  everywhere (anthropic requires a cap, so 0 becomes 1024).
-#
-#                  HTTPS endpoints need the module to have been built with
-#                  OpenSSL, which the build prints as "[mod-ollama-chat]
-#                  OpenSSL found - HTTPS support enabled".
-#
-#                  COST WARNING: random chatter and event chatter across many
-#                  bots adds up quickly against a metered API, and hosted
-#                  providers answer bursts with HTTP 429. Start with
-#                  EnableRandomChatter = 0, a low MaxConcurrentQueries, and
-#                  watch the provider's usage page before opening it up.
-#
-#     Default:     ollama
-OllamaChat.Provider = ollama
-
-# OllamaChat.Bridge.Instance / Provider / Endpoint / Token
-#     Description: Used only with Provider = bridge; empty defaults fail closed.
-#                  Instance identifies this game instance; Provider identifies the selected
-#                  native bridge, not a model or API format: claude, or empty for no bridge.
-#                  Any other value logs one error at config load and counts as empty.
-#                  Instance and Provider start with an ASCII letter or digit and use
+# OllamaChat.Bridge.Instance / Endpoint / Token
+#     Description: The bridge is the module's only generation path (provider claude).
+#                  An enabled module without valid bridge settings is idle: it logs one
+#                  line at config load, listens on no port, starts no workers and
+#                  generates nothing. Instance identifies this game instance.
+#                  Instance starts with an ASCII letter or digit and uses
 #                  1-128 ASCII letters, digits, dot, colon, underscore or hyphen. Endpoint
 #                  must be http://127.0.0.1 with an optional port in 1-65535, and no path,
 #                  query, credentials or trailing slash.
@@ -124,9 +57,8 @@ OllamaChat.Provider = ollama
 #                  a fresh epoch before generation can run. Queued requests keep their
 #                  captured settings/identity/deadline. World delivery rechecks authority.
 #                  This path has no automatic provider switch, retry or LLM fallback.
-#     Default:     all empty (bridge generation disabled)
+#     Default:     all empty (the module idles)
 OllamaChat.Bridge.Instance =
-OllamaChat.Bridge.Provider =
 OllamaChat.Bridge.Endpoint =
 OllamaChat.Bridge.Token =
 

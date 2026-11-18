@@ -86,11 +86,9 @@ OllamaProvider OllamaProvider_Parse(const std::string& text)
     if (lower == "anthropic" || lower == "claude")
         return OllamaProvider::Anthropic;
 
-    if (lower == "bridge")
-        return OllamaProvider::Bridge;
 
     LOG_WARN("module.ollamachat",
-             "[Ollama Chat] Unknown OllamaChat.Provider '{}'; expected ollama, openai, anthropic or bridge. "
+             "[Ollama Chat] Unknown OllamaChat.Provider '{}'; expected ollama, openai or anthropic. "
              "Falling back to ollama.", text);
     return OllamaProvider::Ollama;
 }
@@ -99,8 +97,6 @@ const char* OllamaProvider_Name(OllamaProvider provider)
 {
     switch (provider)
     {
-        case OllamaProvider::Bridge:
-            return "bridge";
         case OllamaProvider::OpenAI:    return "openai";
         case OllamaProvider::Anthropic: return "anthropic";
         default:                        return "ollama";
@@ -574,64 +570,14 @@ void LoadOllamaChatConfig()
     g_MaxBotsToPick                   = sConfigMgr->GetOption<uint32_t>("OllamaChat.MaxBotsToPick", 2);
     g_OllamaUrl                       = sConfigMgr->GetOption<std::string>("OllamaChat.Url", "http://localhost:11434/api/generate");
     g_OllamaModel                     = sConfigMgr->GetOption<std::string>("OllamaChat.Model", "llama3.2:1b");
-    g_OllamaProvider                  = OllamaProvider_Parse(sConfigMgr->GetOption<std::string>("OllamaChat.Provider", "ollama"));
     g_OllamaApiKey                    = TrimApiKey(sConfigMgr->GetOption<std::string>("OllamaChat.ApiKey", ""));
     g_OllamaApiKeyHeader              = sConfigMgr->GetOption<std::string>("OllamaChat.ApiKeyHeader", "");
     g_OllamaVerifyCertificates        = sConfigMgr->GetOption<int32_t>("OllamaChat.VerifyCertificates", -1);
 
     g_OllamaBridgeSettings.instance = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Instance", "");
-    g_OllamaBridgeSettings.provider = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Provider", "");
-    if (!g_OllamaBridgeSettings.provider.empty() && g_OllamaBridgeSettings.provider != "claude")
-    {
-        LOG_ERROR("module.ollamachat",
-                  "[Ollama Chat] OllamaChat.Bridge.Provider must be 'claude' or empty (got '{}'); treated as empty.",
-                  g_OllamaBridgeSettings.provider);
-        g_OllamaBridgeSettings.provider.clear();
-    }
+    g_OllamaBridgeSettings.provider = "claude";  // The wire's provider field: the one bridge there is.
     g_OllamaBridgeSettings.endpoint = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Endpoint", "");
     g_OllamaBridgeSettings.token = sConfigMgr->GetOption<std::string>("OllamaChat.Bridge.Token", "");
-    if (g_OllamaProvider == OllamaProvider::Bridge && !OllamaBridge::ValidSettings(g_OllamaBridgeSettings))
-        LOG_ERROR("module.ollamachat", "[Ollama Chat] Invalid bridge configuration; generation is disabled.");
-
-    // The endpoint path is provider-specific and the most common mistake is
-    // switching Provider while leaving Url on Ollama's /api/generate. Warn,
-    // do not override: proxies and self-hosted gateways use arbitrary paths.
-    if (g_OllamaProvider != OllamaProvider::Bridge)
-    {
-        const char* expected = nullptr;
-        switch (g_OllamaProvider)
-        {
-            case OllamaProvider::OpenAI:    expected = "/chat/completions"; break;
-            case OllamaProvider::Anthropic: expected = "/messages";         break;
-            default:                        expected = "/api/generate";     break;
-        }
-        if (g_OllamaUrl.find(expected) == std::string::npos)
-        {
-            LOG_WARN("module.ollamachat",
-                     "[Ollama Chat] OllamaChat.Provider is '{}' but OllamaChat.Url ('{}') does not "
-                     "contain '{}'. Check that the URL is the full endpoint for this provider.",
-                     OllamaProvider_Name(g_OllamaProvider), g_OllamaUrl, expected);
-        }
-        if (g_OllamaProvider != OllamaProvider::Ollama && g_OllamaApiKey.empty())
-        {
-            LOG_WARN("module.ollamachat",
-                     "[Ollama Chat] OllamaChat.Provider is '{}' and OllamaChat.ApiKey is empty. "
-                     "Hosted services will reject every request; local servers (LM Studio, vLLM) are fine.",
-                     OllamaProvider_Name(g_OllamaProvider));
-        }
-
-        // Say this at startup, once, rather than on every failed request. Every
-        // hosted provider is HTTPS-only, so without OpenSSL none of them work.
-        if (g_OllamaUrl.rfind("https://", 0) == 0 && !OllamaHttp_TlsAvailable())
-        {
-            LOG_ERROR("module.ollamachat",
-                      "[Ollama Chat] OllamaChat.Url is HTTPS but this build has no OpenSSL support, "
-                      "so every request will fail. Install the OpenSSL development package "
-                      "(Windows: 'vcpkg install openssl' or the Win64 OpenSSL installer; "
-                      "Linux: libssl-dev / openssl-devel), re-run CMake and confirm it prints "
-                      "'[mod-ollama-chat] OpenSSL found - HTTPS support enabled'.");
-        }
-    }
 
     g_OllamaNumPredict                = sConfigMgr->GetOption<uint32_t>("OllamaChat.NumPredict", 40);
     g_OllamaTemperature               = sConfigMgr->GetOption<float>("OllamaChat.Temperature", 0.8f);
@@ -952,6 +898,10 @@ void LoadOllamaChatConfig()
     // J5d: the mailbox's 127.0.0.1 transport; a reload restarts it only when the port or the token changed.
     OllamaDispatch_BridgeListen(channelEnabled, sConfigMgr->GetOption<uint32_t>("OllamaChat.Bridge.ChannelPort",
                                                                                 OllamaBridge::DefaultListenerPort));
+    if (g_Enable && !OllamaBridge::BridgeUsable(g_Enable, g_OllamaBridgeSettings))
+        LOG_INFO("module.ollamachat",
+                 "[Ollama Chat] Enabled without valid bridge settings (OllamaChat.Bridge.Instance, "
+                 "Endpoint, Token): idle, no listener, no workers, nothing is generated.");
 
     LoadPersonalityTemplatesFromDB();
 
@@ -1269,15 +1219,6 @@ void OllamaChatConfigWorldScript::OnStartup()
     g_LastHistorySaveTime   = nowSeed;
     g_LastMemorySaveTime    = nowSeed + static_cast<time_t>(g_MemorySaveInterval) * 60 / 3;
     g_LastSentimentSaveTime = nowSeed + static_cast<time_t>(g_SentimentSaveInterval) * 60 * 2 / 3;
-
-    // Ask Ollama what this model can actually do. Runs on its own thread so a
-    // missing or slow Ollama cannot stall worldserver startup; until it
-    // answers, think mode stays off, which is the safe default.
-    OllamaCapability_Init(true);
-
-    // Bounded worker pool. Replaces one detached std::thread per bot per
-    // message, and it is the only place LLM traffic is throttled now.
-    OllamaDispatch_Start();
 
     // Initialize RAG system if enabled
     if (g_EnableRAG) {

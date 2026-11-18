@@ -55,7 +55,6 @@ enum class OllamaProvider : uint8_t
                     // Mistral, DeepSeek, xAI, Gemini (compat endpoint), LM Studio,
                     // vLLM, llama.cpp server, and Ollama's own /v1/chat/completions
     Anthropic,      // Anthropic Messages API (Claude)
-    Bridge,      // Local subscription bridge; requires a game-bound request.
 };
 
 OllamaProvider OllamaProvider_Parse(const std::string& text);

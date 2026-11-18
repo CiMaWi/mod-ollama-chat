@@ -2092,17 +2092,16 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
         return;
     }
     if (lang == LANG_ADDON) return;
-    bool const bridgeProvider = OllamaConfig_Snapshot().provider == OllamaProvider::Bridge;
     // Only a human's line opens a bridge request. A bot's own replies (BridgeHuman false) and bot chains never do,
     // so generated speech cannot feed back into the bridge or start a bot-to-bot loop.
-    if (bridgeProvider && (!g_Enable || !BridgeHuman(player) || chainDepth || channel ||
-                           (sourceLocal != SRC_WHISPER_LOCAL && sourceLocal != SRC_PARTY_LOCAL &&
-                            sourceLocal != SRC_SAY_LOCAL && sourceLocal != SRC_YELL_LOCAL)))
+    if (!g_Enable || !BridgeHuman(player) || chainDepth || channel ||
+        (sourceLocal != SRC_WHISPER_LOCAL && sourceLocal != SRC_PARTY_LOCAL && sourceLocal != SRC_SAY_LOCAL &&
+         sourceLocal != SRC_YELL_LOCAL))
         return;
     // A whisper or party line with the command indicator is for playerbots' own chat hooks (the same rule,
     // ChatCommandLine.h): no request and no budget. Say and yell have no playerbots hook, so such a line stays chat.
     std::string commandLine;
-    if (bridgeProvider && (sourceLocal == SRC_WHISPER_LOCAL || sourceLocal == SRC_PARTY_LOCAL) &&
+    if ((sourceLocal == SRC_WHISPER_LOCAL || sourceLocal == SRC_PARTY_LOCAL) &&
         PlayerbotBridge::ExtractChatCommand(msg, commandLine))
     {
         if (g_DebugEnabled)
@@ -2112,34 +2111,16 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
     std::string chanName = (channel != nullptr) ? channel->GetName() : "Unknown";
     uint32_t channelId = (channel != nullptr) ? channel->GetChannelId() : 0;
     std::string receiverName = (receiver != nullptr) ? receiver->GetName() : "None";
-    if(g_DebugEnabled)
+    if (g_DebugEnabled)
     {
-        LOG_INFO("server.loading",
-                "[Ollama Chat] Player {} sent msg: '{}' | Source: {} | Channel Name: {} | Channel ID: {} | Receiver: {}",
-                player->GetName(), msg, (int)sourceLocal, chanName, channelId, receiverName);
+        LOG_INFO(
+            "server.loading",
+            "[Ollama Chat] Player {} sent msg: '{}' | Source: {} | Channel Name: {} | Channel ID: {} | Receiver: {}",
+            player->GetName(), msg, (int)sourceLocal, chanName, channelId, receiverName);
     }
 
-
-    auto startsWithWord = [](const std::string& text, const std::string& word) {
-        if (text.size() < word.size()) return false;
-        if (text.compare(0, word.size(), word) != 0) return false;
-        // If exact length match or next char is whitespace/punctuation, it's a word
-        return text.size() == word.size() || !std::isalnum((unsigned char)text[word.size()]);
-    };
-
-    // With the bridge provider only the command indicator above decides; no word list silences a line.
+    // Only the command indicator above decides; no word list silences a line.
     std::string trimmedMsg = rtrim(msg);
-    for (const std::string& blacklist : g_BlacklistCommands)
-    {
-        if (!bridgeProvider && startsWithWord(trimmedMsg, blacklist))
-        {
-            if (g_DebugEnabled)
-                LOG_INFO("server.loading",
-                         "[Ollama Chat] Message starts with '{}' (blacklisted). Skipping bot responses.",
-                         blacklist);
-            return;
-        }
-    }
     
     // Check if this channel type is disabled
     if (sourceLocal == SRC_GENERAL_LOCAL && g_DisableForCustomChannels)
@@ -2180,9 +2161,9 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
              
     PlayerbotAI* senderAI = PlayerbotsMgr::instance().GetPlayerbotAI(player);
     bool senderIsBot = (senderAI && senderAI->IsBotAI());
-    // J5g: a human's line under the bridge provider (the gate above already let only those through). The combat
-    // filter below spares a local model; a bridge reply to a human is exempt (DS.14: a fighting bot may just act).
-    bool const bridgeHumanLine = bridgeProvider && !senderIsBot;
+    // J5g: a human's line (the gate above lets only those through). A bridge reply to a human is exempt from the
+    // combat filter below (DS.14: a fighting bot may just act).
+    bool const bridgeHumanLine = !senderIsBot;
 
     // --- conversation governor -------------------------------------------
     // One key per conversation space so cooldowns, rate limits and repetition
@@ -2755,41 +2736,7 @@ void PlayerBotChatHandler::ProcessChat(Player* player, uint32_t /*type*/, uint32
             continue;
         }
 
-        if (bridgeProvider)
-        {
-            BridgeSubmit(bot, player, sourceLocal, msg, directAddress, scopeKey, chainDepth);
-            continue;
-        }
-
-        std::string prompt = GenerateBotPrompt(bot, msg, player);
-        if (prompt.empty())
-            continue;
-
-        OllamaChatRequest request;
-        request.botGuid     = bot->GetGUID().GetRawValue();
-        request.targetGuid  = senderGuid;
-        request.source      = sourceLocal;
-        request.channelName = channel ? channel->GetName() : std::string();
-        request.channelId   = channel ? channel->GetChannelId() : 0;
-        request.chainDepth  = chainDepth;
-        request.directAddress = directAddress;
-        request.scopeKey    = scopeKey;
-        request.prompt      = std::move(prompt);
-        request.botName     = bot->GetName();
-        request.originMessage = msg;
-        request.kind = (g_RoleplayEnable && g_RoleplayStrictness >= 1)
-                           ? OllamaRequestKind::RoleplayReply
-                           : OllamaRequestKind::ChatReply;
-        request.triggerBotReplies = (sourceLocal != SRC_WHISPER_LOCAL);
-        request.recordHistory     = !senderIsBot;
-        request.updateSentiment   = !senderIsBot && g_EnableSentimentTracking;
-
-        if (!OllamaDispatch_Submit(std::move(request)) && g_DebugEnabled)
-        {
-            LOG_INFO("module.ollamachat",
-                     "[Ollama Chat] Bot {} reply dropped: dispatcher queue full.",
-                     bot->GetName());
-        }
+        BridgeSubmit(bot, player, sourceLocal, msg, directAddress, scopeKey, chainDepth);
     }
 }
 

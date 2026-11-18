@@ -402,7 +402,6 @@ void Reset()
     g_done.clear();
     Check(OllamaBridge::DispatchSlot::Used() == 0, "all physical slots disposed");
     config = {};
-    config.provider = OllamaProvider::Bridge;
     config.bridge = {"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-bearer-only"};
     config.systemPrompt = "owned-system";
     g_bridgeWorld.Configured(true, config.bridge, "epoch-1");
@@ -544,7 +543,6 @@ void AdmissionTests()
     g_queue.clear();
     legacy.bridgeGeneration = 123;
     Check(!OllamaDispatch_Submit(legacy), "forged bridge tag rejected");
-    config.provider = OllamaProvider::Bridge;
     Check(!Submit(true, std::string(8193, 'x')), "actual builder rejects oversize context");
     Check(Submit(), "bound request admitted");
     auto const original = config;

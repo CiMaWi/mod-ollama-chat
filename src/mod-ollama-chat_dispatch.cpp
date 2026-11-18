@@ -744,8 +744,7 @@ OllamaBridge::ChannelListener g_bridgeListener(OllamaDispatch_ChannelReceive, Ol
 void OllamaDispatch_BridgeListen(bool channelEnabled, uint32_t port)
 {
     OllamaEndpointSettings const settings = OllamaConfig_Snapshot();
-    bool const wanted = channelEnabled && g_Enable && settings.provider == OllamaProvider::Bridge &&
-                        OllamaBridge::ValidSettings(settings.bridge);
+    bool const wanted = channelEnabled && OllamaBridge::BridgeUsable(g_Enable, settings.bridge);
     g_bridgeListener.Configure(wanted, port, wanted ? settings.bridge.token : std::string());
 }
 
@@ -783,7 +782,8 @@ void OllamaDispatch_BridgeConfigured(bool channelEnabled)
     g_bridgeChannel.Configure(channelEnabled);
     OllamaEndpointSettings const settings = OllamaConfig_Snapshot();
     std::string epoch;
-    if (g_Enable && settings.provider == OllamaProvider::Bridge && OllamaBridge::ValidSettings(settings.bridge))
+    bool const usable = OllamaBridge::BridgeUsable(g_Enable, settings.bridge);
+    if (usable)
     {
         // Core cryptographic entropy; never process id/time/CLI/model-provided authority.
         auto const bytes = Acore::Crypto::GetRandomBytes<32>();
@@ -795,8 +795,11 @@ void OllamaDispatch_BridgeConfigured(bool channelEnabled)
             epoch.push_back(hex[byte & 15]);
         }
     }
-    g_bridgeWorld.Configured(g_Enable && settings.provider == OllamaProvider::Bridge, settings.bridge,
-                             std::move(epoch));
+    g_bridgeWorld.Configured(g_Enable, settings.bridge, std::move(epoch));
+    // Workers start with the first usable bridge settings (start-up or reload) and live until shutdown; an idle
+    // module has none. Start is idempotent; reload never joins workers.
+    if (usable)
+        OllamaDispatch_Start();
 }
 
 void OllamaDispatch_Start()
@@ -857,7 +860,7 @@ void OllamaDispatch_Stop()
 
 bool OllamaDispatch_Submit(OllamaChatRequest request)
 {
-    if (request.bridgeGeneration || OllamaConfig_Snapshot().provider == OllamaProvider::Bridge)
+    if (request.bridgeGeneration)
         return false;
     if (request.prompt.empty() || request.botGuid == 0)
         return false;
@@ -924,8 +927,7 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
         return false;
     auto settings = OllamaConfig_Snapshot();
     Identity const identity{settings.bridge.instance, settings.bridge.provider, settings.bridge.endpoint, scope.epoch};
-    if (settings.provider != OllamaProvider::Bridge || settings.bridge.token != g_bridgeWorld.Snapshot().token ||
-        !(identity == g_bridgeWorld.Selected()))
+    if (settings.bridge.token != g_bridgeWorld.Snapshot().token || !(identity == g_bridgeWorld.Selected()))
         return false;
     auto slot = DispatchSlot::Acquire();
     if (!slot)

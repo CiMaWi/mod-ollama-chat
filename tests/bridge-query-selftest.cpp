@@ -533,6 +533,15 @@ void WatchArming()
           "watch: epoch retirement ends every watch");
 }
 
+void IdleMode()
+{
+    Settings const valid{"fixture", "claude", "http://127.0.0.1:47800", "synthetic-local-channel-token"};
+    Check(BridgeUsable(true, valid), "idle: enabled with valid bridge settings is usable");
+    Check(!BridgeUsable(true, Settings{"", "claude", "", ""}), "idle: enabled without bridge settings is idle");
+    Check(!BridgeUsable(true, Settings{"fixture", "claude", "http://127.0.0.1:47800", ""}), "idle: no token is idle");
+    Check(!BridgeUsable(false, valid), "idle: a disabled module is idle");
+}
+
 int main()
 {
     if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
@@ -548,6 +557,7 @@ int main()
         TopicPublication();
         CataloguePublication();
         WatchArming();
+        IdleMode();
         std::cout << "PASS " << checks << " production filtered query/event helper checks\n";
     }
     catch (std::exception const& error)

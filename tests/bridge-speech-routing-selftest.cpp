@@ -337,7 +337,6 @@ void Reset()
     g_done.clear();
     Check(OllamaBridge::DispatchSlot::Used() == 0, "all physical slots disposed");
     config = {};
-    config.provider = OllamaProvider::Bridge;
     config.bridge = {"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-bearer-only"};
     g_bridgeWorld.Configured(true, config.bridge, "epoch-1");
     Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures), "selected");

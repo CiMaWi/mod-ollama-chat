@@ -285,6 +285,9 @@ struct Result
 bool ValidIdentifier(std::string const& value);
 bool ValidEndpoint(std::string const& value);
 bool ValidSettings(Settings const& settings);
+// The module generates only through the bridge: enabled without valid settings, it is idle (no listener, no
+// workers).
+bool BridgeUsable(bool enabled, Settings const& settings);
 Clock Now();
 Deadline CaptureDeadline(Clock now, int64_t lifetimeMs);
 bool Expired(Deadline deadline, Clock now);

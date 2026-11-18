@@ -589,9 +589,6 @@ OllamaEndpointSettings OllamaConfig_Snapshot()
 
 OllamaHttpHeaders OllamaBuildRequestHeaders(const OllamaEndpointSettings& cfg)
 {
-    if (cfg.provider == OllamaProvider::Bridge)
-        return OllamaBridge::Headers(cfg.bridge);
-
     OllamaHttpHeaders headers;
 
     if (cfg.provider == OllamaProvider::Anthropic)
@@ -637,14 +634,6 @@ OllamaApiResult QueryOllama(const std::string& prompt, OllamaRequestKind kind)
 OllamaApiResult QueryOllama(std::string const& prompt, OllamaRequestKind kind, OllamaEndpointSettings const& cfg)
 {
     OllamaApiResult result;
-    // Never reinterpret background/legacy prompts as an authorized bridge request.
-    // This gate precedes capability policy, provider builders, retries and all HTTP.
-    if (cfg.provider == OllamaProvider::Bridge)
-    {
-        result.error = "bridge_requires_bound_request";
-        return result;
-    }
-
     if (prompt.empty())
     {
         result.error = "empty prompt";
@@ -840,7 +829,7 @@ void OllamaBridge_SetActivation(OllamaBridge::Identity identity)
 OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, OllamaBridge::Request const& request)
 {
     OllamaApiResult result;
-    if (settings.provider != OllamaProvider::Bridge || !OllamaBridge::ValidSettings(settings.bridge))
+    if (!OllamaBridge::ValidSettings(settings.bridge))
     {
         result.error = "bridge_invalid_configuration";
         return result;

@@ -104,10 +104,6 @@ bool OllamaChatConfigCommand::HandleOllamaReloadCommand(ChatHandler* handler)
     LoadOllamaChatConfig();
     Roleplay_Load();
 
-    // Re-probe: the operator may have just pointed the module at a different
-    // model, and think-mode support is per-model.
-    OllamaCapability_Init(true);
-
     // Clear personality assignments if RP personalities are disabled
     // This ensures that when re-enabled later, bots get fresh random assignments
     if (!g_EnableRPPersonalities)
@@ -508,14 +504,10 @@ bool OllamaChatConfigCommand::HandleOllamaStatusCommand(ChatHandler* handler)
     const GovernorStats       gov      = Governor_GetStats();
 
     handler->PSendSysMessage("|cff00ff00[Ollama Chat] Status|r");
-    // The API key is deliberately not shown here.
-    handler->PSendSysMessage("Module: {}   Provider: {}   Endpoint: {}   Model: {}   ApiKey: {}   HTTPS: {}",
-                             g_Enable ? "enabled" : "DISABLED",
-                             OllamaProvider_Name(g_OllamaProvider),
-                             g_OllamaUrl, g_OllamaModel,
-                             g_OllamaApiKey.empty() ? "not set" : "set",
-                             OllamaHttp_TlsAvailable() ? "available" : "NOT BUILT (no OpenSSL)");
-    handler->PSendSysMessage("Think: {}", OllamaCapability_StatusText());
+    handler->PSendSysMessage("Module: {}   Bridge: {}", g_Enable ? "enabled" : "DISABLED",
+                             OllamaBridge::BridgeUsable(g_Enable, g_OllamaBridgeSettings)
+                                 ? "configured"
+                                 : "idle (no valid OllamaChat.Bridge.Instance, Endpoint, Token)");
 
     handler->PSendSysMessage("Dispatcher: {} workers, {} queued, {} in flight, {} awaiting delivery",
                              dispatch.workers, dispatch.queuedRequests,
