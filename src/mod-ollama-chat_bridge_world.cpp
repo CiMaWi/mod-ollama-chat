@@ -479,8 +479,7 @@ bool WorldScope::operator==(WorldScope const& other) const
     return version == other.version && instance == other.instance && provider == other.provider &&
            epoch == other.epoch && botGuid == other.botGuid && controllerGuid == other.controllerGuid &&
            contextId == other.contextId && channel == other.channel && perceptionScope == other.perceptionScope &&
-           contextRevision == other.contextRevision && membershipRevision == other.membershipRevision &&
-           personaRevision == other.personaRevision;
+           contextRevision == other.contextRevision && membershipRevision == other.membershipRevision;
 }
 
 void WorldPolicy::Retire()
@@ -527,8 +526,7 @@ bool WorldPolicy::ObserveScope(WorldScope scope, Clock now)
         scope.provider != _selected.provider || scope.epoch != _selected.epoch || !scope.botGuid ||
         !scope.controllerGuid || (scope.channel != "direct" && scope.channel != "party") ||
         !ValidIdentifier(scope.contextId) || !ValidIdentifier(scope.perceptionScope) ||
-        !ValidIdentifier(scope.contextRevision) || !ValidIdentifier(scope.membershipRevision) ||
-        !ValidIdentifier(scope.personaRevision))
+        !ValidIdentifier(scope.contextRevision) || !ValidIdentifier(scope.membershipRevision))
         return false;
     Deadline const liveUntil = CaptureDeadline(now, WorldLivenessMs);
     if (Expired(liveUntil, now))

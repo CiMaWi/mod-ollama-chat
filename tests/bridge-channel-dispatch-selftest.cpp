@@ -48,7 +48,7 @@ struct Fixture
         Check(!world.ObserveDrain(true, RetirementProof::Unknown), "unknown restoration blocks activation");
         Check(world.ObserveDrain(channel.Drained(), RetirementProof::NoLiveCaptures), "real selection");
         Check(channel.Activate() == enable, "channel requires explicit opt in");
-        WorldScope scope{1, "fixture", "codex", "epoch-1", 11, 22, "context", "party", "visible", "c1", "m1", "p1"};
+        WorldScope scope{1, "fixture", "codex", "epoch-1", 11, 22, "context", "party", "visible", "c1", "m1"};
         Check(world.ObserveScope(scope, now), "trusted observed scope");
         Context input;
         input.speakerGuid = 22;
@@ -356,7 +356,7 @@ void HeartbeatReplayLedger()
 {
     ChannelPolicy policy;
     Clock const now{100000, 200000};
-    WorldScope scope{1, "fixture", "codex", "epoch", 11, 22, "context", "party", "visible", "c1", "m1", "p1"};
+    WorldScope scope{1, "fixture", "codex", "epoch", 11, 22, "context", "party", "visible", "c1", "m1"};
     Check(policy.Bind({"fixture", "codex", "", "epoch"}, "synthetic-local-channel-token"), "ledger bind");
     Check(policy.ObserveScope(scope, now), "ledger scope");
     std::string body;

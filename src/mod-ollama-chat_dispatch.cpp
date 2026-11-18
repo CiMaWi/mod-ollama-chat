@@ -4,7 +4,6 @@
 #include "mod-ollama-chat_config.h"
 #include "mod-ollama-chat_expression.h"
 #include "mod-ollama-chat_governor.h"
-#include "mod-ollama-chat_persona_bridge.h"
 #include "mod-ollama-chat_reply_split.h"
 #include "mod-ollama-chat_response.h"
 #include "mod-ollama-chat_roleplay.h"
@@ -38,8 +37,6 @@
 #include <thread>
 #include <vector>
 
-static_assert(OllamaBridge::MaxCardProposalBytes == OllamaPersona::MaxCardBytes);
-
 namespace
 {
     using Clock = std::chrono::steady_clock;
@@ -60,7 +57,6 @@ namespace
         std::string secondText;  // LC10: the bridge reply's second chat message, empty for one message.
         uint32_t          emoteId = 0;
         Clock::time_point deliverAt;
-        std::optional<std::string> personaProposal;  // Bridge card proposal; never chat text.
     };
 
     // --- shared state -----------------------------------------------------
@@ -149,7 +145,6 @@ void RunBridgeTask(Task& task)
         auto api = QueryOllamaBridge(completion.request.bridgeSettings, completion.request.bridgeTicket.request);
         completion.bridgeOutcome = BridgeOutcome(api);
         completion.text = std::move(api.text);
-        completion.personaProposal = std::move(api.personaProposal);
     }
     catch (...)
     {
@@ -442,22 +437,7 @@ bool PrepareBridge(Completion& c)
             OllamaChat_BridgeRemember(c.request.bridgeTicket, said);
     }
 
-    // BEGIN BRIDGE CARD DELIVERY -- extracted verbatim by the offline persona bridge check.
-    // DS.12: applies the provider's card of a successful generation that was offered one (no accepted card), against
-    // the revision and stamp the request was built from. The handler re-captures the binding; a queued write is not
-    // yet persistence.
-    void ProposeBridgeCard(Completion const& c)
-    {
-        auto const& card = c.request.bridgeTicket.request.input.card;
-        if (c.bridgeOutcome != OllamaBridge::WorldOutcome::Success || !c.personaProposal || !card.offered ||
-            card.accepted)
-            return;
-        auto const status =
-            OllamaChat_BridgeProposeCard(c.request.bridgeTicket, card.revision, card.stamp, *c.personaProposal);
-        LOG_INFO("module.ollamachat", "[Ollama Chat] Bridge card for bot {}: {}", c.request.botGuid,
-                 OllamaPersona::ProposalStatusName(status));
-    }
-
+    // BEGIN BRIDGE DELIVERY -- extracted verbatim by the offline speech routing check.
     void DeliverBridge(Completion const& c, OllamaWorldSnapshot const& world)
     {
         if (!BridgeCurrent(c) || !g_bridgeWorld.Consume(c.request.bridgeTicket, OllamaBridge::Now()))
@@ -469,11 +449,8 @@ bool PrepareBridge(Completion& c)
             ~TerminalRelease() { g_bridgeWorld.Cancel(ticket); }
         } release{c.request.bridgeTicket};
         DeliverBridgeLine(c, world);
-        // After the line, still under the claim: a staged write shows the card as loading, which would fail the
-        // line's later captures. A delivered or dropped line does not decide the proposal, nor the proposal the line.
-        ProposeBridgeCard(c);
     }
-    // END BRIDGE CARD DELIVERY
+    // END BRIDGE DELIVERY
 }
 
 // --------------------------------------------------------------------------

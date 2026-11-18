@@ -28,8 +28,8 @@ struct Fixture
 {
     ChannelPolicy policy;
     WorldScope scope{
-        1,       "fixture",       "codex",     "epoch-1",   9007199254740994ULL, 9007199254740993ULL, "conversation",
-        "party", "visible-party", "context-1", "members-1", "persona-1"};
+        1,       "fixture",       "codex",     "epoch-1",  9007199254740994ULL, 9007199254740993ULL, "conversation",
+        "party", "visible-party", "context-1", "members-1"};
     explicit Fixture(std::size_t ids = ChannelMaxRouteIds, std::size_t pending = ChannelMaxPending)
         : policy(ids, pending)
     {
@@ -167,7 +167,7 @@ void ExpiryAndScope()
     Check(f.Receive(f.Command("removed")) == ChannelError::Stale, "removed context rejected");
     Check(f.policy.ObserveScope(f.scope, now), "same scope can be observed again");
     Check(f.Receive(f.Command("revive")) == ChannelError::Stale, "reobservation cannot revive old request");
-    for (auto const* field : {"controller", "context", "membership", "persona", "perception", "channel"})
+    for (auto const* field : {"controller", "context", "membership", "perception", "channel"})
     {
         Fixture revision;
         revision.Open();
@@ -177,8 +177,6 @@ void ExpiryAndScope()
             revision.scope.contextRevision += "-new";
         if (std::string(field) == "membership")
             revision.scope.membershipRevision += "-new";
-        if (std::string(field) == "persona")
-            revision.scope.personaRevision += "-new";
         if (std::string(field) == "perception")
             revision.scope.perceptionScope += "-new";
         if (std::string(field) == "channel")

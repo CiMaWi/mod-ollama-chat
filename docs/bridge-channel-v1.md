@@ -121,7 +121,7 @@ kept); this is not an RNG: the activation owner supplies 128-bit cryptographical
 Do not destroy/recreate this helper under a still-active epoch to reset replay state.
 
 `ObserveScope` accepts trusted game captures only: exact identity, controller/bot, context/channel, perception,
-context/membership/persona revisions. At most 64 scopes, live for 5000 ms after a trusted observation. Scope removal,
+context/membership revisions. At most 64 scopes, live for 5000 ms after a trusted observation. Scope removal,
 revision change or lapse invalidates existing work permanently, even if an identical scope is registered later.
 `current` arguments are fresh world captures, never native JSON. J5b must also consult the actual world's observer/
 activation/currentness guards before acceptance and publication; this in-process state cannot discover a logout.

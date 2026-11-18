@@ -102,9 +102,8 @@ and a repetition history.
 The bridge builds the prompt; the module sends facts. Whatever is most concrete
 and quotable in them is what the model will talk about, so prefer things outside
 the bot -- people nearby, what just happened, where they are -- over facts about
-the bot itself. The bridge card's `traits` fact is the bot's three strongest
-trait words (mod-playerbots `ReadBotPersonality`, formatted by
-`mod-ollama-chat_trait_words.h`, words only, never numbers).
+the bot itself. The `traits` input is the bot's trait words (mod-playerbots
+`ReadBotPersonality`, words only, never numbers).
 
 ## Conventions
 

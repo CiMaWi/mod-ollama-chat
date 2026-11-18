@@ -131,7 +131,7 @@ struct Fixture
         channel.Configure(true);
         Check(channel.Activate(), "activate real channel");
         auto& guard = source.guard;
-        guard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "ctx", "direct", "p1", "c1", "m1", "v1"};
+        guard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "ctx", "direct", "p1", "c1", "m1"};
         guard.source = DispatchSource::Whisper;
         guard.speakerGuid = 22;
         guard.groupGuid = 33;

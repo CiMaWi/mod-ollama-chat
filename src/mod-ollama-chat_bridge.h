@@ -20,9 +20,8 @@ constexpr std::size_t MaxResponseBytes = 32768;
 // LC16c: the catalogue answer's bound, the hub link's MAX_REPLY_BYTES; every other body keeps MaxResponseBytes.
 constexpr std::size_t MaxCatalogueResponseBytes = 65536;
 constexpr std::size_t MaxTextBytes = 4096;
-// Persona card proposal body; equal to OllamaPersona::MaxCardBytes (checked where both are visible).
-constexpr std::size_t MaxCardProposalBytes = 8192;
-constexpr std::size_t MaxCardFactBytes = 64;  // Each string of `input.personaCard.context`.
+// The fact rule: each fact string in `input.facts` and `input.state` is at most this long.
+constexpr std::size_t MaxFactBytes = 64;
 // LC10: a recent deed in `input.state.deeds` is one whole record sentence, the cap LC7 carries across the wire
 // (playerbots RecordWords::MAX_SENTENCE, ChannelMaxTopicText, the bridge's MAX_STATE_DEED_BYTES); never the 64-byte
 // rule.
@@ -66,38 +65,10 @@ struct Participant
     uint64_t visibleTargetGuid = 0;
 };
 
-// DS.12 in-world facts about the bot for a card generation, gathered on world. Empty strings and level 0 are left
-// out of the wire; the envelope bounds and sanitizes every string.
-struct CardFacts
-{
-    std::string name;
-    std::string race;
-    std::string className;
-    std::string gender;
-    uint32_t level = 0;
-    std::string zone;
-    std::string faction;
-    std::string guild;
-    std::string traits;
-};
-
-// Optional persona card opportunity, set on world only for a ready card store. With an accepted card in the persona
-// text it says so; for a bot without a card it carries the facts (bounded per bot and generation), and the bridge
-// may return one card for exactly this revision, which the module applies itself. The stamp names the store
-// snapshot and never goes on the wire.
-struct CardOpportunity
-{
-    bool offered = false;
-    uint64_t revision = 0;  // Canonical decimal on the wire; 0 means no row yet.
-    uint64_t stamp = 0;
-    bool accepted = false;  // Only when the persona text ends with the accepted card (not when it did not fit).
-    CardFacts facts;        // On the wire as `context` exactly when the card is offered and not accepted.
-};
-
 // DS.14/J5f: the bot's own state for one request, raw as playerbots read it on world (BridgeBotState). It changes
-// constantly, so it is never part of a capture signature, the system prompt or the persona. The envelope filters it
+// constantly, so it is never part of a capture signature. The envelope filters it
 // (the partner only in the bot's group or in its sight, only the bot's own visible victim) and bounds every value;
-// strings follow the card-fact rule (MaxCardFactBytes, no controls, valid UTF-8). Absent from the wire unless present.
+// strings follow the fact rule (MaxFactBytes, no controls, valid UTF-8). Absent from the wire unless present.
 constexpr uint8_t StatePlanMovement = 1;  // Bits of BotState::plans, in PlanKind order.
 constexpr uint8_t StatePlanFormation = 2;
 constexpr uint8_t StatePlanSaveMana = 4;
@@ -204,8 +175,6 @@ struct Context
     uint64_t speakerGuid = 0;
     std::string channel;
     std::string text;
-    std::string systemPrompt;
-    std::string persona;
     std::string memory;
     std::string groupScope;
     bool directAddress = false;
@@ -213,8 +182,7 @@ struct Context
     bool speakerControlsBot = false;
     std::vector<std::string> observations;
     std::vector<Participant> party;
-    CardOpportunity card;  // Absent from the wire unless offered.
-    BotState state;        // Per request, filled at submit; never in a capture.
+    BotState state;  // Per request, filled at submit; never in a capture.
     // LC10: per request like state, filled at submit; never in a capture or a signature.
     std::optional<BotFacts> facts;
     BotTraits traits;
@@ -240,7 +208,6 @@ struct WorldScope
     std::string perceptionScope;
     std::string contextRevision;
     std::string membershipRevision;
-    std::string personaRevision;
 
     bool operator==(WorldScope const& other) const;
 };
@@ -274,8 +241,6 @@ struct Result
     bool silent = false;
     std::string error;  // Fixed reason only; never remote text, credentials or JSON exceptions.
     int status = 0;
-    // Validated card proposal body for the offered revision; never part of text. Staging it is a separate world step.
-    std::optional<std::string> personaProposal;
 };
 
 bool ValidIdentifier(std::string const& value);

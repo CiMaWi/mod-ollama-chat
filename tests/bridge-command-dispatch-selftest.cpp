@@ -117,7 +117,7 @@ struct Fixture
         world.Configured(true, settings, "epoch-1");
         Check(world.ObserveDrain(channel.Drained(), RetirementProof::NoLiveCaptures), "real selection");
         Check(channel.Activate(), "channel opt in");
-        WorldScope scope{1, "fixture", "codex", "epoch-1", 11, 22, "context", "party", "visible", "c1", "m1", "p1"};
+        WorldScope scope{1, "fixture", "codex", "epoch-1", 11, 22, "context", "party", "visible", "c1", "m1"};
         Check(world.ObserveScope(scope, now), "trusted observed scope");
         Context input;
         input.speakerGuid = 22;

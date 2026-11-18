@@ -50,7 +50,6 @@ OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, Ollama
     result.ok = bridge.ok;
     result.text = std::move(bridge.text);
     result.error = std::move(bridge.error);
-    result.personaProposal = std::move(bridge.personaProposal);
     result.silent = bridge.silent;
     return result;
 }

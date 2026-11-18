@@ -1,5 +1,6 @@
 // Offline production value-policy checks. No server, game objects, native observer or delivery proof.
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 
 #include "mod-ollama-chat_bridge_world.h"
@@ -22,8 +23,8 @@ Settings Config() { return {"fixture", "codex", "http://127.0.0.1:47800", "synth
 WorldScope Scope(WorldPolicy const& policy)
 {
     auto const selected = policy.Selected();
-    return {1,       selected.instance, selected.provider, selected.epoch, 11,         22, "conversation",
-            "party", "visible-party",   "context-1",       "membership-1", "persona-1"};
+    return {1,       selected.instance, selected.provider, selected.epoch, 11, 22, "conversation",
+            "party", "visible-party",   "context-1",       "membership-1"};
 }
 
 Context Input()
@@ -90,7 +91,7 @@ void OutcomesAndScopes()
     Select(policy, "world-epoch-scope");
     auto scope = Scope(policy);
     auto invalid = scope;
-    invalid.personaRevision.clear();
+    invalid.membershipRevision.clear();
     Check(!policy.ObserveScope(invalid, now), "partial scope rejected");
     Check(policy.ObserveScope(scope, now), "scope observed");
     auto first = policy.Reserve(scope, Input(), now, 1000);
@@ -171,6 +172,33 @@ void Capacity()
 }
 }  // namespace
 
+// LCB3b: the module has no persona card. A generation input carries no system prompt, persona or card, and a
+// result with a ninth key (an older bridge's card proposal) is malformed.
+void NoCardOnTheWire()
+{
+    WorldPolicy policy;
+    Select(policy, "world-epoch-card");
+    auto const scope = Scope(policy);
+    Check(policy.ObserveScope(scope, now), "card: scope observed");
+    auto const ticket = policy.Reserve(scope, Input(), now, 1000);
+    std::string body;
+    Check(Build(Config(), ticket.request, now, body), "card: generation built");
+    auto const input = nlohmann::json::parse(body)["input"];
+    Check(!input.contains("systemPrompt") && !input.contains("persona") && !input.contains("personaCard"),
+          "card: no system prompt, persona or card on the wire");
+    nlohmann::json reply = {{"version", 1},
+                            {"instance", "fixture"},
+                            {"provider", "codex"},
+                            {"epoch", ticket.request.epoch},
+                            {"requestId", ticket.request.requestId},
+                            {"deadlineUnixMs", ticket.request.deadline.unixMs},
+                            {"type", "generation.result"},
+                            {"text", "Onward."}};
+    Check(Parse(Config(), ticket.request, reply.dump(), now).ok, "card: an eight-key result parses");
+    reply["personaProposal"] = {{"revision", "0"}, {"body", "A careful hunter."}};
+    Check(!Parse(Config(), ticket.request, reply.dump(), now).ok, "card: a result with a card proposal is malformed");
+}
+
 int main()
 {
     try
@@ -178,6 +206,7 @@ int main()
         Lifecycle();
         OutcomesAndScopes();
         Capacity();
+        NoCardOnTheWire();
         std::cout << "PASS " << checks << " production world-policy checks\n";
     }
     catch (std::exception const& error)

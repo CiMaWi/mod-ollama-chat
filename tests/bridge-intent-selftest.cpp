@@ -35,8 +35,8 @@ Json Step(std::string const& act, Json const& params = Json::object()) { return 
 
 struct Fixture
 {
-    WorldScope scope{1,       "fixture",       "codex",     "epoch-1",   Bot,        Controller, "intent-test",
-                     "party", "visible-party", "context-1", "members-1", "persona-1"};
+    WorldScope scope{1,       "fixture",       "codex",     "epoch-1",  Bot, Controller, "intent-test",
+                     "party", "visible-party", "context-1", "members-1"};
     ChannelPolicy policy;
     ChannelMessage message;
 

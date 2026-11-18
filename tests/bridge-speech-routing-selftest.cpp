@@ -1,5 +1,5 @@
 // Generated bridge speech never reaches playerbots or mod-ollama-chat order parsing (J6b4a, hub J6b4-check runner).
-// Real: PrepareBridge, RouteMessage, DeliverBridgeLine, ProposeBridgeCard, DeliverBridge and
+// Real: PrepareBridge, RouteMessage, DeliverBridgeLine, DeliverBridge and
 // OllamaDispatch_SubmitBridge (extracted verbatim), the bridge policy units and playerbots' ChatCommandLine.h. Models:
 // the playerbots whisper hook (a whisper to a bot parses a command line) and the ProcessChat bridge gate (only a
 // human's line opens a request). Game objects, the governor, the API and cleanup are stand-ins. No full dispatch TU or
@@ -21,7 +21,6 @@
 #include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
-#include "mod-ollama-chat_persona_db.h"
 #include "mod-ollama-chat_reply_split.h"
 
 enum ChatChannelSourceLocal
@@ -68,11 +67,6 @@ OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
     static Closed executor;
     return executor;
 }
-namespace OllamaPersona
-{
-void ForgetPersona(uint64_t) {}
-void RetirePersonas(uint64_t) {}
-}  // namespace OllamaPersona
 
 #include "dispatch-types.inc"
 
@@ -303,11 +297,6 @@ void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const&, std::string con
     ++rememberCalls;
     remembered = reply;
 }
-OllamaPersona::ProposalStatus OllamaChat_BridgeProposeCard(OllamaBridge::WorldTicket const&, uint64_t, uint64_t,
-                                                           std::string)
-{
-    return {};
-}
 bool Observe(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard& guard)
 {
     guard = gameGuard;
@@ -332,7 +321,7 @@ void Reset()
     Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures), "selected");
     g_bridgeGeneration = g_bridgeWorld.Generation();
     gameGuard = {};
-    gameGuard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "party", "visible", "c1", "m1", "p1"};
+    gameGuard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "party", "visible", "c1", "m1"};
     gameGuard.source = OllamaBridge::DispatchSource::Party;
     gameGuard.speakerGuid = 33;
     gameGuard.groupGuid = 99;

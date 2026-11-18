@@ -55,8 +55,6 @@ OllamaBridge::Request Request()
     request.input.speakerGuid = request.controllerGuid;
     request.input.channel = "party";
     request.input.text = "Stay by me.\n\"quoted\"\\";
-    request.input.systemPrompt = "World rules\n";
-    request.input.persona = "A \"steady\" companion";
     request.input.memory = "We met by the inn.\\";
     request.input.groupScope = "party:9007199254740993";
     request.input.speakerControlsBot = true;
@@ -106,7 +104,8 @@ void BoundaryChecks()
     auto const wire = nlohmann::json::parse(body);
     Check(wire["controllerGuid"] == "9007199254740993" && wire["botGuid"] == "18446744073709551615",
           "uint64 GUID strings");
-    Check(wire["input"]["text"] == request.input.text && wire["input"]["persona"] == request.input.persona &&
+    Check(wire["input"]["text"] == request.input.text && !wire["input"].contains("systemPrompt") &&
+              !wire["input"].contains("persona") && !wire["input"].contains("personaCard") &&
               wire["input"]["memory"] == request.input.memory &&
               wire["input"]["party"][0]["name"] == request.input.party[0].name &&
               wire["input"]["observations"] == request.input.observations,
@@ -166,7 +165,7 @@ void BoundaryChecks()
     silentReply.erase("text");
     silentReply["silent"] = true;
     auto const silent = Parse(settings, request, silentReply.dump(), now);
-    Check(silent.ok && silent.silent && silent.text.empty() && silent.error.empty() && !silent.personaProposal,
+    Check(silent.ok && silent.silent && silent.text.empty() && silent.error.empty(),
           "DS.14: an action-only answer parsed as silent");
     for (auto const& value : {nlohmann::json(false), nlohmann::json(1), nlohmann::json("true"), nlohmann::json()})
     {
@@ -222,8 +221,6 @@ void BoundaryChecks()
     request.input.party.push_back(request.input.party.front());
     Check(!Build(settings, request, now, body), "duplicate participant rejected");
     request = Request();
-    request.input.persona.assign(8192, '\\');
-    request.input.systemPrompt.assign(8192, '\\');
     request.input.memory.assign(8192, '\\');
     request.input.observations.assign(32, std::string(1024, '\\'));
     Check(!Build(settings, request, now, body) && body.empty(), "encoded request byte cap");
@@ -1065,7 +1062,7 @@ void FactsChecks()
     for (auto const& item : oldInput.items())
         keys.push_back(item.key());
     Check(keys == std::vector<std::string>{"channel", "directAddress", "groupScope", "memory", "observations", "party",
-                                           "persona", "speakerControlsBot", "speakerGuid", "systemPrompt", "text"},
+                                           "speakerControlsBot", "speakerGuid", "text"},
           "lc10: without the new fields the input has exactly the old keys");
     auto request = Request();
     request.input.facts = BotFacts();  // Present but without who or phrase: left out whole.

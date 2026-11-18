@@ -1,7 +1,6 @@
 #ifndef MOD_OLLAMA_CHAT_API_H
 #define MOD_OLLAMA_CHAT_API_H
 
-#include <optional>
 #include <string>
 
 #include "mod-ollama-chat_bridge.h"
@@ -14,8 +13,7 @@ struct OllamaApiResult
     std::string text;
     bool ok = false;
     std::string error;
-    std::optional<std::string> personaProposal;  // bridge card proposal, never chat text
-    bool silent = false;                         // bridge action-only answer (DS.14): ok with empty text
+    bool silent = false;  // bridge action-only answer (DS.14): ok with empty text
 
     bool empty() const { return text.empty(); }
 };

@@ -30,9 +30,9 @@ bool Identifier(std::string const& value)
 bool SameScope(WorldScope const& a, WorldScope const& b)
 {
     return std::tie(a.version, a.instance, a.provider, a.epoch, a.botGuid, a.controllerGuid, a.contextId, a.channel,
-                    a.perceptionScope, a.contextRevision, a.membershipRevision, a.personaRevision) ==
+                    a.perceptionScope, a.contextRevision, a.membershipRevision) ==
            std::tie(b.version, b.instance, b.provider, b.epoch, b.botGuid, b.controllerGuid, b.contextId, b.channel,
-                    b.perceptionScope, b.contextRevision, b.membershipRevision, b.personaRevision);
+                    b.perceptionScope, b.contextRevision, b.membershipRevision);
 }
 
 bool ValidDeadline(Deadline deadline, Clock now)
@@ -705,8 +705,8 @@ bool ChannelPolicy::ObserveScope(WorldScope scope, Clock now)
         scope.provider != _identity.provider || scope.epoch != _identity.epoch || !scope.botGuid ||
         !scope.controllerGuid || !Identifier(scope.contextId) || !Identifier(scope.perceptionScope) ||
         !Identifier(scope.contextRevision) || !Identifier(scope.membershipRevision) ||
-        !Identifier(scope.personaRevision) || (scope.channel != "direct" && scope.channel != "party") ||
-        now.unixMs < 0 || now.unixMs > MaxSafeInteger - ScopeLifetimeMs || now.steadyMs < 0 ||
+        (scope.channel != "direct" && scope.channel != "party") || now.unixMs < 0 ||
+        now.unixMs > MaxSafeInteger - ScopeLifetimeMs || now.steadyMs < 0 ||
         now.steadyMs > std::numeric_limits<int64_t>::max() - ScopeLifetimeMs)
         return false;
     auto found =

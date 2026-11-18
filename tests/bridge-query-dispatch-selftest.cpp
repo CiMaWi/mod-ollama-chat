@@ -10,7 +10,6 @@
 #include <stdexcept>
 
 #include "mod-ollama-chat_bridge_query.h"
-#include "mod-ollama-chat_persona_db.h"
 
 using namespace OllamaBridge;
 using Json = nlohmann::json;
@@ -138,24 +137,12 @@ bool g_DisableForParty = false;
 bool g_DisableForSayYell = false;
 float g_SayDistance = 25;
 float g_YellDistance = 100;
-// The adapter's debug-only card churn line (J14c).
-bool g_DebugEnabled = false;
 #define LOG_INFO(...) ((void)0)
 bool OllamaIsRealPlayer(Player* player) { return player && player->human; }
-std::string Roleplay_BuildVoicePrompt(Player*) { return "A quiet traveler."; }
-
-// The extracted capture reads the persona card through the production store (compiled in, gate closed: voice only),
-// so a card is never offered.
 
 Clock clockNow;
 WorldPolicy g_bridgeWorld;
 }  // namespace
-
-namespace OllamaPersona
-{
-void ForgetPersona(uint64_t) {}
-void RetirePersonas(uint64_t) {}
-}  // namespace OllamaPersona
 
 QueryWorldSource& OllamaChat_BridgeQuerySource();
 bool OllamaChat_BridgeObserve(WorldTicket const&, DispatchGuard&);
@@ -199,12 +186,6 @@ auto g_bridgeObserver = ::OllamaChat_BridgeObserve;
 
 namespace
 {
-// BridgeSubmit, which this fixture does not extract, is the only caller of the extracted card opportunity.
-[[maybe_unused]] auto const g_cardOpportunityUse = &BridgeCardOpportunity;
-}  // namespace
-
-namespace
-{
 Settings const settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-token"};
 
 struct Fixture
@@ -241,7 +222,7 @@ struct Fixture
         BridgeView view;
         Check(BridgeCapture(11, 22, DispatchSource::Whisper, view), "capture production game scope");
         auto& scope = view.guard.scope;
-        scope.contextRevision = scope.membershipRevision = scope.personaRevision = scope.perceptionScope = "rev1";
+        scope.contextRevision = scope.membershipRevision = scope.perceptionScope = "rev1";
         guard = view.guard;
         Check(g_bridgeWorld.ObserveScope(scope, clockNow), "observe trusted scope");
         g_bridgeBindings.push_back({g_bridgeWorld.Generation(), view, CaptureDeadline(clockNow, WorldLivenessMs),

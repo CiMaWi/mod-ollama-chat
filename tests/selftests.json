@@ -1,9 +1,5 @@
 {
-    "tests": [
-        {
-            "file": "bridge-card-facts-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
-        },
+    "tests": [
         {
             "file": "bridge-channel-dispatch-selftest.cpp",
             "includes": [
@@ -163,42 +159,7 @@
                 "deps"
             ],
             "success": "lab selftest: \\d+ checks passed"
-        },
-        {
-            "file": "persona-adapter-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
-        },
-        {
-            "file": "persona-bridge-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
-        },
-        {
-            "file": "persona-card-selftest.cpp",
-            "includes": [
-                "src",
-                "../mod-playerbots/src/Bot",
-                "deps",
-                "{core}/deps/utf8cpp"
-            ],
-            "sources": [
-                "src/mod-ollama-chat_persona_card.cpp"
-            ],
-            "success": "persona-card selftest passed \\d+ checks"
-        },
-        {
-            "file": "persona-store-selftest.cpp",
-            "includes": [
-                "src",
-                "../mod-playerbots/src/Bot",
-                "deps",
-                "{core}/deps/utf8cpp"
-            ],
-            "sources": [
-                "src/mod-ollama-chat_persona_store.cpp",
-                "src/mod-ollama-chat_persona_card.cpp"
-            ],
-            "success": "persona-store selftest: \\d+ checks passed"
-        },
+        },
         {
             "file": "reply-split-selftest.cpp",
             "includes": [
