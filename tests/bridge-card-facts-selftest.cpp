@@ -118,7 +118,7 @@ bool ReadBotPersonality(ObjectGuid const&, BotPersonality& out)
     out = BotPersonality();
     if (!g_traitsPresent)
         return false;
-    out.words = {"very careful", "deeply devout", "rather bookish", "rather suspicious"};
+    out.words = {"careful", "deeply devout", "bookish", "suspicious"};
     out.interests = {"fishing"};
     return true;
 }

@@ -29,7 +29,8 @@ struct Fixture
     WorldScope scope{
         1,       "fixture",       "codex",     "epoch-1",   9007199254740994ULL, 9007199254740993ULL, "conversation",
         "party", "visible-party", "context-1", "members-1", "persona-1"};
-    explicit Fixture(std::size_t ids = ChannelMaxIds, std::size_t pending = ChannelMaxPending) : policy(ids, pending)
+    explicit Fixture(std::size_t ids = ChannelMaxRouteIds, std::size_t pending = ChannelMaxPending)
+        : policy(ids, pending)
     {
         Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}, bearer), "trusted selected epoch binding");
         Check(policy.ObserveScope(scope, now), "trusted scope registration");
@@ -69,7 +70,10 @@ struct Fixture
     ChannelError Receive(Json const& json, Clock clock = now)
     {
         ChannelMessage result;
-        std::string const route = json.at("requestId").is_string() ? json.at("requestId").get<std::string>() : "work";
+        // A query opens under the fixture's generation route (LC.35); other messages name their own route.
+        bool const query = json.contains("type") && json.at("type") == "query";
+        std::string const route =
+            !query && json.at("requestId").is_string() ? json.at("requestId").get<std::string>() : "work";
         return policy.Receive(bearer, json.dump(), scope, clock, result, route);
     }
 };
@@ -98,19 +102,17 @@ void IdentityAndTerminal()
     auto terminal = f.Wire("generation.result");
     terminal["text"] = "I shall wait here.";
     Check(f.Receive(terminal) == ChannelError::None, "one terminal result");
-    Check(f.Receive(terminal) == ChannelError::Closed, "duplicate terminal blocked");
-    Check(f.Receive(f.Command("late")) == ChannelError::Closed, "command cannot follow terminal");
+    // LC.35: the terminal drops the route with its ids; whatever follows finds no route.
+    Check(f.Receive(terminal) == ChannelError::Unknown, "duplicate terminal blocked");
+    Check(f.Receive(f.Command("late")) == ChannelError::Unknown, "command cannot follow terminal");
     auto failure = f.Wire("failure");
     failure["code"] = "unavailable";
-    Check(f.Receive(failure) == ChannelError::Closed, "failure cannot replace terminal");
+    Check(f.Receive(failure) == ChannelError::Unknown, "failure cannot replace terminal");
     std::string body;
     ChannelEnvelope envelope{"fixture", "codex", "epoch-1", "work", deadline.unixMs};
-    Check(f.policy.FinishCommand(envelope, "effect", ChannelOutcome::Failed, f.scope, now, body) == ChannelError::None,
-          "failed staged proposal reports once even after parent terminal");
-    Check(Json::parse(body).at("outcome") == "failed", "typed fixed outcome");
-    Check(f.policy.FinishCommand(envelope, "effect", ChannelOutcome::Applied, f.scope, now, body) ==
-              ChannelError::Duplicate,
-          "failed command id never retries");
+    // WorldChannel finishes every command in the tick it arrives, so nothing is left to report after the terminal.
+    Check(f.policy.FinishCommand(envelope, "effect", ChannelOutcome::Failed, f.scope, now, body) == ChannelError::Stale,
+          "a closed route reports no staged proposal");
     Check(body.empty(), "rejected result has no stale output");
     auto nativeResult = f.Wire("command.result");
     nativeResult["commandId"] = "effect";
@@ -122,7 +124,7 @@ void IdentityAndTerminal()
     failure = failed.Wire("failure");
     failure["code"] = "timeout";
     Check(failed.Receive(failure) == ChannelError::None, "failure terminal accepted");
-    Check(failed.Receive(failed.Command()) == ChannelError::Closed, "failure cannot authorize effects");
+    Check(failed.Receive(failed.Command()) == ChannelError::Unknown, "failure cannot authorize effects");
     Check(failed.policy.Bind({"fixture", "codex", "", "epoch-2"}, bearer + "-new"), "reconnect uses new epoch");
     Check(!failed.policy.ObserveScope(failed.scope, now), "reconnect rejects old scope");
     Check(failed.Receive(failure) == ChannelError::Unauthorized, "old bearer retired");
@@ -135,7 +137,8 @@ void IdentityAndTerminal()
     Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result, "work") ==
               ChannelError::Unknown,
           "reconnect cannot reopen old work");
-    Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-1"}, bearer), "retired epoch reuse fails closed");
+    // LC.35: only the previous binding's epoch is remembered (epochs are 128-bit random, never reissued).
+    Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-2"}, bearer), "retired epoch reuse fails closed");
     Check(!failed.policy.ObserveScope(failed.scope, now), "bad activation leaves inactive");
 }
 
@@ -145,10 +148,11 @@ void ExpiryAndScope()
     {
         Fixture f;
         f.Open();
-        Check(f.Receive(f.Command(), clock) == ChannelError::Stale,
+        // LC.35: expiry drops the route; the trusted clock's high-water mark keeps its id from reopening.
+        Check(f.Receive(f.Command(), clock) == ChannelError::Unknown,
               "expiry equality on either clock including rollback");
-        Check(f.policy.RequestReservations() == 1 && f.policy.Pending() == 0, "expiry retains replay id");
-        Check(f.policy.OpenGeneration(f.scope, "work", deadline, now) == ChannelError::Duplicate,
+        Check(f.policy.RequestReservations() == 0 && f.policy.Pending() == 0, "expiry drops the route");
+        Check(f.policy.OpenGeneration(f.scope, "work", deadline, now) == ChannelError::Stale,
               "expired id cannot reopen");
     }
     Fixture f;
@@ -310,9 +314,10 @@ void Schemas()
     Check(f.Receive(terminal) == ChannelError::None, "exact text byte maximum");
 }
 
-void QueriesEventsAndCapacity()
+void QueriesAndCapacity()
 {
     Fixture f;
+    f.Open();  // LC.35: queries open under a live generation route.
     ChannelMessage query;
     Check(f.policy.Receive(bearer, f.Query().dump(), f.scope, now, query, "work") == ChannelError::None,
           "authenticated reverse query");
@@ -358,62 +363,132 @@ void QueriesEventsAndCapacity()
     Check(f.policy.FinishFailure(query.envelope, ChannelFailure::Cancelled, f.scope, now, body) == ChannelError::Stale,
           "local failure terminal once");
     Check(f.Receive(f.Command("query-after-failure", "q3")) == ChannelError::Closed, "failed query remains closed");
-    Check(f.policy.OpenEvents(f.scope, "events", deadline, std::vector<ChannelObservedMark>(32, {1, 7}), now, body) ==
-              ChannelError::None,
-          "maximum event batch");
-    parsed = Json::parse(body);
-    Check(parsed.at("events").size() == 32 && parsed.at("events").at(0).size() == 3, "only observed mark schema");
-    Check(f.Receive(f.Wire("events.result", "events")) == ChannelError::None, "event acknowledgement terminal");
-    Check(f.Receive(f.Wire("events.result", "events")) == ChannelError::Closed, "event terminal replay rejected");
-    Check(f.policy.OpenEvents(f.scope, "overevents", deadline, std::vector<ChannelObservedMark>(33, {1, 0}), now,
-                              body) == ChannelError::Invalid,
-          "oversize event batch");
-    Check(f.policy.OpenEvents(f.scope, "badmark", deadline, {{1, 8}}, now, body) == ChannelError::Invalid,
-          "mark icon bound");
     Fixture slots(4, 1);
     slots.Open();
     Check(slots.Receive(slots.Query()) == ChannelError::Capacity, "pending work fails closed");
     auto failure = slots.Wire("failure");
     failure["code"] = "cancelled";
     Check(slots.Receive(failure) == ChannelError::None, "terminal releases only logical pending work");
-    Check(slots.Receive(slots.Query()) == ChannelError::None, "capacity reuse with fresh request id");
-    Check(slots.policy.RequestReservations() == 2, "terminal replay reservation retained");
+    Check(slots.Receive(slots.Query()) == ChannelError::Unknown, "a closed route opens no query");
+    slots.Open("work-2");
+    Check(slots.policy.RequestReservations() == 1, "a closed route keeps no replay reservation");
     Fixture commands(2);
     commands.Open();
     Check(commands.Receive(commands.Command("a")) == ChannelError::None, "first effect reservation");
     Check(commands.Receive(commands.Command("b")) == ChannelError::None, "last effect reservation");
     Check(commands.Receive(commands.Command("c")) == ChannelError::Capacity,
-          "effect capacity rejects instead of eviction");
+          "the route's id bound rejects instead of eviction");
     Check(commands.Receive(commands.Command("a")) == ChannelError::Duplicate, "oldest live effect retained");
+    // LC.35: 5,000 generations with 3 queries each in one epoch, every one admitted. Each closed route leaves the
+    // ledger with its ids, so a late replay of any of them finds no route.
     Fixture full;
-    for (std::size_t i = 0; i < ChannelMaxIds; ++i)
+    for (std::size_t i = 0; i < 5000; ++i)
     {
         auto const id = "work-" + std::to_string(i);
-        full.Open(id);
-        auto fail = full.Wire("failure", id);
-        fail["code"] = "unavailable";
-        Check(full.Receive(fail) == ChannelError::None, "retained request terminal");
+        Check(full.policy.OpenGeneration(full.scope, id, deadline, now) == ChannelError::None,
+              "5000: every generation admitted");
+        for (std::size_t k = 0; k < 3; ++k)
+        {
+            ChannelMessage asked;
+            Check(full.policy.Receive(bearer, full.Query("q-" + std::to_string(i) + "-" + std::to_string(k)).dump(),
+                                      full.scope, now, asked, id) == ChannelError::None,
+                  "5000: every query admitted");
+        }
+        Check(full.Receive(full.Command("c-" + std::to_string(i), id)) == ChannelError::None,
+              "5000: every command admitted");
+        auto close = full.Wire(i % 2 ? "generation.result" : "failure", id);
+        if (i % 2)
+            close["text"] = "Done.";
+        else
+            close["code"] = "unavailable";
+        Check(full.Receive(close) == ChannelError::None, "5000: every route closes");
     }
-    Check(full.policy.RequestReservations() == 4096, "exact epoch request maximum");
-    Check(full.policy.OpenGeneration(full.scope, "overflow", deadline, now) == ChannelError::Capacity,
-          "request capacity fails closed");
-    Check(full.policy.OpenGeneration(full.scope, "work-0", deadline, now) == ChannelError::Duplicate,
-          "oldest terminal id retained");
+    Check(
+        full.policy.RequestReservations() == 0 && full.policy.CommandReservations() == 0 && full.policy.Pending() == 0,
+        "closed routes leave an empty ledger");
+    auto lateFailure = full.Wire("failure", "work-0");
+    lateFailure["code"] = "unavailable";
+    auto lateText = full.Wire("generation.result", "work-1");
+    lateText["text"] = "Again.";
+    ChannelMessage late;
+    Check(full.Receive(lateFailure) == ChannelError::Unknown && full.Receive(lateText) == ChannelError::Unknown &&
+              full.Receive(full.Command("c-0", "work-0")) == ChannelError::Unknown &&
+              full.policy.Receive(bearer, full.Query("q-0-0").dump(), full.scope, now, late, "work-0") ==
+                  ChannelError::Unknown,
+          "a late replay of a closed route's failure, text, command or query is unknown_request");
+    Fixture pair;
+    pair.Open("route-a");
+    pair.Open("route-b");
+    ChannelMessage asked;
+    Check(
+        pair.policy.Receive(bearer, pair.Query("qa").dump(), pair.scope, now, asked, "route-a") == ChannelError::None &&
+            pair.policy.Receive(bearer, pair.Query("qb").dump(), pair.scope, now, asked, "route-b") ==
+                ChannelError::None &&
+            pair.Receive(pair.Command("ca", "route-a")) == ChannelError::None &&
+            pair.Receive(pair.Command("cb", "route-b")) == ChannelError::None,
+        "two routes, each with a query and a command");
+    auto closeA = pair.Wire("generation.result", "route-a");
+    closeA["text"] = "Done.";
+    Check(pair.Receive(closeA) == ChannelError::None, "route a closes");
+    Check(pair.policy.RequestReservations() == 2 && pair.policy.CommandReservations() == 1,
+          "only the closed route's ids leave the ledger");
+    Check(pair.Receive(pair.Command("cb", "route-b")) == ChannelError::Duplicate &&
+              pair.policy.Receive(bearer, pair.Query("qb").dump(), pair.scope, now, asked, "route-b") ==
+                  ChannelError::Duplicate,
+          "the open route's ids stay refused as duplicates");
+    Check(pair.Receive(pair.Command("ca", "route-a")) == ChannelError::Unknown,
+          "a closed route's command id never lands on that route");
+    // A dropped route's ids are answered nowhere: not under their own envelope and not under the open route's.
+    std::string none;
+    auto const envelopeOf = [&](std::string id)
+    {
+        return ChannelEnvelope{pair.scope.instance, pair.scope.provider, pair.scope.epoch, std::move(id),
+                               deadline.unixMs};
+    };
+    Check(pair.policy.FinishCommand(envelopeOf("route-a"), "ca", ChannelOutcome::Applied, pair.scope, now, none) ==
+                  ChannelError::Stale &&
+              pair.policy.FinishCommand(envelopeOf("route-b"), "ca", ChannelOutcome::Applied, pair.scope, now, none) ==
+                  ChannelError::Unknown &&
+              pair.policy.FinishQuery(envelopeOf("qa"), pair.scope, {}, now, none) == ChannelError::Stale &&
+              none.empty(),
+          "a closed route's command and query are answered on no route");
+    Check(pair.policy.FinishCommand(envelopeOf("route-b"), "cb", ChannelOutcome::Applied, pair.scope, now, none) ==
+                  ChannelError::None &&
+              Json::parse(none).at("requestId") == "route-b",
+          "the open route's command still reports once, on its own route");
+    Fixture aging;
+    aging.Open("old");
+    Check(aging.policy.Receive(bearer, aging.Query("old-q").dump(), aging.scope, now, asked, "old") ==
+                  ChannelError::None &&
+              aging.Receive(aging.Command("old-c", "old")) == ChannelError::None,
+          "expiry: a route with a query and a command");
+    Clock const after{deadline.unixMs, deadline.steadyMs};
+    aging.policy.Expire(after);
+    Check(aging.policy.RequestReservations() == 0 && aging.policy.CommandReservations() == 0,
+          "expiry: a route at its deadline leaves the ledger with its ids");
+    auto lateTimeout = aging.Wire("failure", "old");
+    lateTimeout["code"] = "timeout";
+    Check(aging.Receive(lateTimeout, after) == ChannelError::Unknown &&
+              aging.Receive(aging.Command("old-c", "old"), after) == ChannelError::Unknown,
+          "expiry: a late replay finds no route");
     ChannelPolicy invalid(0);
     Check(!invalid.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "zero capacity fails closed");
-    ChannelPolicy tooMany(ChannelMaxIds + 1);
+    ChannelPolicy tooMany(ChannelMaxRouteIds + 1);
     Check(!tooMany.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "cannot expand id bound");
     ChannelPolicy tooPending(1, ChannelMaxPending + 1);
     Check(!tooPending.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "cannot expand pending bound");
 
     Fixture effects;
     effects.Open();
-    for (std::size_t i = 0; i < ChannelMaxIds; ++i)
+    for (std::size_t i = 0; i < ChannelMaxRouteIds; ++i)
         Check(effects.Receive(effects.Command("effect-" + std::to_string(i))) == ChannelError::None,
-              "reserve full effect namespace");
-    Check(effects.policy.CommandReservations() == 4096, "exact effect maximum");
-    Check(effects.Receive(effects.Command("overflow")) == ChannelError::Capacity, "full effect namespace refuses");
+              "a route holds its full id bound");
+    Check(effects.policy.CommandReservations() == ChannelMaxRouteIds, "exact route id maximum");
+    Check(effects.Receive(effects.Command("overflow")) == ChannelError::Capacity, "a full route refuses another id");
     Check(effects.Receive(effects.Command("effect-0")) == ChannelError::Duplicate, "first effect never evicted");
+    Check(effects.policy.Receive(bearer, effects.Query("q-over").dump(), effects.scope, now, asked, "work") ==
+              ChannelError::Capacity,
+          "queries share the route's id bound");
     Fixture scopes;
     for (unsigned i = 1; i < ChannelMaxScopes; ++i)
     {
@@ -426,14 +501,15 @@ void QueriesEventsAndCapacity()
     Check(!scopes.policy.ObserveScope(extra, now), "scope capacity fails closed");
     scopes.policy.RemoveScope(scopes.scope.botGuid, scopes.scope.contextId);
     Check(scopes.policy.ObserveScope(extra, now), "removed scope frees bounded scope slot");
+    // LC.35: no epoch history bound; only the previous binding's epoch is refused (epochs are 128-bit random).
     ChannelPolicy epochs;
-    for (unsigned i = 0; i < ChannelMaxIds; ++i)
+    for (unsigned i = 0; i < 5000; ++i)
         Check(epochs.Bind({"fixture", "codex", "", "epoch-" + std::to_string(i)}, bearer),
-              "bounded fresh epoch history");
-    Check(!epochs.Bind({"fixture", "codex", "", "epoch-overflow"}, bearer), "epoch history capacity fails closed");
+              "fresh epochs bind without a history bound");
+    Check(!epochs.Bind({"fixture", "codex", "", "epoch-4999"}, bearer), "the previous binding's epoch is refused");
     ChannelMessage output;
     Check(epochs.Receive(bearer, f.Query().dump(), f.scope, now, output, "work") == ChannelError::Unauthorized,
-          "epoch exhaustion leaves inactive");
+          "a refused rebind leaves inactive");
 }
 }  // namespace
 
@@ -480,9 +556,19 @@ bool Keys(Json const& entry, std::set<std::string> const& keys)
     return found == keys;
 }
 
+// LCB1e: a topic's limit is its installed catalogue row's.
+std::size_t RowLimit(StateTopic topic)
+{
+    for (auto const& row : Abilities().rows)
+        if (row.topic && row.code == static_cast<uint8_t>(topic))
+            return row.limit;
+    return 0;
+}
+
 void Topics()
 {
     Fixture f;
+    f.Open();
     // Parse: the fourteen topics, nothing else.
     for (std::string bad : {"bank", "", "Inventory", "talents", "Plan", "quest plan", "questplan", "place"})
         Check(f.Receive(StateQuery(f, "bad-" + bad, bad)) == ChannelError::Invalid, "unknown topic invalid_input");
@@ -549,31 +635,32 @@ void Topics()
               entries.at(19).at("where") == "bag" && entries.at(1).at("count") == 1000,
           "inventory values bounded and named");
 
-    // Quests: 25 entries, done never above needed.
+    // Quests: the row's limit of entries, done never above needed.
     std::vector<StateEntry> quests{{"Odd status", "abandoned", 1, 2}};
-    for (int i = 0; i < 30; ++i)
+    for (int i = 0; i < 50; ++i)
         quests.push_back({"Quest " + std::to_string(i),
                           i % 3 == 0   ? "complete"
                           : i % 3 == 1 ? "failed"
                                        : "active",
                           i == 0 ? 99 : -4, i == 0 ? 8 : 20000});
     entries = Topic(f, "quests", StateTopic::Quests, quests);
-    Check(entries.size() == 25 && Keys(entries.at(0), {"title", "status", "done", "needed"}),
-          "quests at most 25 with fixed keys");
+    Check(entries.size() == RowLimit(StateTopic::Quests) && entries.size() == 40 &&
+              Keys(entries.at(0), {"title", "status", "done", "needed"}),
+          "quests at most the row's limit with fixed keys");
     Check(entries.at(0).at("title") == "Quest 0" && entries.at(0).at("done") == 8 && entries.at(0).at("needed") == 8 &&
               entries.at(0).at("status") == "complete" && entries.at(1).at("status") == "failed" &&
               entries.at(2).at("status") == "active" && entries.at(1).at("done") == 0 &&
               entries.at(1).at("needed") == 10000,
           "quest progress bounded");
 
-    // Cooldowns: 20 entries, only positive seconds, capped at a week.
+    // Cooldowns: the row's limit of entries, only positive seconds, capped at a week.
     std::vector<StateEntry> cooldowns{{"Ready", "", 0, 0}};
-    for (int i = 0; i < 30; ++i)
-        cooldowns.push_back({"Spell " + std::to_string(i), "", i == 0 ? 100000000 : 30 - i, 0});
+    for (int i = 0; i < 50; ++i)
+        cooldowns.push_back({"Spell " + std::to_string(i), "", i == 0 ? 100000000 : 60 - i, 0});
     entries = Topic(f, "cooldowns", StateTopic::Cooldowns, cooldowns);
-    Check(entries.size() == 20 && Keys(entries.at(0), {"name", "seconds"}) && entries.at(0).at("name") == "Spell 0" &&
+    Check(entries.size() == RowLimit(StateTopic::Cooldowns) && entries.size() == 40 && Keys(entries.at(0), {"name", "seconds"}) && entries.at(0).at("name") == "Spell 0" &&
               entries.at(0).at("seconds") == 604800,
-          "cooldowns at most 20, ready spells dropped, seconds capped");
+          "cooldowns at most the row's limit, ready spells dropped, seconds capped");
 
     // Strategies: whitelist, kinds, repeats dropped.
     entries = Topic(f, "strategies", StateTopic::Strategies,
@@ -597,30 +684,6 @@ void Topics()
               entries.at(1).at("rank") == 0 && entries.at(2).at("rank") == 3,
           "spells at most 40, rank bounded");
 
-    // WT18b: the planner's topics share one row shape; the row word comes from StateTopicRow, other rows dropped.
-    struct RowWords
-    {
-        StateTopic topic;
-        std::vector<std::string> words;
-    };
-    RowWords const tables[] = {{StateTopic::Plan, {"goal", "source", "reason", "stop"}},
-                               {StateTopic::Options, {"option", "current"}},
-                               {StateTopic::Route, {"total", "leg", "failed"}},
-                               {StateTopic::QuestPlan, {"take", "task", "turn_in", "carried", "deferred"}},
-                               {StateTopic::Bags, {"free", "sell", "bag"}},
-                               {StateTopic::Places, {"hearth", "flight_here", "flight_elsewhere"}},
-                               {StateTopic::History, {"event", "zone", "dungeon", "boss"}},
-                               {StateTopic::Lately, {"deed"}},
-                               {StateTopic::Known, {"bot"}}};
-    for (auto const& table : tables)
-        for (std::size_t code = 0; code < 8; ++code)
-            Check(std::string(StateTopicRow(table.topic, static_cast<uint8_t>(code))) ==
-                      (code < table.words.size() ? table.words[code] : std::string()),
-                  "each planner row code has its word, an unknown code none");
-    for (std::size_t t = 0; t <= static_cast<std::size_t>(StateTopic::Spells); ++t)
-        Check(!*StateTopicRow(static_cast<StateTopic>(t), 0) && !*StateTopicRow(static_cast<StateTopic>(t), 1),
-              "older topics have no row words");
-    Check(!*StateTopicRow(static_cast<StateTopic>(StateTopicCount), 0), "an unknown topic has no row words");
     Check(std::string(StateTopicName(StateTopic::Plan)) == "plan" &&
               std::string(StateTopicName(StateTopic::Options)) == "options" &&
               std::string(StateTopicName(StateTopic::Route)) == "route" &&
@@ -628,16 +691,10 @@ void Topics()
               std::string(StateTopicName(StateTopic::Bags)) == "bags" &&
               std::string(StateTopicName(StateTopic::Places)) == "places",
           "planner topic names");
-    Check(StateTopicLimit(StateTopic::Plan) == 8 && StateTopicLimit(StateTopic::Options) == 5 &&
-              StateTopicLimit(StateTopic::Route) == 12 && StateTopicLimit(StateTopic::QuestPlan) == 12 &&
-              StateTopicLimit(StateTopic::Bags) == 6 && StateTopicLimit(StateTopic::Places) == 24,
-          "planner topic limits as playerbots keeps them");
     Check(std::string(StateTopicName(StateTopic::History)) == "history" &&
               std::string(StateTopicName(StateTopic::Lately)) == "lately" &&
-              std::string(StateTopicName(StateTopic::Known)) == "known" &&
-              StateTopicLimit(StateTopic::History) == 24 && StateTopicLimit(StateTopic::Lately) == 12 &&
-              StateTopicLimit(StateTopic::Known) == 12,
-          "LC7: record topic names and limits as playerbots keeps them");
+              std::string(StateTopicName(StateTopic::Known)) == "known",
+          "LC7: record topic names");
     entries = Topic(f, "plan", StateTopic::Plan,
                     {{"rpg_travel", "goal", 120, 600},
                      {"planner", "source", -5, 5000000000LL},
@@ -645,38 +702,58 @@ void Topics()
                      {"Kobold Camp Cleanup", "stop", 3, 250},
                      {"bogus", "option", 1, 1},
                      {"none", "", 0, 0},
-                     {"", "goal", 1, 1}});
-    Check(entries.size() == 4 && Keys(entries.at(0), {"row", "name", "value", "extra"}) &&
+                     {"", "goal", 1, 1},
+                     {"spaced", "Not a word", 1, 1},
+                     {"long", std::string(65, 'w'), 1, 1},
+                     {"bad sentence", "goal", 2, 2, "Bad\nline"}});
+    Check(entries.size() == 6 && Keys(entries.at(0), {"row", "name", "value", "extra"}) &&
               entries.at(0).at("row") == "goal" && entries.at(0).at("name") == "rpg_travel" &&
               entries.at(0).at("value") == 120 && entries.at(0).at("extra") == 600 &&
               entries.at(1).at("row") == "source" && entries.at(1).at("value") == 0 &&
               entries.at(1).at("extra") == 4294967295LL && entries.at(2).at("name") == "near quests" &&
-              entries.at(3).at("row") == "stop" && entries.at(3).at("name") == "Kobold Camp Cleanup",
-          "plan rows: row word, name, value and extra bounded; another topic's row word and an empty name dropped");
-    for (auto const& table : tables)
+              entries.at(3).at("row") == "stop" && entries.at(3).at("name") == "Kobold Camp Cleanup" &&
+              entries.at(4).at("row") == "option" && entries.at(5).at("name") == "bad sentence" &&
+              Keys(entries.at(5), {"row", "name", "value", "extra"}),
+          "plan rows: the game's row word whichever it is, name, value and extra bounded; no word, a word not of "
+          "[a-z_] 1..64 and an empty name dropped; a bad sentence left out");
+    // LCB1e: the rows past bags' old three (the mail, the kept items) reach the wire, each with the game's sentence.
+    entries = Topic(f, "bags", StateTopic::Bags,
+                    {{"free", "free", 6, 16},
+                     {"Linen Cloth", "sell", 3, 40},
+                     {"mail", "mail_waiting", 1, 0, "Mail waits at the mailbox."},
+                     {"Copper Ore", "kept_bank", 2, 0, "Copper Ore, kept in the bank."}});
+    Check(entries.size() == 4 && !entries.at(0).contains("text") && entries.at(2).at("row") == "mail_waiting" &&
+              entries.at(2).at("text") == "Mail waits at the mailbox." &&
+              Keys(entries.at(2), {"row", "name", "text", "value", "extra"}) &&
+              entries.at(3).at("row") == "kept_bank" && entries.at(3).at("text") == "Copper Ore, kept in the bank.",
+          "bags: the mail and kept rows pass with their sentences; a row without one has none");
+    for (StateTopic const topic : {StateTopic::Plan, StateTopic::Options, StateTopic::Route, StateTopic::QuestPlan,
+                                   StateTopic::Bags, StateTopic::Places, StateTopic::History, StateTopic::Lately,
+                                   StateTopic::Known})
     {
         std::vector<StateEntry> rows;
         for (int i = 0; i < 30; ++i)
-            rows.push_back({"word " + std::to_string(i), table.words.at(i % table.words.size()), i, i, "Words."});
-        auto const limited = Topic(f, std::string("limit-") + StateTopicName(table.topic), table.topic, rows);
-        Check(limited.size() == StateTopicLimit(table.topic) &&
-                  limited.at(1).at("row") == table.words.at(1 % table.words.size()),
-              "a planner topic keeps its row words and stops at its limit");
+            rows.push_back({"word " + std::to_string(i), i % 2 ? "row_odd" : "row_even", i, i, "Words."});
+        auto const limited = Topic(f, std::string("limit-") + StateTopicName(topic), topic, rows);
+        Check(limited.size() == RowLimit(topic) && limited.size() > 1 && limited.at(1).at("row") == "row_odd" &&
+                  limited.at(1).at("text") == "Words.",
+              "a planner or record topic keeps the game's row words and sentences and stops at its row's limit");
     }
 
     // LC7: a record topic's entry carries its sentence in its own field, cut at its own cap; no sentence, no entry.
     entries = Topic(f, "history", StateTopic::History,
-                    {{"kill", "event", 3, 0, "You slew Hogger, an elite foe, in Elwynn Forest."},
+                    {{"kill", "event", 3, 0, "You slew Hogger, an elite creature, in Elwynn Forest."},
                      {"Westfall", "zone", 2, 0, "You have spent time in Westfall."},
-                     {"kill", "deed", 1, 0, "A row word of another topic."},
+                     {"kill", "deed", 1, 0, "A row word the module does not know."},
                      {"quest", "event", 1, 0, ""},
                      {"level", "event", 1, 0, "Bad\nline"},
                      {"spell", "event", 0, 0, std::string(300, 's')}});
-    Check(entries.size() == 3 && Keys(entries.at(0), {"row", "name", "text", "value", "extra"}) &&
-              entries.at(0).at("text") == "You slew Hogger, an elite foe, in Elwynn Forest." &&
+    Check(entries.size() == 4 && Keys(entries.at(0), {"row", "name", "text", "value", "extra"}) &&
+              entries.at(0).at("text") == "You slew Hogger, an elite creature, in Elwynn Forest." &&
               entries.at(0).at("name") == "kill" && entries.at(1).at("row") == "zone" &&
-              entries.at(2).at("text") == std::string(ChannelMaxTopicText, 's'),
-          "history rows: row, name, text, value, extra; a missing or bad sentence drops the entry, a long one is cut");
+              entries.at(2).at("row") == "deed" && entries.at(3).at("text") == std::string(ChannelMaxTopicText, 's'),
+          "history rows: row (any word the game sends), name, text, value, extra; a missing or bad sentence drops the "
+          "entry, a long one is cut");
     entries = Topic(f, "known", StateTopic::Known,
                     {{"Aldric", "bot", 0, 2, "Aldric, a human paladin, fought beside you."}, {"Brug", "bot", 1, 1, ""}});
     Check(entries.size() == 1 && entries.at(0).at("name") == "Aldric" && entries.at(0).at("extra") == 2,
@@ -706,11 +783,11 @@ void Topics()
                              topic == StateTopic::Inventory    ? "equipped"
                              : topic == StateTopic::Quests     ? "complete"
                              : topic == StateTopic::Strategies ? "non_combat"
-                                                               : StateTopicRow(topic, 0),
+                                                               : "row_word",
                              topic == StateTopic::Inventory ? 5 : 604800, 10000,
                              std::string(ChannelMaxTopicText, 'w')});
         auto const result = Topic(f, "worst-" + std::to_string(t), topic, worst);
-        Check(result.size() == (topic == StateTopic::Strategies ? 0 : StateTopicLimit(topic)), "worst case count");
+        Check(result.size() == (topic == StateTopic::Strategies ? 0 : RowLimit(topic)), "worst case count");
     }
 
     // Terminal once, unknown topic value refused, wrong work refused.
@@ -896,11 +973,11 @@ void Catalogue()
               "params":[{"name":"target","kind":"unit","sentence":"The unit to mark, by name.","choices":[]},
                         {"name":"icon","kind":"choice","sentence":"The raid icon to put on it.",
                          "choices":["star","circle","diamond","triangle","moon","square","cross","skull"]}],
-              "refusals":[{"word":"battleground","sentence":"Not here; I have my own fight to see to."},
-                          {"word":"travelling","sentence":"I cannot do that while I am in flight."},
-                          {"word":"dead","sentence":"I am in no state to do anything right now."},
-                          {"word":"not_in_group","sentence":"We are not in the same group."},
-                          {"word":"unknown_name","sentence":"I do not know what you mean by that."}],
+              "refusals":[{"word":"battleground","sentence":"You are in a battleground, where this cannot be done."},
+                          {"word":"travelling","sentence":"You are in flight; this cannot be done until you land."},
+                          {"word":"dead","sentence":"You are dead."},
+                          {"word":"not_in_group","sentence":"The one who asked is not in your group."},
+                          {"word":"unknown_name","sentence":"You know nothing by that name."}],
               "effect":"none","done":"at_once","state":"marking {target}","event":"BridgeAct","limit":0})"),
           "an act row, field for field");
     Check(catalogue.at("rows").at(10) == Json::parse(R"({"kind":"topic","name":"route","sentence":"Your route.",
@@ -993,10 +1070,6 @@ void Watches()
     Check(f.Receive(WatchWire(f, "on-query", "time", 160000, "q-watch")) == ChannelError::Invalid,
           "watch: never on a query route");
     std::string body;
-    Check(f.policy.OpenEvents(f.scope, "ev-watch", deadline, {{1, 0}}, now, body) == ChannelError::None,
-          "watch: an events route");
-    Check(f.Receive(WatchWire(f, "on-events", "time", 160000, "ev-watch")) == ChannelError::Invalid,
-          "watch: never on an events route");
 
     ChannelEnvelope const envelope{f.scope.instance, f.scope.provider, f.scope.epoch, "work", deadline.unixMs};
     Check(f.policy.FinishWatch(envelope, "w-combat_end", WatchOutcome::Armed, f.scope, now, body) == ChannelError::None,
@@ -1021,11 +1094,11 @@ void Watches()
         char const* code;
         char const* text;
     };
-    Words const words[] = {{CommandRefusal::NotFighting, "not_fighting", "I am not fighting anything right now."},
-                           {CommandRefusal::NotBusy, "not_busy", "I am not busy with anything."},
-                           {CommandRefusal::WaitTooShort, "wait_too_short", "That is hardly worth waiting for."},
-                           {CommandRefusal::WaitTooLong, "wait_too_long", "I cannot wait that long."},
-                           {CommandRefusal::PutOff, "put_off", "I have put this off long enough already."},
+    Words const words[] = {{CommandRefusal::NotFighting, "not_fighting", "You are not fighting anything."},
+                           {CommandRefusal::NotBusy, "not_busy", "You are not busy with anything."},
+                           {CommandRefusal::WaitTooShort, "wait_too_short", "That wait is too short to be worth it."},
+                           {CommandRefusal::WaitTooLong, "wait_too_long", "That wait is too long."},
+                           {CommandRefusal::PutOff, "put_off", "You have already put this off as long as you can."},
                            {CommandRefusal::CannotNow, "cannot_now", nullptr}};
     for (auto const& w : words)
     {
@@ -1047,7 +1120,7 @@ void Watches()
     }
     auto terminal = f.Wire("generation.result");
     terminal["text"] = "I will come once this is done.";
-    Check(f.Receive(terminal) == ChannelError::None && f.Receive(WatchWire(f, "late")) == ChannelError::Closed,
+    Check(f.Receive(terminal) == ChannelError::None && f.Receive(WatchWire(f, "late")) == ChannelError::Unknown,
           "watch: none after the terminal result");
 }
 
@@ -1253,7 +1326,7 @@ void SteppedResults()
 {
     Check(SetAbilityIndex(TestStepAbilityIndex()) > 0, "the stepped double installs");
     ChannelStepResult const ok{ChannelOutcome::Applied, "", ""};
-    ChannelStepResult const place{ChannelOutcome::Rejected, "unknown_place", "I do not know that place."};
+    ChannelStepResult const place{ChannelOutcome::Rejected, "unknown_place", "You do not know that place."};
     Json const three = Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
                                     Step("go_to", {{"place", "Goldshire"}}), Step("stay")});
     auto const old = Finish(Json(), ChannelOutcome::Applied, {}, CommandRefusal::None);
@@ -1269,10 +1342,10 @@ void SteppedResults()
     auto const second = Finish(three, ChannelOutcome::Rejected, {ok, place}, CommandRefusal::CannotNow);
     Check(second.error == ChannelError::None && second.json.at("outcome") == "rejected" &&
               second.json.at("reason") == "unknown_place" &&
-              second.json.at("reasonText") == "I do not know that place." &&
+              second.json.at("reasonText") == "You do not know that place." &&
               second.json.at("steps") == Json::parse(R"([{"act":"mark","outcome":"applied"},
                   {"act":"go_to","outcome":"rejected","reason":"unknown_place",
-                   "reasonText":"I do not know that place."},{"act":"stay","outcome":"skipped"}])"),
+                   "reasonText":"You do not know that place."},{"act":"stay","outcome":"skipped"}])"),
           "a refused step ends the order with its words; the steps after it are skipped");
     auto const failedWords = DescribeRefusal(CommandRefusal::Failed);
     auto const failed = Finish(three, ChannelOutcome::Failed, {{ChannelOutcome::Failed, "", ""}}, CommandRefusal::None);
@@ -1448,11 +1521,8 @@ void OpenRows()
           "an open act's step is named by its row and refused in playerbots' words");
 
     // A topic past the fourteen: its argument under the row's parameter name, its entries in the lines form.
-    Check(StateTopicLimit(static_cast<StateTopic>(TestOpenTopic)) == 6 &&
-              std::string(StateTopicRow(static_cast<StateTopic>(TestOpenTopic), 3)) == "deeds_of" &&
-              !*StateTopicRow(static_cast<StateTopic>(TestOpenTopic + 1), 0) &&
-              !StateTopicLimit(static_cast<StateTopic>(TestOpenTopic + 1)),
-          "an open topic's limit is its row's, its row word its own; a topic the index lacks has neither");
+    Check(RowLimit(static_cast<StateTopic>(TestOpenTopic)) == 6 && !RowLimit(static_cast<StateTopic>(TestOpenTopic + 1)),
+          "an open topic's limit is its row's; a topic the index lacks has none");
     {
         Fixture f;
         f.Open();
@@ -1486,7 +1556,7 @@ void OpenRows()
               "the open topic and its argument");
         std::string const longText(ChannelMaxTopicText + 40, 't');
         std::vector<StateEntry> entries = {
-            {"Hogger", StateTopicRow(query.topic, 0), 3, 4, "Hogger slew a wolf."},
+            {"Hogger", "deeds_of", 3, 4, "Hogger slew a wolf."},
             {"Hogger", "deed", -5, 5000000000LL, longText},
             {"Hogger", "Bad Word", 1, 1, "Dropped."},
             {"Hogger", "deed", 1, 1, ""},
@@ -1550,7 +1620,7 @@ int main()
         IdentityAndTerminal();
         ExpiryAndScope();
         Schemas();
-        QueriesEventsAndCapacity();
+        QueriesAndCapacity();
         Topics();
         Watches();
         Catalogue();

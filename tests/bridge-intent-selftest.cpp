@@ -262,8 +262,10 @@ void WireRefusals()
     Check(fixture.policy.CommandReservations() == 0, "invalid requests consume zero command ids");
     fixture.Stage("stay", empty);
     Check(fixture.Receive(fixture.Wire("stay", empty)) == ChannelError::Duplicate, "duplicate cannot stage again");
-    Check(fixture.Receive(fixture.Wire("stay", empty, "expired"), {Until.unixMs, Now.steadyMs}) == ChannelError::Stale,
-          "equal wall deadline refuses fresh id");
+    // LC.35: at its wall deadline the route leaves the ledger; a fresh id then finds no route.
+    Check(
+        fixture.Receive(fixture.Wire("stay", empty, "expired"), {Until.unixMs, Now.steadyMs}) == ChannelError::Unknown,
+        "equal wall deadline refuses fresh id");
 }
 
 void WorldRefusals()
@@ -476,27 +478,27 @@ void RefusalWords()
         auto const words = DescribeRefusal(refusal);
         return std::string(words.code) == code && std::string(words.text) == text;
     };
-    Check(said(CommandRefusal::Dead, "dead", "I am in no state to do anything right now."), "dead sentence");
-    Check(said(CommandRefusal::Battleground, "battleground", "Not here; I have my own fight to see to."),
+    Check(said(CommandRefusal::Dead, "dead", "You are dead."), "dead sentence");
+    Check(said(CommandRefusal::Battleground, "battleground", "You are in a battleground, where this cannot be done."),
           "battleground sentence");
-    Check(said(CommandRefusal::Travelling, "travelling", "I cannot do that while I am in flight."),
+    Check(said(CommandRefusal::Travelling, "travelling", "You are in flight; this cannot be done until you land."),
           "travelling sentence");
-    Check(said(CommandRefusal::NotWithYou, "not_with_you", "We are not travelling together."), "not_with_you sentence");
-    Check(said(CommandRefusal::TooFar, "too_far", "You are too far away for me to reach."), "too_far sentence");
+    Check(said(CommandRefusal::NotWithYou, "not_with_you", "The one who asked is not the one you follow."), "not_with_you sentence");
+    Check(said(CommandRefusal::TooFar, "too_far", "The one who asked is too far away."), "too_far sentence");
     // WT18b: the planner's refusals of a goal verb.
-    Check(said(CommandRefusal::NotPlanner, "not_planner", "My own plans are not mine to change right now."),
+    Check(said(CommandRefusal::NotPlanner, "not_planner", "Your plans are not yours to change right now."),
           "not_planner sentence");
-    Check(said(CommandRefusal::GoalHeld, "goal_held", "My group has a goal I am holding to."), "goal_held sentence");
-    Check(said(CommandRefusal::UnknownPlace, "unknown_place", "I do not know that place."), "unknown_place sentence");
-    Check(said(CommandRefusal::NoRoute, "no_route", "I cannot find a way there."), "no_route sentence");
-    Check(said(CommandRefusal::NoSuchQuest, "no_such_quest", "That quest is not in my log."), "no_such_quest sentence");
-    Check(said(CommandRefusal::NothingHere, "nothing_here", "There is nothing for me to do here."),
+    Check(said(CommandRefusal::GoalHeld, "goal_held", "Your group holds to a goal, and you with it."), "goal_held sentence");
+    Check(said(CommandRefusal::UnknownPlace, "unknown_place", "You do not know that place."), "unknown_place sentence");
+    Check(said(CommandRefusal::NoRoute, "no_route", "You know no way there."), "no_route sentence");
+    Check(said(CommandRefusal::NoSuchQuest, "no_such_quest", "That quest is not in your quest log."), "no_such_quest sentence");
+    Check(said(CommandRefusal::NothingHere, "nothing_here", "There is nothing for you to do here."),
           "nothing_here sentence");
-    Check(said(CommandRefusal::AlreadyThere, "already_there", "I am already there."), "already_there sentence");
+    Check(said(CommandRefusal::AlreadyThere, "already_there", "You are already there."), "already_there sentence");
     // LC3: playerbots' sentence for a name it does not know (a named order).
-    Check(said(CommandRefusal::UnknownName, "unknown_name", "I do not know what you mean by that."),
+    Check(said(CommandRefusal::UnknownName, "unknown_name", "You know nothing by that name."),
           "unknown_name sentence");
-    Check(said(CommandRefusal::Failed, "failed", "I tried, but it did not work."), "failed sentence");
+    Check(said(CommandRefusal::Failed, "failed", "You tried, but it did not work."), "failed sentence");
 }
 
 void StagedCommandCurrentness()

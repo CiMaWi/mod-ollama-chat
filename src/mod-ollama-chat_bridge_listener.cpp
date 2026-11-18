@@ -23,8 +23,10 @@ constexpr std::string_view RoutePrefix = "/v1/channel/";
 constexpr std::size_t MaxRouteBytes = 128;
 constexpr std::size_t MaxBearerBytes = 256;  // WorldChannel::Authenticated never accepts a longer bearer.
 constexpr time_t IoTimeoutSec = 2;
-constexpr std::size_t Workers = 2;        // A handler blocks while the world answers; the bridge sends few calls.
-constexpr std::size_t MaxQueued = 8;      // Further connections are closed at once (the client reads unavailable).
+// One handler per mailbox slot: a handler blocks while the world answers, so fewer would cap the world's TickBudget.
+constexpr std::size_t Workers = WorldChannel::MaxPackets;
+// Connections beyond the handlers wait for one; further ones are closed (the client reads network).
+constexpr std::size_t MaxQueued = WorldChannel::MaxPackets;
 constexpr time_t AcceptIdleUsec = 50000;  // Accept-loop wake-up; also bounds Stop().
 
 struct StatusEntry

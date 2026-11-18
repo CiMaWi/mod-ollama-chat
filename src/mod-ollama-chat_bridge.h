@@ -43,9 +43,6 @@ struct Settings
     std::string provider;
     std::string endpoint;
     std::string token;  // Local game-link bearer only; never native subscription credentials.
-    bool observerEnabled = false;
-    std::string observerTokenRef;  // Absolute protected observer.json path; resolved only on config load.
-    std::string observerToken;     // Owned local observer bearer, distinct from the game-link bearer.
 };
 
 struct Clock
@@ -260,7 +257,7 @@ struct Request
     uint64_t controllerGuid = 0;
     uint64_t botGuid = 0;
     Context input;
-    WorldScope scope;  // Required only by the opt-in Codex observer protocol.
+    WorldScope scope;  // The scope the request was reserved for.
 };
 
 struct Identity
@@ -288,9 +285,6 @@ struct Result
 bool ValidIdentifier(std::string const& value);
 bool ValidEndpoint(std::string const& value);
 bool ValidSettings(Settings const& settings);
-// Windows-only, matching the native service. Refusal always clears the cached secret.
-bool LoadObserverToken(Settings& settings);
-bool ValidObserverSettings(Settings const& settings);
 Clock Now();
 Deadline CaptureDeadline(Clock now, int64_t lifetimeMs);
 bool Expired(Deadline deadline, Clock now);
@@ -302,20 +296,6 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
 // 5 resting, 6 questing, 7 travelling (one classifier for the wire and the watches).
 uint8_t ActivityCode(BotState const& state);
 Result Parse(Settings const& settings, Request const& request, std::string const& body, Clock now);
-
-struct ObserverChallenge
-{
-    std::string serviceId;
-    std::string incarnation;
-    std::string challenge;
-    uint32_t sequence = 0;
-};
-
-bool BuildObserverOpen(Settings const& settings, std::string& body);
-bool BuildObserverSnapshot(Settings const& settings, ObserverChallenge const& challenge, std::string const& epoch,
-                           bool active, bool worldDrained, std::vector<WorldScope> const& scopes, std::string& body);
-bool ParseObserverChallenge(Settings const& settings, std::string const& body, ObserverChallenge const* previous,
-                            ObserverChallenge& challenge);
 
 // Reset is called ONLY by the trusted world activation owner after its retirement
 // obligations are met. It does not acknowledge CLI intent, drain work or restore strategies.

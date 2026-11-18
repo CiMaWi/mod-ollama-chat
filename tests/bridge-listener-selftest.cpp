@@ -507,8 +507,7 @@ void Deadlines(Harness& h)
     Check(standing.status == 400 &&
               standing.body ==
                   "{\"error\":\"invalid_input\",\"reason\":\"standing_not_supported\",\"reasonText\":"
-                  "\"I can follow or stay until you say otherwise, but I cannot take it as a standing "
-                  "order.\"}" &&
+                  "\"You can follow or stay until told otherwise, but not as a standing order.\"}" &&
               Json::parse(standing.body).size() == 3,
           "a standing shape answers invalid_input with its reason");
     quick(ChannelError::None, ChannelError::Stale, 410, "stale");  // Terminal Take error ends the wait.
@@ -552,6 +551,25 @@ void Handoff(Harness& h)
         h.mailbox.Publish(next, error, "");
         Check(Error(Post(h.port, "gen-1", Envelope(3000)), status, name), "packet error maps through the table");
     }
+}
+
+// The bridge's calls of one world tick: every mailbox slot is filled at once, none waits for a handler or is closed.
+void MailboxSlots()
+{
+    Harness h;
+    std::size_t const calls = WorldChannel::MaxPackets;
+    std::vector<std::future<Reply>> replies;
+    for (std::size_t i = 0; i < calls; ++i)
+        replies.push_back(std::async(std::launch::async,
+                                     [&h, i] { return Post(h.port, "gen-" + std::to_string(i), Envelope(5000)); }));
+    Check(WaitFor([&] { return h.mailbox.Receives() == calls; }, 3000),
+          "every mailbox slot's call reaches the mailbox at once");
+    for (uint64_t receipt = 1; receipt <= calls; ++receipt)
+        h.mailbox.Publish(receipt, ChannelError::None, R"({"type":"query.result"})");
+    std::size_t answered = 0;
+    for (auto& reply : replies)
+        answered += reply.get().status == 200 ? 1 : 0;
+    Check(answered == calls, "every call of a full mailbox is answered 200");
 }
 
 void BindAddress(Harness& h)
@@ -663,13 +681,12 @@ struct Source : QueryWorldSource
         result = {it->second.guid, it->second.group, it->second.name, 70};
         return true;
     }
-    bool ReadMark(WorldTicket const&, uint8_t, uint64_t&) override { return false; }
 };
 
 struct RealFixture
 {
     Clock now = Now();
-    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", Token, false, "", ""};
+    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", Token};
     WorldPolicy world;
     Source source;
     WorldChannel channel{world, [this](WorldTicket const& ticket, DispatchGuard& guard)
@@ -781,6 +798,7 @@ int main()
             BindAddress(h);
             Check(h.LogsClean(), "request handling logs nothing secret");
         }
+        MailboxSlots();
         Shutdown();
         RealChannel();
         slowLoris.get();

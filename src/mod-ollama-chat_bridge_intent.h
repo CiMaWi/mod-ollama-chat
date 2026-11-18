@@ -8,6 +8,8 @@
 #include <variant>
 #include <vector>
 
+#include "BridgeTexts.h"
+
 namespace OllamaBridge
 {
 enum class ChannelIntent : uint8_t
@@ -258,66 +260,65 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
         case CommandRefusal::None:
             return {"", ""};
         case CommandRefusal::NotSupported:
-            return {"not_supported", "That is not something I can do on command yet."};
+            return {"not_supported", BridgeTexts::Refusals::NOT_SUPPORTED};
         case CommandRefusal::StandingNotSupported:
-            return {"standing_not_supported",
-                    "I can follow or stay until you say otherwise, but I cannot take it as a standing order."};
+            return {"standing_not_supported", BridgeTexts::Refusals::STANDING_NOT_SUPPORTED};
         case CommandRefusal::TooSoon:
-            return {"too_soon", "I just took an order; give me a moment."};
+            return {"too_soon", BridgeTexts::Refusals::TOO_SOON};
         case CommandRefusal::Unavailable:
-            return {"unavailable", "I cannot take orders right now."};
+            return {"unavailable", BridgeTexts::Refusals::UNAVAILABLE};
         case CommandRefusal::Dead:
-            return {"dead", "I am in no state to do anything right now."};
+            return {"dead", BridgeTexts::Refusals::DEAD};
         case CommandRefusal::Battleground:
-            return {"battleground", "Not here; I have my own fight to see to."};
+            return {"battleground", BridgeTexts::Refusals::BATTLEGROUND};
         case CommandRefusal::Travelling:
-            return {"travelling", "I cannot do that while I am in flight."};
+            return {"travelling", BridgeTexts::Refusals::TRAVELLING};
         case CommandRefusal::NotWithYou:
-            return {"not_with_you", "We are not travelling together."};
+            return {"not_with_you", BridgeTexts::Refusals::NOT_WITH_YOU};
         case CommandRefusal::TooFar:
-            return {"too_far", "You are too far away for me to reach."};
+            return {"too_far", BridgeTexts::Refusals::TOO_FAR};
         case CommandRefusal::NotInGroup:
-            return {"not_in_group", "We are not in the same group."};
+            return {"not_in_group", BridgeTexts::Refusals::NOT_IN_GROUP};
         case CommandRefusal::NoTarget:
-            return {"no_target", "I have no target to attack."};
+            return {"no_target", BridgeTexts::Refusals::NO_TARGET};
         case CommandRefusal::TargetNotVisible:
-            return {"target_not_visible", "I cannot see that target from here."};
+            return {"target_not_visible", BridgeTexts::Refusals::TARGET_NOT_VISIBLE};
         case CommandRefusal::Unreachable:
-            return {"unreachable", "I cannot get to that spot from here."};
+            return {"unreachable", BridgeTexts::Refusals::UNREACHABLE};
         case CommandRefusal::Busy:
-            return {"busy", "I am still finishing an earlier order; ask me again shortly."};
+            return {"busy", BridgeTexts::Refusals::BUSY};
         case CommandRefusal::NotFighting:
-            return {"not_fighting", "I am not fighting anything right now."};
+            return {"not_fighting", BridgeTexts::Refusals::NOT_FIGHTING};
         case CommandRefusal::NotBusy:
-            return {"not_busy", "I am not busy with anything."};
+            return {"not_busy", BridgeTexts::Refusals::NOT_BUSY};
         case CommandRefusal::WaitTooShort:
-            return {"wait_too_short", "That is hardly worth waiting for."};
+            return {"wait_too_short", BridgeTexts::Refusals::WAIT_TOO_SHORT};
         case CommandRefusal::WaitTooLong:
-            return {"wait_too_long", "I cannot wait that long."};
+            return {"wait_too_long", BridgeTexts::Refusals::WAIT_TOO_LONG};
         case CommandRefusal::PutOff:
-            return {"put_off", "I have put this off long enough already."};
+            return {"put_off", BridgeTexts::Refusals::PUT_OFF};
         case CommandRefusal::CannotNow:
-            return {"cannot_now", "I cannot do that right now."};
+            return {"cannot_now", BridgeTexts::Refusals::CANNOT_NOW};
         case CommandRefusal::Failed:
-            return {"failed", "I tried, but it did not work."};
+            return {"failed", BridgeTexts::Refusals::FAILED};
         case CommandRefusal::NotPlanner:
-            return {"not_planner", "My own plans are not mine to change right now."};
+            return {"not_planner", BridgeTexts::Refusals::NOT_PLANNER};
         case CommandRefusal::GoalHeld:
-            return {"goal_held", "My group has a goal I am holding to."};
+            return {"goal_held", BridgeTexts::Refusals::GOAL_HELD};
         case CommandRefusal::UnknownPlace:
-            return {"unknown_place", "I do not know that place."};
+            return {"unknown_place", BridgeTexts::Refusals::UNKNOWN_PLACE};
         case CommandRefusal::NoRoute:
-            return {"no_route", "I cannot find a way there."};
+            return {"no_route", BridgeTexts::Refusals::NO_ROUTE};
         case CommandRefusal::NoSuchQuest:
-            return {"no_such_quest", "That quest is not in my log."};
+            return {"no_such_quest", BridgeTexts::Refusals::NO_SUCH_QUEST};
         case CommandRefusal::NothingHere:
-            return {"nothing_here", "There is nothing for me to do here."};
+            return {"nothing_here", BridgeTexts::Refusals::NOTHING_HERE};
         case CommandRefusal::AlreadyThere:
-            return {"already_there", "I am already there."};
+            return {"already_there", BridgeTexts::Refusals::ALREADY_THERE};
         case CommandRefusal::UnknownName:
-            return {"unknown_name", "I do not know what you mean by that."};
+            return {"unknown_name", BridgeTexts::Refusals::UNKNOWN_NAME};
     }
-    return {"cannot_now", "I cannot do that right now."};
+    return {"cannot_now", BridgeTexts::Refusals::CANNOT_NOW};
 }
 
 // DS.14: group play needs a group. Follow, formation and save_mana also need the partner in the bot's group; a mark

@@ -23,7 +23,7 @@ void Check(bool value, char const* label)
 struct Fixture
 {
     Clock now{100000, 200000};
-    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-local-channel-token", false, "", ""};
+    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-local-channel-token"};
     WorldPolicy world;
     DispatchGuard guard;
     bool visible = true;
@@ -199,31 +199,31 @@ void GuardsAndTerminal()
 
 void RouteCorrelation()
 {
-    for (auto const* type : {"events.result", "failure", "command"})
+    for (std::string const type : {"generation.result", "failure", "command"})
     {
         Fixture f;
         Context input;
         input.speakerGuid = 22;
         input.channel = "party";
         input.text = "Ready?";
-        auto const event = f.world.Reserve(f.ticket.scope, input, f.now, 30000);
-        uint64_t outbound = 0;
-        Check(f.channel.RegisterEvents(event, f.guard, {{44, 3}}, outbound), "second same-scope route registered");
-        auto message = f.Wire(type, event.request.requestId);
-        if (std::string(type) == "failure")
+        auto const second = f.world.Reserve(f.ticket.scope, input, f.now, 30000);
+        Check(second.generation && f.channel.Register(second, f.guard), "second same-scope route registered");
+        auto message = f.Wire(type, second.request.requestId);
+        if (type == "failure")
             message["code"] = "unavailable";
-        if (std::string(type) == "command")
+        if (type == "generation.result")
+            message["text"] = "Hello.";
+        if (type == "command")
         {
             message = Json::parse(f.Command("cross-route-effect"));
-            message["requestId"] = event.request.requestId;
+            message["requestId"] = second.request.requestId;
         }
         auto const wrongReceipt = f.Receive(message.dump());
         Check(f.channel.Update() == 1, "wrong-route message processed");
         auto wrong = f.Take(wrongReceipt);
         Check(wrong->error == ChannelError::Invalid && wrong->body.empty(), "wrong route rejected without echo");
         wrong.reset();
-        Check(f.world.Current(event, f.now) && f.channel.Used() == 1,
-              "rejected input preserves other world authority and queued event");
+        Check(f.world.Current(second, f.now) && f.channel.Drained(), "rejected input preserves other world authority");
 
         // Queries deliberately have a new id; route correlation must not couple it to the generation id.
         auto const queryReceipt = f.Receive(f.Query("independent-query"));
@@ -233,30 +233,90 @@ void RouteCorrelation()
               "original route remains usable with independent query id");
         query.reset();
 
-        uint64_t rightReceipt = 0;
-        Check(f.channel.Receive(f.settings.token, event.request.requestId, message.dump(), rightReceipt) ==
-                  ChannelError::None,
-              "same message admitted through correct route");
-        f.channel.Update();
-        if (std::string(type) == "command")
+        auto const send = [&]
         {
-            auto command = f.Take(rightReceipt);
-            Check(command->error == ChannelError::None && Json::parse(command->body)["outcome"] == "rejected",
-                  "wrong route did not reserve command replay id; execution stays closed");
-            command.reset();
-            Check(f.world.Current(event, f.now), "accepted proposal does not terminate event");
-            auto const ack = f.Wire("events.result", event.request.requestId).dump();
-            Check(f.channel.Receive(f.settings.token, event.request.requestId, ack, rightReceipt) == ChannelError::None,
-                  "event terminal after correctly routed command");
+            uint64_t receipt = 0;
+            Check(f.channel.Receive(f.settings.token, second.request.requestId, message.dump(), receipt) ==
+                      ChannelError::None,
+                  "message admitted through its own route");
             f.channel.Update();
-        }
-        Check(!f.world.Current(event, f.now) && f.channel.Drained() && f.world.Pending() == 1,
-              "valid terminal releases event authority and queued outbound packet only");
-        std::unique_ptr<ChannelPacket> cancelled;
-        Check(f.channel.Take(f.settings.token, outbound, cancelled) == ChannelError::Unknown,
-              "terminal cancels queued event receipt");
+            return receipt;
+        };
+        auto right = f.Take(send());
+        Check(type == "command"
+                  ? right->error == ChannelError::None && Json::parse(right->body)["outcome"] == "rejected"
+                  : right->error == ChannelError::Unknown && right->body.empty(),
+              "a command stays refused; a terminal closes the route without fabricated delivery");
+        right.reset();
+        // LC.35: a replay on the open binding: a command id stays reserved, a terminal's route is already gone.
+        auto again = f.Take(send());
+        Check(again->error == (type == "command" ? ChannelError::Duplicate : ChannelError::Unknown),
+              "a replay on the same route is refused");
+        again.reset();
+        f.channel.Close(second);
+        f.world.Cancel(second);
+        Check(!f.world.Current(second, f.now) && f.channel.Drained() && f.world.Pending() == 1,
+              "closing releases only that route");
+        auto const late = send();
+        std::unique_ptr<ChannelPacket> gone;
+        Check(f.channel.Take(f.settings.token, late, gone) == ChannelError::Unknown && !gone && f.channel.Drained(),
+              "a closed route answers nothing");
         Check(f.world.Current(f.ticket, f.now), "other generation authority remains current");
     }
+}
+
+// LC.35: the ledger forgets a route at its terminal, so nothing may open that route again while its binding lives: a
+// second Register of the bound ticket is refused before the policy sees it, and the route's command id stays refused.
+void BoundRouteStaysClosed()
+{
+    Fixture f;
+    auto id = f.Receive(f.Command("once"));
+    f.channel.Update();
+    auto reply = f.Take(id);
+    Check(reply->error == ChannelError::None && Json::parse(reply->body)["commandId"] == "once", "command staged once");
+    reply.reset();
+    auto failure = f.Wire("failure", f.ticket.request.requestId);
+    failure["code"] = "cancelled";
+    id = f.Receive(failure.dump());
+    f.channel.Update();
+    reply = f.Take(id);
+    Check(reply->error == ChannelError::Unknown, "the terminal drops the route; its binding stays until Close");
+    reply.reset();
+    Check(!f.channel.Register(f.ticket, f.guard), "a bound route registers once");
+    id = f.Receive(f.Command("once"));
+    f.channel.Update();
+    reply = f.Take(id);
+    Check(reply->error == ChannelError::Unknown && reply->body.empty(),
+          "a second Register cannot reopen the dropped route for a replayed command id");
+}
+
+// LC.35: a long-running server keeps answering: 5,000 generation routes with 3 queries each in one epoch, each closed
+// route leaving the world policy and the replay ledger.
+void LongRunRoutes()
+{
+    Fixture f;
+    Context input;
+    input.speakerGuid = 22;
+    input.channel = "party";
+    input.text = "Ready?";
+    for (unsigned i = 0; i < 5000; ++i)
+    {
+        auto const ticket = f.world.Reserve(f.ticket.scope, input, f.now, 30000);
+        Check(ticket.generation && f.channel.Register(ticket, f.guard), "5000: every route registered");
+        for (unsigned k = 0; k < 3; ++k)
+        {
+            uint64_t receipt = 0;
+            Check(f.channel.Receive(f.settings.token, ticket.request.requestId,
+                                    f.Query("q-" + std::to_string(i) + "-" + std::to_string(k)),
+                                    receipt) == ChannelError::None,
+                  "5000: every query received");
+            f.channel.Update();
+            Check(f.Take(receipt)->error == ChannelError::None, "5000: every query answered");
+        }
+        f.channel.Close(ticket);
+        f.world.Cancel(ticket);
+    }
+    Check(f.world.Pending() == 1 && f.channel.Drained(), "5000: only the fixture's own route stays");
 }
 
 void ExpiryReloadAndDefaults()
@@ -301,22 +361,22 @@ void HeartbeatReplayLedger()
     Check(policy.Bind({"fixture", "codex", "", "epoch"}, "synthetic-local-channel-token"), "ledger bind");
     Check(policy.ObserveScope(scope, now), "ledger scope");
     std::string body;
-    for (std::size_t i = 0; i < ChannelMaxIds; ++i)
+    for (std::size_t i = 0; i < 5000; ++i)
     {
         auto const id = "r" + std::to_string(i);
         Check(policy.OpenGeneration(scope, id, {101000, 201000}, now) == ChannelError::None, "ledger reserve");
-        if (i + 1 != ChannelMaxIds)
+        if (i + 1 != 5000)
             Check(policy.FinishFailure({"fixture", "codex", "epoch", id, 101000}, ChannelFailure::Cancelled, scope, now,
                                        body) == ChannelError::None,
-                  "ledger retain closed id");
+                  "ledger closes the route");
     }
-    Check(policy.RequestReservations() == 4096 && policy.Pending() == 1, "full replay ledger retained");
+    Check(policy.RequestReservations() == 1 && policy.Pending() == 1, "closed routes leave; the open one stays");
     Check(policy.ObserveScope(scope, {101000, 200100}), "heartbeat at wall deadline with live scope");
     Check(policy.Pending() == 0, "heartbeat logical expiry without request-table sweep");
-    Check(!policy.Current({"fixture", "codex", "epoch", "r4095", 101000}, scope, now),
+    Check(!policy.Current({"fixture", "codex", "epoch", "r4999", 101000}, scope, now),
           "wall rollback cannot revive request after trusted heartbeat expiry");
     Check(policy.ObserveScope(scope, {106000, 206000}), "scope gap refresh");
-    Check(!policy.Current({"fixture", "codex", "epoch", "r4095", 101000}, scope, now),
+    Check(!policy.Current({"fixture", "codex", "epoch", "r4999", 101000}, scope, now),
           "scope lapse and clock rollback never revive retained work");
 }
 }  // namespace
@@ -333,6 +393,8 @@ int main()
         PhysicalAndIndependent();
         GuardsAndTerminal();
         RouteCorrelation();
+        BoundRouteStaysClosed();
+        LongRunRoutes();
         ExpiryReloadAndDefaults();
         HeartbeatReplayLedger();
         std::cout << "PASS " << checks << " production channel dispatch checks\n";

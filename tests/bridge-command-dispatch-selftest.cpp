@@ -99,7 +99,7 @@ struct Options
 struct Fixture
 {
     Clock now{100000, 200000};
-    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-local-channel-token", false, "", ""};
+    Settings settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-local-channel-token"};
     WorldPolicy world;
     DispatchGuard guard;
     bool visible = true;
@@ -708,11 +708,12 @@ void TerminalAndIds()
     result["text"] = "Done.";
     Check(f.Result(f.Send(result.dump()), "") == "unknown_request", "generation result closes the request");
     f.Advance(CommandRate::IntervalMs);
-    Check(f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "closed" && f.probe.calls == 2,
-          "a command after its request is terminal is closed before reservation or effect");
-    Check(
-        f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "closed" && !f.channel.Commands().duplicates,
-        "the closed command consumed no id");
+    // LC.35: the terminal dropped the route; a later command finds none.
+    Check(f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "unknown_request" && f.probe.calls == 2,
+          "a command after its request is terminal is refused before reservation or effect");
+    Check(f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "unknown_request" &&
+              !f.channel.Commands().duplicates,
+          "the refused command consumed no id");
 
     Fixture c;
     auto const id = c.Receive(c.Attack("closed-route"));
@@ -1070,7 +1071,7 @@ void SteppedDispatch()
     {
         Fixture f;
         f.probe.result = EffectResult::Rejected;
-        f.probe.stepResults = {ok, {ChannelOutcome::Rejected, "unknown_name", "I do not know what you mean by that."}};
+        f.probe.stepResults = {ok, {ChannelOutcome::Rejected, "unknown_name", "You know nothing by that name."}};
         Check(f.Result(f.Send(f.Steps("s3", three)), "s3") == "rejected" && f.reason == "unknown_name" &&
                   f.steps.size() == 3 && f.steps[1].at("reason") == "unknown_name" &&
                   f.steps[2] == Json{{"act", "mark"}, {"outcome", "skipped"}},

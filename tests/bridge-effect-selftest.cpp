@@ -19,14 +19,6 @@
 
 // ---- game doubles -------------------------------------------------------------------------------------------------
 float g_SayDistance = 17.5f;
-// The handler's self-mark re-baseline (DS.10), counted.
-unsigned ownMarkNotes = 0;
-uint64_t ownMarkBot = 0;
-void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid)
-{
-    ++ownMarkNotes;
-    ownMarkBot = botGuid;
-}
 
 struct ObjectGuid
 {
@@ -210,8 +202,6 @@ struct Env
         game = Counters{};
         PlayerbotBridge::pb = PlayerbotBridge::Doubles{};
         g_SayDistance = 17.5f;
-        ownMarkNotes = 0;
-        ownMarkBot = 0;
         botGroup.guid = controllerGroup.guid = kGroup;
         botGroup.leader = controllerGroup.leader = kController;
         bot.group = &botGroup;
@@ -336,7 +326,6 @@ void VerbSwitch()
         Check(pb.order.Operation == verb.op, "verb maps to its own playerbots operation");
         Check(pb.order.Bot == kBot && pb.order.Controller == kController && pb.order.Group == kGroup,
               "bot, controller and group from scope and guard");
-        Check(pb.order.VisibilityDistance == g_SayDistance, "visibility radius");
         Check(pb.phase == &env.phase.join, "the joined phase is forwarded");
         Check(env.authorizeCalls == 1 && pb.authorizeCalled == 1 && pb.authorizeResult,
               "authorize passes through and the executor adds none");
@@ -404,8 +393,8 @@ void Gates()
     {
         Env env;
         env.phase.join.current = false;
-        Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Rejected && ownMarkNotes == 0,
-              "a mark refused before playerbots re-baselines nothing");
+        Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Rejected,
+              "a mark refused before playerbots is rejected");
     }
     for (int which = 0; which < 3; ++which)
     {
@@ -536,7 +525,8 @@ void Facts()
                   PlayerbotBridge::pb.order.Target == kTarget,
               "mark ignores the bot's own target");
     }
-    // DS.14: target visibility must hold for the bot, in each respect; the partner's sight plays no part.
+    // DS.14, LCB1e: what the bot perceives is playerbots' one rule (Perceives, when the act runs); the module only
+    // resolves the unit, and the partner's sight plays no part.
     for (ChannelIntent intent : {ChannelIntent::AttackOwnTarget, ChannelIntent::Mark})
         for (int observer = 0; observer < 2; ++observer)
             for (int respect = 0; respect < 6; ++respect)
@@ -557,20 +547,18 @@ void Facts()
                     ObjectAccessor::Units().erase(kTarget);
                 if (intent == ChannelIntent::AttackOwnTarget && respect == 5)
                     env.bot.target = kTarget;  // Guid stays; the unit cannot be resolved.
-                bool const partnerOnly = observer == 1 && respect < 4;
+                bool const unresolved = respect == 5;
                 EffectResult const result = env.Run(ValidCmd(intent));
-                Check(partnerOnly ? result == EffectResult::Applied && PlayerbotBridge::pb.order.Target == kTarget
-                                  : result == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 &&
-                                        env.why == CommandRefusal::TargetNotVisible,
-                      "a target the bot does not see is rejected; one only the partner does not see is not");
+                Check(unresolved ? result == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 &&
+                                       env.why == CommandRefusal::TargetNotVisible
+                                 : result == EffectResult::Applied && PlayerbotBridge::pb.order.Target == kTarget,
+                      "only a unit the module cannot resolve is rejected before playerbots; sight is playerbots'");
             }
     {
         Env env;
-        env.Run(ValidCmd(ChannelIntent::Mark));
-        Check(game.distanceCalls == 1 && game.lastDistance == g_SayDistance, "visibility uses g_SayDistance");
-        Env closed;
         g_SayDistance = 0.0f;
-        Check(closed.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Rejected, "zero radius sees nothing");
+        Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Applied && game.distanceCalls == 0,
+              "the module measures no distance to a target");
         g_SayDistance = 17.5f;
     }
     // Position: a fact only when playerbots finds it reachable, and the probe carries the exact destination.
@@ -587,9 +575,9 @@ void Facts()
         Check(env.Run(ValidCmd(ChannelIntent::Position)) == EffectResult::Applied, "reachable position");
         auto const& probe = PlayerbotBridge::pb.probe;
         Check(probe.Operation == PlayerbotBridge::Intent::Position && probe.Bot == kBot &&
-                  probe.Controller == kController && probe.VisibilityDistance == g_SayDistance && probe.MapId == 1 &&
-                  probe.X == 100.5 && probe.Y == 200.25 && probe.Z == 300.125,
-              "reachability probe carries scope guids, radius and the exact destination");
+                  probe.Controller == kController && probe.MapId == 1 && probe.X == 100.5 && probe.Y == 200.25 &&
+                  probe.Z == 300.125,
+              "reachability probe carries scope guids and the exact destination");
         Check(PlayerbotBridge::pb.reachPhase == &env.phase.join, "probe uses the joined phase");
     }
     {
@@ -991,10 +979,6 @@ void ResultMapping()
             PlayerbotBridge::pb.result = pair.in;
             Check(env.Run(ValidCmd(verb.intent)) == pair.out && PlayerbotBridge::pb.executes == 1,
                   "playerbots result maps one to one; unknown is failed, never applied");
-            bool const mayHaveMarked = verb.intent == ChannelIntent::Mark &&
-                                       (pair.out == EffectResult::Applied || pair.out == EffectResult::Failed);
-            Check(ownMarkNotes == (mayHaveMarked ? 1u : 0u) && (!mayHaveMarked || ownMarkBot == kBot),
-                  "only a mark that applied or may have applied re-baselines the marking bot's own marks");
         }
 
     // DS.14: playerbots' reason for a refusal, in the bot's own words; no reason leaves the channel's cannot_now.
@@ -1109,12 +1093,10 @@ void SteppedOrders()
         Check(std::all_of(pb.steps.begin(), pb.steps.end(),
                           [](PlayerbotBridge::Order const& order)
                           {
-                              return order.Bot == kBot && order.Controller == kController && order.Group == kGroup &&
-                                     order.VisibilityDistance == 17.5f;
+                              return order.Bot == kBot && order.Controller == kController && order.Group == kGroup;
                           }),
-              "every step carries the scope's bot, partner, captured group and radius");
+              "every step carries the scope's bot, partner and captured group");
         Check(pb.reaches == 0 && plans.Size() == 0, "no module pre-check of the spot; one-shot steps record no plan");
-        Check(ownMarkNotes == 1 && ownMarkBot == kBot, "a mark step that ran re-baselines the bot's own marks");
     }
     {
         Env env;
@@ -1184,8 +1166,8 @@ void SteppedOrders()
         PlayerbotBridge::pb.stepOutcomes = {{Result::Applied, Refusal::None}, {Result::Rejected, Refusal::None}};
         auto const cannot = DescribeRefusal(CommandRefusal::CannotNow);
         Check(RunSteps(env, Steps({go, mark})) == EffectResult::Rejected && env.ran.size() == 2 &&
-                  env.ran[1].reason == cannot.code && env.ran[1].reasonText == cannot.text && ownMarkNotes == 0,
-              "an unworded refusal reads cannot_now; a refused mark notes nothing");
+                  env.ran[1].reason == cannot.code && env.ran[1].reasonText == cannot.text,
+              "an unworded refusal reads cannot_now");
     }
     {
         Env env;

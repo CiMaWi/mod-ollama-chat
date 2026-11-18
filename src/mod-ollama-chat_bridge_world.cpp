@@ -84,82 +84,24 @@ bool WorldChannel::Register(WorldTicket const& ticket, DispatchGuard const& guar
     Binding binding{ticket, guard};
     if (!Fresh(binding, now))
         return false;
-    // Explicit admission work only; no all-request sweep is installed on the world tick.
-    std::erase_if(_bindings, [&](auto const& pair) { return !_world.Current(pair.second.ticket, now); });
-    if (_bindings.size() >= MaxWorldPending || !_policy.ObserveScope(ticket.scope, now) ||
+    // Explicit admission work only; no all-request sweep is installed on the world tick. A lapsed binding's route
+    // leaves the replay ledger with it (LC.35).
+    std::erase_if(_bindings,
+                  [&](auto const& pair)
+                  {
+                      if (_world.Current(pair.second.ticket, now))
+                          return false;
+                      _policy.Drop(pair.first);
+                      return true;
+                  });
+    // A bound route registers once: the ledger forgets a route at its terminal (LC.35), so a second OpenGeneration
+    // would reopen it without the command ids it already consumed.
+    if (_bindings.contains(ticket.request.requestId) || _bindings.size() >= MaxWorldPending ||
+        !_policy.ObserveScope(ticket.scope, now) ||
         _policy.OpenGeneration(ticket.scope, ticket.request.requestId, ChannelDeadline(ticket.request.deadline, now),
                                now) != ChannelError::None)
         return false;
     return _bindings.emplace(ticket.request.requestId, std::move(binding)).second;
-}
-
-bool WorldChannel::RegisterEvents(WorldTicket const& ticket, DispatchGuard const& guard,
-                                  std::vector<ChannelObservedMark> const& events, uint64_t& receipt,
-                                  std::function<bool()> const& current)
-{
-    receipt = 0;
-    auto const now = _clock();
-    Binding binding{ticket, guard, true};
-    if (!Fresh(binding, now) || events.empty() || events.size() > ChannelMaxEvents || (_source && !current))
-        return false;
-    std::erase_if(_bindings, [&](auto const& pair) { return !_world.Current(pair.second.ticket, now); });
-    if (_bindings.size() >= MaxWorldPending || _bindings.contains(ticket.request.requestId) ||
-        !_policy.ObserveScope(ticket.scope, now))
-        return false;
-    // Capacity lasts through serialization/publication; no untracked outbound body survives this call.
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (Used() >= MaxPackets || _sequence == std::numeric_limits<uint64_t>::max())
-        return false;
-    auto packet = std::make_unique<ChannelPacket>();
-    packet->_lease = std::make_unique<ChannelPacket::Lease>(_used);
-    packet->_serial = _serial;
-    packet->_route = ticket.request.requestId;
-    packet->_until = CaptureDeadline(now, WorldLivenessMs);
-    packet->_until.unixMs = std::min(packet->_until.unixMs, ticket.request.deadline.unixMs);
-    packet->_until.steadyMs = std::min(packet->_until.steadyMs, ticket.request.deadline.steadyMs);
-    if (_policy.OpenEvents(ticket.scope, ticket.request.requestId, ChannelDeadline(ticket.request.deadline, now),
-                           events, now, packet->body) != ChannelError::None)
-        return false;
-    if (!Fresh(binding, _clock()) || (current && !current()) || !Fresh(binding, _clock()) ||
-        Expired(packet->_until, _clock()))
-    {
-        std::string ignored;
-        _policy.FinishFailure(RouteEnvelope(ticket), ChannelFailure::Cancelled, ticket.scope, _clock(), ignored);
-        return false;
-    }
-    _bindings.emplace(ticket.request.requestId, std::move(binding));
-    packet->receipt = ++_sequence;
-    receipt = packet->receipt;
-    _done.emplace(receipt, std::move(packet));
-    return true;
-}
-
-bool WorldChannel::ObserveEvents(DispatchGuard const& guard, std::vector<uint8_t> const& icons,
-                                 EventPublication& publication)
-{
-    publication = {};
-    if (!_source || !Activate())
-        return false;
-    Context input;
-    input.channel = guard.scope.channel;
-    input.speakerGuid = guard.speakerGuid;
-    input.text = "Current observed marks.";
-    auto const ticket = _world.Reserve(guard.scope, std::move(input), _clock(), WorldLivenessMs);
-    if (!ticket.generation)
-        return false;
-    FilteredQueryAdapter adapter(_world, *_source, _clock);
-    MarkObservation observed;
-    uint64_t receipt = 0;
-    if (!adapter.CaptureMarks(ticket, guard, icons, observed) ||
-        !RegisterEvents(ticket, guard, observed.marks, receipt, [&] { return adapter.Current(observed); }))
-    {
-        Close(ticket);
-        _world.Cancel(ticket);
-        return false;
-    }
-    // No consumer can discover this route/receipt until the final validation and _done insertion succeeded.
-    publication = {ticket.request.requestId, receipt};
-    return true;
 }
 
 bool WorldChannel::Close(WorldTicket const& ticket)
@@ -170,6 +112,7 @@ bool WorldChannel::Close(WorldTicket const& ticket)
     bool const acted = it->second.acted;
     std::string body;
     _policy.FinishFailure(RouteEnvelope(ticket), ChannelFailure::Cancelled, ticket.scope, _clock(), body);
+    _policy.Drop(ticket.request.requestId);  // LC.35: also a route whose scope or deadline already lapsed.
     _bindings.erase(it);
     std::lock_guard<std::mutex> lock(_mutex);
     std::erase_if(_receive, [&](auto const& packet) { return packet->_route == ticket.request.requestId; });
@@ -352,8 +295,7 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
         ++processed;
         auto const it = _bindings.find(packet->_route);
         if (it == _bindings.end() || Expired(packet->_until, _clock()) || !Fresh(it->second, _clock()))
-            continue;  // Actual payload disposal, not merely a logical cancellation.
-        bool eventTerminal = false;
+            continue;            // Actual payload disposal, not merely a logical cancellation.
         bool command = false;    // A command outcome was decided for this packet.
         bool attempted = false;  // An authorized effect attempt; its receipt uses the post-effect join.
         bool armed = false;      // J6e-c: a watch was armed on this route.
@@ -415,10 +357,7 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
                 else if (auto const* watch = std::get_if<ChannelWatch>(&message.payload))
                     packet->error = Arm(binding, message.envelope, *watch, phase, armed, packet->body);
                 else
-                {
-                    eventTerminal = binding.events;
-                    packet->error = ChannelError::Unknown;  // No reverse text/effect adapter; never fabricate delivery.
-                }
+                    packet->error = ChannelError::Unknown;  // No reverse text adapter; never fabricate delivery.
                 auto const until = CaptureDeadline(_clock(), message.envelope.deadlineUnixMs - _clock().unixMs);
                 packet->_until.unixMs = std::min(packet->_until.unixMs, until.unixMs);
                 packet->_until.steadyMs = std::min(packet->_until.steadyMs, until.steadyMs);
@@ -443,13 +382,6 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
             continue;
         }
         auto const& binding = route->second;
-        if (eventTerminal)
-        {
-            auto const ticket = binding.ticket;
-            Close(ticket);
-            _world.Cancel(ticket);
-            continue;
-        }
         packet->_until.unixMs = std::min(packet->_until.unixMs, binding.ticket.request.deadline.unixMs);
         packet->_until.steadyMs = std::min(packet->_until.steadyMs, binding.ticket.request.deadline.steadyMs);
         std::lock_guard<std::mutex> lock(_mutex);
@@ -555,8 +487,6 @@ bool WorldScope::operator==(WorldScope const& other) const
 
 void WorldPolicy::Retire()
 {
-    if (_observer)
-        _observer->ForgetAll();
     _selected = {};
     _scopes.clear();
     _pending.clear();
@@ -572,7 +502,6 @@ void WorldPolicy::Configured(bool enabled, Settings settings, std::string epoch)
     if (_generation == std::numeric_limits<uint64_t>::max())
         return;
     ++_generation;
-    _issued = 0;
     if (!enabled || !ValidSettings(settings) || !ValidIdentifier(epoch))
         return;
     _settings = std::move(settings);
@@ -632,8 +561,6 @@ void WorldPolicy::InvalidateScope(uint64_t botGuid, std::string const& contextId
                   [&](ScopeEntry const& entry)
                   {
                       bool const remove = entry.scope.botGuid == botGuid && entry.scope.contextId == contextId;
-                      if (remove && _observer)
-                          _observer->Forget(entry.scope);
                       return remove;
                   });
     std::erase_if(
@@ -653,8 +580,6 @@ void WorldPolicy::Expire(Clock now)
                   [&](ScopeEntry const& entry)
                   {
                       bool const remove = Expired(entry.liveUntil, now);
-                      if (remove && _observer)
-                          _observer->Forget(entry.scope);
                       return remove;
                   });
     std::erase_if(_pending,
@@ -677,7 +602,7 @@ std::vector<WorldScope> WorldPolicy::Scopes(Clock now) const
 WorldTicket WorldPolicy::Reserve(WorldScope const& scope, Context input, Clock now, int64_t lifetimeMs)
 {
     Expire(now);
-    if (!ScopeCurrent(scope, now) || _pending.size() >= MaxWorldPending || _issued >= MaxEpochRequests ||
+    if (!ScopeCurrent(scope, now) || _pending.size() >= MaxWorldPending ||
         _sequence == std::numeric_limits<uint64_t>::max())
         return {};
     Deadline const deadline = CaptureDeadline(now, lifetimeMs);
@@ -697,7 +622,6 @@ WorldTicket WorldPolicy::Reserve(WorldScope const& scope, Context input, Clock n
     std::string body;
     if (!Build(_settings, ticket.request, now, body))
         return {};
-    ++_issued;
     _pending.emplace(ticket.request.requestId, PendingEntry{ticket, Stage::Reserved});
     return ticket;
 }
@@ -766,256 +690,6 @@ void WorldPolicy::Cancel(WorldTicket const& ticket)
 {
     if (ticket.generation == _generation)
         _pending.erase(ticket.request.requestId);
-}
-WorldObserver::WorldObserver(Transport transport, ReadClock clock)
-    : _transport(std::move(transport)), _clock(std::move(clock))
-{
-}
-
-WorldObserver::~WorldObserver() { Stop(); }
-
-void WorldObserver::Start()
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (_running)
-        return;
-    _running = true;
-    _worker = std::thread(&WorldObserver::Run, this);
-}
-
-void WorldObserver::Reset(Clock now)
-{
-    // Serial tags discard a previous settings/epoch's reply, even if its HTTP finishes after retirement.
-    if (_serial == std::numeric_limits<uint64_t>::max())
-        _enabled = false;
-    else
-        ++_serial;
-    _challenge = {};
-    _epoch.clear();
-    _accepted.clear();
-    _observed.clear();
-    _sent.clear();
-    _challengeUntil = _liveUntil = {};
-    _job.reset();
-    _reply.reset();
-    _retryAt = now.steadyMs + 1000;
-    _refreshAt = 0;
-}
-
-void WorldObserver::RetirePacket(Clock now)
-{
-    // Best effort only. An occupied/ambiguous lane cannot invent the next challenge; native expiry is the bound.
-    if (!_running || _busy || _job || _reply || _epoch.empty() || Expired(_challengeUntil, now))
-        return;
-    std::string body;
-    if (BuildObserverSnapshot(_settings, _challenge, _epoch, false, false, {}, body))
-        _job = Job{0, _settings, OllamaObserverOperation::Snapshot, std::move(body), _challengeUntil, _challenge, {}};
-}
-
-void WorldObserver::Configured(bool enabled, Settings settings, Clock now)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    RetirePacket(now);
-    auto retirement = _job && _job->serial == 0 ? std::move(_job) : std::optional<Job>{};
-    Reset(now);
-    _enabled = enabled && ValidObserverSettings(settings) && _serial != std::numeric_limits<uint64_t>::max();
-    _settings = _enabled ? std::move(settings) : Settings{};
-    _lastSteady = now.steadyMs;
-    _retryAt = now.steadyMs;
-    _job = std::move(retirement);
-    _wake.notify_one();
-}
-
-void WorldObserver::Stop()
-{
-    Configured(false, {}, _clock());
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        _running = false;
-    }
-    _wake.notify_one();
-    if (_worker.joinable())
-        _worker.join();
-}
-
-WorldObserver::View WorldObserver::State() const
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    return {_enabled, _challenge.incarnation, _epoch, _busy || _job.has_value() || _reply.has_value()};
-}
-
-void WorldObserver::Poll(Clock now)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (now.steadyMs < _lastSteady || (_liveUntil.steadyMs && Expired(_liveUntil, now)))
-        Reset(now);
-    _lastSteady = now.steadyMs;
-    if (_reply)
-    {
-        Reply reply = std::move(*_reply);
-        _reply.reset();
-        if (reply.job.serial == _serial)
-        {
-            if (!reply.valid || Expired(reply.job.deadline, now) || Expired(reply.nextDeadline, now))
-                Reset(now);
-            else
-            {
-                if (reply.job.operation == OllamaObserverOperation::Snapshot)
-                {
-                    _accepted = std::move(reply.job.scopes);
-                    std::erase_if(_accepted, [&](WorldScope const& scope)
-                                  { return std::find(_observed.begin(), _observed.end(), scope) == _observed.end(); });
-                    _liveUntil = reply.job.deadline;
-                }
-                _challenge = std::move(reply.challenge);
-                _challengeUntil = reply.nextDeadline;
-            }
-        }
-    }
-    if ((!_challenge.incarnation.empty() && Expired(_challengeUntil, now)) ||
-        (_liveUntil.steadyMs && Expired(_liveUntil, now)))
-        Reset(now);
-}
-
-void WorldObserver::Open(bool worldDrained, Clock now)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (!_running || !_enabled || !worldDrained || _busy || _job || _reply || !_challenge.incarnation.empty() ||
-        now.steadyMs < _retryAt)
-        return;
-    std::string body;
-    if (!BuildObserverOpen(_settings, body))
-        return;
-    _job =
-        Job{_serial, _settings, OllamaObserverOperation::Open, std::move(body), CaptureDeadline(now, WorldLivenessMs),
-            {},      {}};
-    _wake.notify_one();
-}
-
-bool WorldObserver::BindEpoch(std::string epoch, bool worldDrained, Clock now)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    std::string body;
-    if (!_enabled || !worldDrained || !_epoch.empty() || Expired(_challengeUntil, now) ||
-        !BuildObserverSnapshot(_settings, _challenge, epoch, true, true, {}, body))
-        return false;
-    _epoch = std::move(epoch);
-    return true;
-}
-
-void WorldObserver::Publish(std::vector<WorldScope> scopes, bool worldDrained, Clock now)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (scopes.size() > MaxWorldScopes)
-    {
-        Reset(now);
-        return;
-    }
-    _observed = scopes;
-    // Removal is immediate locally, including while a previous snapshot is in flight.
-    std::erase_if(_accepted, [&](WorldScope const& scope)
-                  { return std::find(scopes.begin(), scopes.end(), scope) == scopes.end(); });
-    if (!_enabled || _epoch.empty() || _busy || _job || _reply || (now.steadyMs < _refreshAt && scopes == _sent))
-        return;
-    std::string body;
-    if (Expired(_challengeUntil, now) ||
-        !BuildObserverSnapshot(_settings, _challenge, _epoch, true, worldDrained, scopes, body))
-    {
-        Reset(now);
-        return;
-    }
-    _sent = scopes;
-    _job = Job{_serial,    _settings,        OllamaObserverOperation::Snapshot, std::move(body), _challengeUntil,
-               _challenge, std::move(scopes)};
-    _refreshAt = now.steadyMs + 1000;
-    _wake.notify_one();
-}
-
-bool WorldObserver::Current(WorldScope const& scope, Clock now) const
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _enabled && now.steadyMs >= _lastSteady && !Expired(_liveUntil, now) && scope.epoch == _epoch &&
-           std::find(_accepted.begin(), _accepted.end(), scope) != _accepted.end();
-}
-
-void WorldObserver::Forget(WorldScope const& scope)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    std::erase(_accepted, scope);
-    std::erase(_observed, scope);
-    // A delayed acknowledgement must not resurrect this invalidated exact scope.
-    if (_reply)
-        std::erase(_reply->job.scopes, scope);
-    if (_job && std::find(_job->scopes.begin(), _job->scopes.end(), scope) != _job->scopes.end())
-    {
-        // Unsent bytes no longer describe the world. Keep the unused challenge for a new world capture.
-        _job.reset();
-        _sent.clear();
-        _refreshAt = 0;
-    }
-}
-
-void WorldObserver::ForgetAll()
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    _accepted.clear();
-    _observed.clear();
-    if (_reply)
-        _reply->job.scopes.clear();
-    if (_job && _job->operation == OllamaObserverOperation::Snapshot && _job->serial)
-    {
-        _job.reset();
-        _sent.clear();
-        _refreshAt = 0;
-    }
-}
-
-void WorldObserver::Run()
-{
-    for (;;)
-    {
-        Job job;
-        {
-            std::unique_lock<std::mutex> lock(_mutex);
-            _wake.wait(lock, [&] { return !_running || _job.has_value(); });
-            if (!_job)
-                return;
-            job = std::move(*_job);
-            _job.reset();
-            _busy = true;
-        }
-        Reply reply;
-        reply.job = std::move(job);
-        try
-        {
-            Clock const started = _clock();
-            int64_t const remaining = RemainingMs(reply.job.deadline, started);
-            if (remaining > 0 && remaining <= WorldLivenessMs)
-            {
-                auto const result = _transport(reply.job.settings, reply.job.operation, reply.job.body, remaining);
-                auto const* previous =
-                    reply.job.operation == OllamaObserverOperation::Snapshot ? &reply.job.previous : nullptr;
-                reply.valid = result.ok() && result.error.empty() &&
-                              ParseObserverChallenge(reply.job.settings, result.body, previous, reply.challenge);
-                // Request start precedes native challenge issuance, so this is a conservative local bound.
-                reply.nextDeadline = CaptureDeadline(started, WorldLivenessMs);
-            }
-        }
-        catch (...)
-        {
-            reply.valid = false;
-        }
-        {
-            std::lock_guard<std::mutex> lock(_mutex);
-            if (reply.job.serial == _serial)
-            {
-                if (!reply.valid)
-                    _accepted.clear();
-                _reply = std::move(reply);
-            }
-            _busy = false;
-        }
-    }
 }
 
 }  // namespace OllamaBridge

@@ -131,8 +131,6 @@ OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters();
 // DS.14/J5f: OllamaBridge::BotState::plans bits (PlanKind order) of the bot's live bridge plans; world thread.
 uint8_t OllamaChat_BridgePlanKinds(uint64_t botGuid);
 void OllamaChat_BridgeRefresh();
-// World thread: re-baselines the stored marks of botGuid's own bindings after its mark order, publishing nothing.
-void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid);
 void OllamaChat_BridgeReset();
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply);
 // J6e-c, world thread (post-map-join scan): opens the wake generation of a fired watch through BridgeSubmit on a fresh
@@ -174,11 +172,7 @@ void OllamaDispatch_BridgeListen(bool channelEnabled, uint32_t port);
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld();
 
 // Shared native-adapter boundary; every I/O operation authenticates the local game-link bearer.
-// route is an existing game-issued generation/event request id, never a wire-authored world scope.
-// World-only event publication; J5c owns observed mark provenance and fresh capture.
-bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const& guard, std::vector<uint8_t> const& icons);
-// World-only route handoff for the later native adapter; contains no game pointer or authority grant.
-bool OllamaDispatch_ChannelNextEvent(OllamaBridge::EventPublication& publication);
+// route is an existing game-issued generation request id, never a wire-authored world scope.
 OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer, std::string_view route,
                                                          std::string_view body, uint64_t& receipt);
 OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, uint64_t receipt,

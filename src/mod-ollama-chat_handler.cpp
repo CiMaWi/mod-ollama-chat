@@ -1336,15 +1336,16 @@ bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic, std::
         return false;
     for (auto& item : items)
     {
-        OllamaBridge::StateEntry entry{std::move(item.name), {}, item.value, item.extra, std::move(item.text)};
+        // LCB1e: the game's row word as it sends it (the bridge decides what it shows); inventory, quests and
+        // strategies still send a code only, so their fixed words follow it here.
+        OllamaBridge::StateEntry entry{std::move(item.name), std::move(item.word), item.value, item.extra,
+                                       std::move(item.text)};
         if (topic == OllamaBridge::StateTopic::Inventory)
             entry.kind = item.code ? "equipped" : "bag";
         else if (topic == OllamaBridge::StateTopic::Quests)
             entry.kind = item.code == 1 ? "complete" : item.code == 2 ? "failed" : "active";
         else if (topic == OllamaBridge::StateTopic::Strategies)
             entry.kind = item.code ? "combat" : "non_combat";
-        else
-            entry.kind = OllamaBridge::StateTopicRow(topic, item.code);  // Empty for cooldowns and spells.
         entries.push_back(std::move(entry));
     }
     return true;
@@ -1462,7 +1463,6 @@ struct BridgeView
     std::string signature;
     // Length of the signature's voice part; the card fields (appended accepted body, card token) follow it (DS.8).
     std::size_t voiceSignature = 0;
-    std::vector<OllamaBridge::ChannelObservedMark> marks;
     OllamaPersona::CardContext card;
 };
 
@@ -1473,7 +1473,6 @@ struct BridgeBinding
     OllamaBridge::Deadline heartbeat;
     OllamaBridge::Deadline idleUntil;
     std::string memory;
-    std::vector<OllamaBridge::ChannelObservedMark> marks;
 };
 
 // World-thread only. Entries contain values, never Player/Group pointers. Refresh work is at most 64 * 40 members.
@@ -1562,17 +1561,6 @@ public:
         result = {guid, group ? group->GetGUID().GetRawValue() : 0, unit->GetName(),
                   static_cast<int32_t>(unit->GetHealthPct())};
         return true;
-    }
-
-    bool ReadMark(OllamaBridge::WorldTicket const& ticket, uint8_t icon, uint64_t& targetGuid) override
-    {
-        targetGuid = 0;
-        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.botGuid));
-        Group* group = bot && bot->IsInWorld() ? bot->GetGroup() : nullptr;
-        if (!group || group->isRaidGroup() || icon > 7 || !group->IsMember(bot->GetGUID()))
-            return false;
-        targetGuid = group->GetTargetIcon(icon).GetRawValue();
-        return targetGuid != 0;
     }
 
     bool ReadTopic(OllamaBridge::WorldTicket const& ticket, OllamaBridge::StateTopic topic, std::string const& place,
@@ -1734,15 +1722,6 @@ bool BridgeCapture(uint64_t botGuid, uint64_t speakerGuid, OllamaBridge::Dispatc
     std::size_t const voiceSize = view.context.persona.size();
     BridgeCard(view);
     view.context.observations = {"Your name is " + bot->GetName() + ".", "The speaker is " + speaker->GetName() + "."};
-    // Piggyback on this existing bounded observation; never add a world/group scan or tick hook.
-    if (group)
-        for (uint8_t icon = 0; icon < 8; ++icon)
-        {
-            auto const guid = group->GetTargetIcon(icon);
-            Unit* unit = guid.GetRawValue() ? ObjectAccessor::GetUnit(*bot, guid) : nullptr;
-            if (BridgeVisibleUnit(bot, unit, distance))
-                view.marks.push_back({guid.GetRawValue(), icon});
-        }
     std::string_view const persona = view.context.persona;
     BridgeField(view.signature, persona.substr(0, voiceSize));
     view.voiceSignature = view.signature.size();
@@ -1898,24 +1877,6 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
     // The one load request: a qualified current encounter (DS.12: any speaker and channel; the card is the bot's own
     // data). Captures elsewhere only read. A closed gate does no I/O.
     cards.Prepare(generation, view.guard.scope.botGuid, std::chrono::steady_clock::now());
-    auto const bridgeSettings = OllamaDispatch_BridgeWorld().Snapshot();
-    if (bridgeSettings.provider == "codex" && bridgeSettings.observerEnabled)
-    {
-        // Native permits one exact context per bot/controller/channel peer. Replace, never alias to newest.
-        for (auto prior = g_bridgeBindings.begin(); prior != g_bridgeBindings.end();)
-        {
-            auto const& scope = prior->view.guard.scope;
-            if (scope.botGuid == view.guard.scope.botGuid && scope.controllerGuid == view.guard.scope.controllerGuid &&
-                scope.channel == view.guard.scope.channel && scope.contextId != view.guard.scope.contextId)
-            {
-                auto const index = prior - g_bridgeBindings.begin();
-                BridgeErase(prior);
-                prior = g_bridgeBindings.begin() + index;
-            }
-            else
-                ++prior;
-        }
-    }
     auto it = std::find_if(g_bridgeBindings.begin(), g_bridgeBindings.end(),
                            [&](BridgeBinding const& item)
                            {
@@ -1955,10 +1916,8 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
         if (!OllamaDispatch_BridgeWorld().ObserveScope(scope, now))
             return false;
         g_bridgeBindings.push_back({OllamaDispatch_BridgeWorld().Generation(), std::move(view),
-                                    CaptureDeadline(now, WorldLivenessMs),
-                                    CaptureDeadline(now, MaxLifetimeMs),
-                                    std::move(memory),
-                                    {}});
+                                    CaptureDeadline(now, WorldLivenessMs), CaptureDeadline(now, MaxLifetimeMs),
+                                    std::move(memory)});
         it = std::prev(g_bridgeBindings.end());
     }
     it->idleUntil = CaptureDeadline(now, MaxLifetimeMs);
@@ -2040,39 +1999,8 @@ void OllamaChat_BridgeRefresh()
         else
         {
             it->heartbeat = CaptureDeadline(now, WorldLivenessMs);
-            bool const changed = current.marks.size() != it->marks.size() ||
-                                 !std::equal(current.marks.begin(), current.marks.end(), it->marks.begin(),
-                                             [](ChannelObservedMark const& a, ChannelObservedMark const& b)
-                                             { return a.targetGuid == b.targetGuid && a.icon == b.icon; });
-            auto const observedGuard = guard;
-            std::vector<uint8_t> icons;
-            if (changed)
-                for (auto const& mark : current.marks)
-                    icons.push_back(mark.icon);
-            it->marks = std::move(current.marks);
             ++it;
-            // The synchronous observer may invalidate a binding. Do not retain its iterator across publication.
-            if (!icons.empty())
-            {
-                auto const index = it - g_bridgeBindings.begin();
-                OllamaDispatch_ChannelEvents(observedGuard, icons);
-                it = g_bridgeBindings.begin() + std::min<std::size_t>(index, g_bridgeBindings.size());
-            }
         }
-    }
-}
-
-void OllamaChat_BridgeNoteOwnMark(uint64_t botGuid)
-{
-    // DS.10: only the marking bot's bindings take the new marks as their baseline, so the next refresh opens no
-    // events route for its own mark. A failed capture leaves the binding for the refresh to retire.
-    for (auto& binding : g_bridgeBindings)
-    {
-        auto const& guard = binding.view.guard;
-        BridgeView current;
-        if (guard.scope.botGuid == botGuid &&
-            BridgeCapture(guard.scope.botGuid, guard.speakerGuid, guard.source, current))
-            binding.marks = std::move(current.marks);
     }
 }
 

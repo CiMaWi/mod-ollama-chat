@@ -30,12 +30,11 @@ inline std::string Clean(std::string const& text)
     return out;
 }
 
-// "very careful" -> "careful", "a loner" -> "loner": the word without its intensity or article (the four grades of
-// playerbots' TraitRules::Word: somewhat, rather, very, extremely)
+// "fiercely loyal" -> "loyal", "a loner" -> "loner": the word without its adverb or article. Playerbots' trait words
+// are three words of their own per pole, none with a qualifier in front, so only the adverbs inside such words go.
 inline std::string StripAdverb(std::string const& word)
 {
-    static char const* const prefixes[] = {"extremely ", "very ",   "rather ", "somewhat ",
-                                           "fiercely ",  "deeply ", "a ",      "an "};
+    static char const* const prefixes[] = {"fiercely ", "deeply ", "a ", "an "};
     for (char const* prefix : prefixes)
     {
         std::string const p = prefix;
@@ -45,7 +44,7 @@ inline std::string StripAdverb(std::string const& word)
     return word;
 }
 
-// "very careful, very devout; fond of fishing and inns and ale"
+// "wary, devout; fond of fishing and inns and ale"
 inline std::string FormatPersonalityPrompt(std::vector<std::string> const& words,
                                            std::vector<std::string> const& interests)
 {
@@ -80,7 +79,7 @@ inline std::string FormatPersonalityPrompt(std::vector<std::string> const& words
     return text;
 }
 
-// "careful, devout, bookish": the three strongest words without intensity, cut at a word to the card fact bound
+// "careful, devout, bookish": the three strongest words without adverb, cut at a word to the card fact bound
 inline std::string FormatCardTraits(std::vector<std::string> const& words)
 {
     std::string text;

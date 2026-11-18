@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 
+#include "BridgeTexts.h"
 #include "mod-ollama-chat_bridge.h"
 #include "mod-ollama-chat_bridge_intent.h"
 
@@ -81,11 +82,11 @@ inline char const* WakeText(WatchCondition condition)
     switch (condition)
     {
         case WatchCondition::CombatEnd:
-            return "Your fight is over.";
+            return BridgeTexts::Wakes::COMBAT_END;
         case WatchCondition::ActivityDone:
-            return "You have finished what you were doing.";
+            return BridgeTexts::Wakes::ACTIVITY_DONE;
         default:
-            return "The time you meant to wait has passed.";
+            return BridgeTexts::Wakes::TIME_PASSED;
     }
 }
 

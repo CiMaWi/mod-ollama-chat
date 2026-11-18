@@ -187,7 +187,7 @@ void BridgeChecks()
     Check(QueryOllamaBridge(latest, request).error == "bridge_expired_or_invalid_request", "expired request rejected");
     OllamaBridge_SetActivation({});
     fixtureConfig.values = {{"OllamaChat.Bridge.Instance", "fixture-main"},
-                            {"OllamaChat.Bridge.Provider", "codex"},
+                            {"OllamaChat.Bridge.Provider", "claude"},
                             {"OllamaChat.Bridge.Endpoint", "http://127.0.0.1:47800"},
                             {"OllamaChat.Bridge.Token", "synthetic-not-a-real-link-token"}};
     FixtureLoadBridge();

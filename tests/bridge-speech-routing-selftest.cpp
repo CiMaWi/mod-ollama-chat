@@ -60,7 +60,6 @@ OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource()
         {
             return false;
         }
-        bool ReadMark(OllamaBridge::WorldTicket const&, uint8_t, uint64_t&) override { return false; }
     };
     static Blind source;
     return source;
@@ -79,17 +78,11 @@ OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
     static Closed executor;
     return executor;
 }
-OllamaHttpResult OllamaHttp_PostObserver(OllamaBridge::Settings const&, OllamaObserverOperation, std::string const&,
-                                         int64_t)
-{
-    return {};
-}
 namespace OllamaPersona
 {
 void ForgetPersona(uint64_t) {}
 void RetirePersonas(uint64_t) {}
 }  // namespace OllamaPersona
-bool OllamaDispatch_ChannelEvents(OllamaBridge::DispatchGuard const&, std::vector<uint8_t> const&) { return false; }
 
 #include "dispatch-types.inc"
 

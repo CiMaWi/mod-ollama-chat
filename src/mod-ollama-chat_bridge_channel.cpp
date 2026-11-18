@@ -415,18 +415,6 @@ std::string TopicText(std::string const& text, std::size_t max)
     return Text(result, max) ? result : std::string();
 }
 
-// WT18b: a planner topic's row word, as StateTopicRow names it.
-bool PlannerRow(StateTopic topic, std::string const& kind)
-{
-    for (uint8_t code = 0; code < 8; ++code)
-    {
-        std::string const word = StateTopicRow(topic, code);
-        if (!word.empty() && word == kind)
-            return true;
-    }
-    return false;
-}
-
 // Gameplay strategies the bot can talk about; every other playerbots strategy name is dropped.
 bool StrategyAllowed(std::string const& name)
 {
@@ -562,19 +550,25 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
         case StateTopic::QuestPlan:
         case StateTopic::Bags:
         case StateTopic::Places:
-            if (!PlannerRow(topic, entry.kind))
+        {
+            // LCB1e: the game's row word, whichever it is, and its sentence when it sends one.
+            if (!Word(entry.kind))
                 return false;
             value = {{"row", entry.kind},
                      {"name", name},
                      {"value", std::clamp<int64_t>(entry.first, 0, UINT32_MAX)},
                      {"extra", std::clamp<int64_t>(entry.second, 0, UINT32_MAX)}};
+            auto text = TopicText(entry.text, ChannelMaxTopicText);
+            if (!text.empty())
+                value["text"] = std::move(text);
             return true;
+        }
         case StateTopic::History:  // LC7: the planner shape and the entry's sentence in its own field.
         case StateTopic::Lately:
         case StateTopic::Known:
         {
             auto const text = TopicText(entry.text, ChannelMaxTopicText);
-            if (!PlannerRow(topic, entry.kind) || text.empty())
+            if (!Word(entry.kind) || text.empty())
                 return false;
             value = {{"row", entry.kind},
                      {"name", name},
@@ -717,85 +711,6 @@ char const* StateTopicName(StateTopic topic)
     return row ? row->name.c_str() : "";
 }
 
-char const* StateTopicRow(StateTopic topic, uint8_t code)
-{
-    static constexpr char const* plan[] = {"goal", "source", "reason", "stop"};
-    static constexpr char const* options[] = {"option", "current"};
-    static constexpr char const* route[] = {"total", "leg", "failed"};
-    static constexpr char const* questPlan[] = {"take", "task", "turn_in", "carried", "deferred"};
-    static constexpr char const* bags[] = {"free", "sell", "bag"};
-    static constexpr char const* places[] = {"hearth", "flight_here", "flight_elsewhere"};
-    static constexpr char const* history[] = {"event", "zone", "dungeon", "boss"};
-    static constexpr char const* lately[] = {"deed"};
-    static constexpr char const* known[] = {"bot"};
-    auto const pick = [code](auto const& words) -> char const* { return code < std::size(words) ? words[code] : ""; };
-    switch (topic)
-    {
-        case StateTopic::Plan:
-            return pick(plan);
-        case StateTopic::Options:
-            return pick(options);
-        case StateTopic::Route:
-            return pick(route);
-        case StateTopic::QuestPlan:
-            return pick(questPlan);
-        case StateTopic::Bags:
-            return pick(bags);
-        case StateTopic::Places:
-            return pick(places);
-        case StateTopic::History:
-            return pick(history);
-        case StateTopic::Lately:
-            return pick(lately);
-        case StateTopic::Known:
-            return pick(known);
-        case StateTopic::Inventory:
-        case StateTopic::Quests:
-        case StateTopic::Cooldowns:
-        case StateTopic::Strategies:
-        case StateTopic::Spells:
-            break;
-    }
-    return static_cast<std::size_t>(topic) >= StateTopicCount ? StateTopicName(topic) : "";
-}
-
-std::size_t StateTopicLimit(StateTopic topic)
-{
-    switch (topic)
-    {
-        case StateTopic::Inventory:
-            return 40;
-        case StateTopic::Quests:
-            return 25;
-        case StateTopic::Cooldowns:
-            return 20;
-        case StateTopic::Strategies:
-            return 40;
-        case StateTopic::Spells:
-            return 40;
-        case StateTopic::Plan:  // WT18b: the limits playerbots' topic readers keep.
-            return 8;
-        case StateTopic::Options:
-            return 5;
-        case StateTopic::Route:
-            return 12;
-        case StateTopic::QuestPlan:
-            return 12;
-        case StateTopic::Bags:
-            return 6;
-        case StateTopic::Places:
-            return 24;
-        case StateTopic::History:  // LC7: the limits playerbots' record readers keep.
-            return 24;
-        case StateTopic::Lately:
-            return 12;
-        case StateTopic::Known:
-            return 12;
-    }
-    auto const* row = TopicRowOf(topic);  // LC16c: an open topic's own limit.
-    return row ? row->limit : 0;
-}
-
 char const* ChannelErrorName(ChannelError error)
 {
     switch (error)
@@ -826,9 +741,10 @@ char const* ChannelErrorName(ChannelError error)
     return "invalid_input";
 }
 
-ChannelPolicy::ChannelPolicy(std::size_t maxIds, std::size_t maxPending)
-    : _validLimits(maxIds > 0 && maxIds <= ChannelMaxIds && maxPending > 0 && maxPending <= ChannelMaxPending),
-      _maxIds(maxIds),
+ChannelPolicy::ChannelPolicy(std::size_t maxRouteIds, std::size_t maxPending)
+    : _validLimits(maxRouteIds > 0 && maxRouteIds <= ChannelMaxRouteIds && maxPending > 0 &&
+                   maxPending <= ChannelMaxPending),
+      _maxRouteIds(maxRouteIds),
       _maxPending(maxPending)
 {
 }
@@ -848,8 +764,9 @@ bool ChannelPolicy::Bind(Identity identity, std::string localBearer)
     Retire();
     if (!_validLimits || !Identifier(identity.instance) || !Identifier(identity.provider) ||
         !Identifier(identity.epoch) || localBearer.size() < 16 || localBearer.size() > 256 ||
-        _epochs.size() >= ChannelMaxIds || !_epochs.insert(identity.epoch).second)
+        identity.epoch == _previous)
         return false;
+    _previous = identity.epoch;
     _identity = std::move(identity);
     _bearer = std::move(localBearer);
     return true;
@@ -878,10 +795,33 @@ void ChannelPolicy::RemoveScope(uint64_t botGuid, std::string const& contextId)
 void ChannelPolicy::Expire(Clock now)
 {
     _observed = {std::max(_observed.unixMs, now.unixMs), std::max(_observed.steadyMs, now.steadyMs)};
+    // LC.35: a generation route past its deadline is forgotten with its queries and commands. The ledger holds live
+    // routes only, so this scan is bounded by them, not by the epoch's history.
+    std::vector<std::string> expired;
     for (auto& [id, entry] : _requests)
-        if (!Alive(entry.until, now) || !Alive(entry.until, _observed) || !ScopeCurrent(entry.scope, now))
+        if (!Alive(entry.until, now) || !Alive(entry.until, _observed))
+        {
             entry.invalid = true;
+            if (entry.work == ChannelWork::Generation)
+                expired.push_back(id);
+        }
+        else if (!ScopeCurrent(entry.scope, now))
+            entry.invalid = true;
+    for (auto const& route : expired)
+        Drop(route);
     std::erase_if(_scopes, [&](ScopeEntry const& entry) { return !Alive(entry.until, now); });
+}
+
+void ChannelPolicy::Drop(std::string const& route)
+{
+    auto const found = _requests.find(route);
+    if (found == _requests.end() || found->second.work != ChannelWork::Generation)
+        return;
+    for (auto const& id : found->second.queries)
+        _requests.erase(id);
+    for (auto const& id : found->second.commands)
+        _commands.erase(id);
+    _requests.erase(found);
 }
 
 bool ChannelPolicy::ObserveScope(WorldScope scope, Clock now)
@@ -938,7 +878,7 @@ std::size_t ChannelPolicy::Pending() const
 }
 
 ChannelError ChannelPolicy::Open(WorldScope const& scope, std::string requestId, Deadline deadline, ChannelWork work,
-                                 Clock now)
+                                 Clock now, std::string const& route)
 {
     Expire(now);
     if (!ScopeCurrent(scope, now))
@@ -947,47 +887,29 @@ ChannelError ChannelPolicy::Open(WorldScope const& scope, std::string requestId,
         return ChannelError::Invalid;
     if (_requests.contains(requestId))
         return ChannelError::Duplicate;
+    RequestEntry* parent = nullptr;
+    if (work == ChannelWork::Query)
+    {
+        auto const found = _requests.find(route);
+        if (found == _requests.end() || found->second.work != ChannelWork::Generation)
+            return ChannelError::Unknown;  // LC.35: a query opens under a live generation route only.
+        parent = &found->second;
+    }
     if (!Alive(deadline, _observed))
         return ChannelError::Stale;
-    if (_requests.size() >= _maxIds || Pending() >= _maxPending)
+    if (Pending() >= _maxPending || (parent && parent->queries.size() + parent->commands.size() >= _maxRouteIds))
         return ChannelError::Capacity;
     ChannelEnvelope envelope{_identity.instance, _identity.provider, _identity.epoch, requestId, deadline.unixMs};
-    _requests.emplace(std::move(requestId), RequestEntry{std::move(envelope), scope, deadline, work});
+    if (parent)
+        parent->queries.push_back(requestId);  // Element references survive the rehash below.
+    _requests.emplace(std::move(requestId),
+                      RequestEntry{std::move(envelope), scope, deadline, work, false, false, {}, {}});
     return ChannelError::None;
 }
 
 ChannelError ChannelPolicy::OpenGeneration(WorldScope const& scope, std::string requestId, Deadline deadline, Clock now)
 {
     return Open(scope, std::move(requestId), deadline, ChannelWork::Generation, now);
-}
-
-ChannelError ChannelPolicy::OpenEvents(WorldScope const& scope, std::string requestId, Deadline deadline,
-                                       std::vector<ChannelObservedMark> const& events, Clock now, std::string& body)
-{
-    body.clear();
-    if (events.empty() || events.size() > ChannelMaxEvents || !Identifier(requestId) || !ScopeCurrent(scope, now) ||
-        !ValidDeadline(deadline, now))
-        return ChannelError::Invalid;
-    Json observations = Json::array();
-    for (auto const& event : events)
-    {
-        if (!event.targetGuid || event.icon > 7)
-            return ChannelError::Invalid;
-        observations.push_back(
-            {{"kind", "observed_mark"}, {"targetGuid", std::to_string(event.targetGuid)}, {"icon", event.icon}});
-    }
-    ChannelEnvelope envelope{scope.instance, scope.provider, scope.epoch, requestId, deadline.unixMs};
-    auto json = EnvelopeJson(envelope, "events");
-    json["controllerGuid"] = std::to_string(scope.controllerGuid);
-    json["botGuid"] = std::to_string(scope.botGuid);
-    json["events"] = std::move(observations);
-    auto encoded = json.dump();
-    if (encoded.size() > MaxRequestBytes)
-        return ChannelError::TooLarge;
-    auto const result = Open(scope, std::move(requestId), deadline, ChannelWork::Events, now);
-    if (result == ChannelError::None)
-        body = std::move(encoded);
-    return result;
 }
 
 bool ChannelPolicy::Current(ChannelEnvelope const& envelope, WorldScope const& current, Clock now,
@@ -1078,7 +1000,7 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
                 now.steadyMs > std::numeric_limits<int64_t>::max() - (envelope.deadlineUnixMs - now.unixMs))
                 return ChannelError::Stale;
             Deadline const deadline{envelope.deadlineUnixMs, now.steadyMs + (envelope.deadlineUnixMs - now.unixMs)};
-            auto const result = Open(current, envelope.requestId, deadline, ChannelWork::Query, now);
+            auto const result = Open(current, envelope.requestId, deadline, ChannelWork::Query, now, expectedRequestId);
             if (result != ChannelError::None)
                 return result;
             message = {std::move(envelope), query};
@@ -1100,12 +1022,6 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
             if (!Text(text, MaxTextBytes))
                 return ChannelError::Invalid;
             payload = ChannelText{std::move(text)};
-        }
-        else if (type == "events.result")
-        {
-            if (!Exact(json, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type"}))
-                return ChannelError::Invalid;
-            payload = ChannelAck{};
         }
         else if (type == "failure")
         {
@@ -1138,9 +1054,10 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
                 return ChannelError::Invalid;
             if (_commands.contains(command->commandId))
                 return ChannelError::Duplicate;
-            if (_commands.size() >= _maxIds)
+            if (entry.queries.size() + entry.commands.size() >= _maxRouteIds)
                 return ChannelError::Capacity;
             _commands.emplace(command->commandId, CommandEntry{envelope.requestId});
+            entry.commands.push_back(command->commandId);
         }
         else if (auto const* watch = std::get_if<ChannelWatch>(&payload))
         {
@@ -1149,16 +1066,20 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
                 return ChannelError::Invalid;
             if (_commands.contains(watch->commandId))
                 return ChannelError::Duplicate;
-            if (_commands.size() >= _maxIds)
+            if (entry.queries.size() + entry.commands.size() >= _maxRouteIds)
                 return ChannelError::Capacity;
             _commands.emplace(watch->commandId, CommandEntry{envelope.requestId});
+            entry.commands.push_back(watch->commandId);
         }
         else
         {
-            if ((type == "generation.result" && entry.work != ChannelWork::Generation) ||
-                (type == "events.result" && entry.work != ChannelWork::Events))
+            if (type == "generation.result" && entry.work != ChannelWork::Generation)
                 return ChannelError::Invalid;
-            entry.terminal = true;
+            // LC.35: a generation's terminal forgets its route; a late replay then finds none (Unknown).
+            if (entry.work == ChannelWork::Generation)
+                Drop(envelope.requestId);
+            else
+                entry.terminal = true;
         }
         message = {std::move(envelope), std::move(payload)};
         return ChannelError::None;
@@ -1219,19 +1140,21 @@ ChannelError ChannelPolicy::FinishTopic(ChannelEnvelope const& envelope, WorldSc
                                         std::vector<StateEntry> const& entries, Clock now, std::string& body)
 {
     body.clear();
-    if (!TopicRowOf(topic))
+    AbilityRow const* const row = TopicRowOf(topic);
+    if (!row)
         return ChannelError::Invalid;  // LC16c: a topic the installed index lists, any of its values.
     if (!Current(envelope, current, now) || _requests.at(envelope.requestId).work != ChannelWork::Query)
         return ChannelError::Stale;
     try
     {
-        // Entries in the game's order, unusable and repeated ones dropped, cut at the topic's count and byte bounds.
+        // Entries in the game's order, unusable and repeated ones dropped, cut at the catalogue row's limit (LCB1e) and
+        // the byte bound.
         Json list = Json::array();
         std::set<std::string> seen;
         std::size_t bytes = 2;  // The enclosing brackets.
         for (auto const& entry : entries)
         {
-            if (list.size() >= StateTopicLimit(topic))
+            if (list.size() >= row->limit)
                 break;
             Json value;
             if (!TopicEntry(topic, entry, value))
@@ -1314,7 +1237,10 @@ ChannelError ChannelPolicy::FinishFailure(ChannelEnvelope const& envelope, Chann
     auto json = EnvelopeJson(envelope, "failure");
     json["code"] = code;
     body = json.dump();
-    _requests.at(envelope.requestId).terminal = true;
+    if (_requests.at(envelope.requestId).work == ChannelWork::Generation)
+        Drop(envelope.requestId);  // LC.35: the route's terminal; its ids go with it.
+    else
+        _requests.at(envelope.requestId).terminal = true;
     return ChannelError::None;
 }
 
