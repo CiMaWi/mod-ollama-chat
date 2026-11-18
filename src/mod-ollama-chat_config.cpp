@@ -12,7 +12,6 @@
 #include "mod-ollama-chat_memory.h"
 #include "mod-ollama-chat_persona_db.h"
 #include "mod-ollama-chat_roleplay.h"
-#include "mod-ollama-chat_topics.h"
 #include "mod-ollama-chat-utilities.h"
 #include <fmt/core.h>
 #include <sstream>

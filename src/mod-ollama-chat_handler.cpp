@@ -52,7 +52,6 @@
 #include "mod-ollama-chat_roleplay.h"
 #include "mod-ollama-chat_world.h"
 #include "mod-ollama-chat_memory.h"
-#include "mod-ollama-chat_topics.h"
 #include "mod-ollama-chat_random.h"
 #include "mod-ollama-chat_persona_bridge.h"
 #include "mod-ollama-chat_persona_db.h"
@@ -3063,7 +3062,5 @@ void OllamaChatMaintenance::OnPlayerLogout(Player* player)
 
     Governor_OnPlayerLogout(guid);
     Memory_ForgetBot(guid);
-    OllamaRandomChatter_ForgetBot(guid);
-    Topics_ForgetBot(guid);
     OllamaDispatch_BridgeWatchLogout(guid.GetRawValue());  // J6e-c: its watches (as bot or partner) end now.
 }

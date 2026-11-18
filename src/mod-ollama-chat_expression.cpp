@@ -748,49 +748,25 @@ void ChatOnEmote::OnPlayerTextEmote(Player* player, uint32 textEmote,
     if (urand(1, 100) > g_EmoteReplyChance)
         return;
 
-    // Pick a response style by configured weight.
-    const uint32_t total = g_EmoteReplyMirrorWeight + g_EmoteReplyCounterWeight +
-                           g_EmoteReplySpeakWeight;
+    // Pick a gesture style by configured weight.
+    const uint32_t total = g_EmoteReplyMirrorWeight + g_EmoteReplyCounterWeight;
     if (total == 0)
         return;
 
-    uint32_t roll = urand(0, total - 1);
-    uint32_t reactEmote = 0;
-    bool speak = false;
+    uint32_t const roll = urand(0, total - 1);
+    uint32_t reactEmote = roll < g_EmoteReplyMirrorWeight ? GetMirrorEmote(textEmote) : GetCounterEmote(textEmote);
 
-    if (roll < g_EmoteReplyMirrorWeight)
-    {
+    // Fall back to the other table if this one had nothing for this emote.
+    if (!reactEmote)
         reactEmote = GetMirrorEmote(textEmote);
-    }
-    else if (roll < g_EmoteReplyMirrorWeight + g_EmoteReplyCounterWeight)
-    {
+    if (!reactEmote)
         reactEmote = GetCounterEmote(textEmote);
-    }
-    else
-    {
-        speak = true;
-    }
-
-    // Fall back to a gesture if the table had nothing for this emote.
-    if (!speak && !reactEmote)
-        reactEmote = GetMirrorEmote(textEmote);
-    if (!speak && !reactEmote)
-        reactEmote = GetCounterEmote(textEmote);
-
-    if (reactEmote)
-    {
-        ScheduleBotExpression(bot, player->GetGUID(), reactEmote, g_BotExpressionDelayMs);
-
-        if (g_DebugEnabled)
-            LOG_INFO("module.ollamachat", "[Ollama Chat] Bot {} reacting to emote {} from {} with emote {}",
-                     bot->GetName(), textEmote, player->GetName(), reactEmote);
+    if (!reactEmote)
         return;
-    }
 
-    if (speak)
-    {
-        // Turn toward them regardless, then answer in words via the event path.
-        ScheduleBotExpression(bot, player->GetGUID(), 0, g_BotExpressionDelayMs);
-        OllamaChat_DispatchEmoteReaction(bot, player, textEmote);
-    }
+    ScheduleBotExpression(bot, player->GetGUID(), reactEmote, g_BotExpressionDelayMs);
+
+    if (g_DebugEnabled)
+        LOG_INFO("module.ollamachat", "[Ollama Chat] Bot {} reacting to emote {} from {} with emote {}",
+                 bot->GetName(), textEmote, player->GetName(), reactEmote);
 }
