@@ -29,7 +29,12 @@
         },
         {
             "file": "bridge-combat-filter-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "includes": [
+                "src",
+                "../mod-playerbots/src/Bot",
+                "deps"
+            ],
+            "success": "PASS \\d+ combat filter checks"
         },
         {
             "file": "bridge-command-dispatch-selftest.cpp",
@@ -48,7 +53,19 @@
         },
         {
             "file": "bridge-effect-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "includes": [
+                "tests/doubles",
+                "src",
+                "../mod-playerbots/src/Bot",
+                "{core}/deps/fmt/include",
+                "deps"
+            ],
+            "flags": [
+                "/DFMT_HEADER_ONLY",
+                "-Wno-mismatched-tags",
+                "-Wno-missing-field-initializers"
+            ],
+            "success": "PASS \\d+ production bridge effect adapter checks"
         },
         {
             "file": "bridge-intent-selftest.cpp",

@@ -1,6 +1,6 @@
-// The production BridgeCommandExecutor class (src/mod-ollama-chat_bridge_effect.cpp) is extracted verbatim by the
-// runner into bridge-effect-executor.inc and compiled against game and playerbots doubles that count every read and
-// every call. The playerbots Intent, Result and Order types are extracted from mod-playerbots' BridgeIntentEffect.h.
+// The production typed-effect unit (src/mod-ollama-chat_bridge_effect.cpp) is compiled whole, with playerbots' own
+// order types (BridgeIntentEffect.h, BridgeAbilities.h), against game doubles and doubles of playerbots' executor
+// boundary that count every read and every call. The world phase is built as in production: by the world tick.
 // LCB2: every command is stepped, so every case runs through Execute as WorldChannel calls it. J12: the executor's
 // plan ledger (the real PlanLedger) with Capture/Restore doubles that model each bot's lasting parts; the world tick's
 // expiry, group, controller and logout checks and restores. No game, no playerbots, no server.
@@ -9,16 +9,19 @@
 #include <iostream>
 #include <map>
 #include <new>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
-#include "bridge-effect-playerbots.inc"
+#include "BridgeAbilities.h"
+#include "BridgeIntentEffect.h"
 #include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_world.h"
 
 // ---- game doubles -------------------------------------------------------------------------------------------------
-float g_SayDistance = 17.5f;
-
 struct ObjectGuid
 {
     ObjectGuid() = default;
@@ -29,18 +32,9 @@ private:
     uint64_t _raw = 0;
 };
 
-struct Sight
-{
-    bool inMap = true;
-    bool samePhase = true;
-    bool inDistance = true;
-    bool canSee = true;
-};
-
 struct Unit
 {
     bool inWorld = true;
-    Sight sight;  // What this unit, as an observer, makes of any other unit.
     bool IsInWorld() const { return inWorld; }
 };
 
@@ -53,11 +47,11 @@ struct Group
 };
 
 struct Player;
-// The bot's playerbots AI: only its master matters to the plan tick's controller check.
+// The bot's playerbots AI and its master: the unit has no way to ask for them, and the plan tick's cases change them
+// to show that who leads the bot plays no part.
 struct PlayerbotAI
 {
     Player* master = nullptr;
-    Player* GetMaster() const { return master; }
 };
 
 struct Counters
@@ -66,8 +60,6 @@ struct Counters
     unsigned unitLookups = 0;
     unsigned targetReads = 0;
     unsigned groupReads = 0;
-    unsigned distanceCalls = 0;
-    float lastDistance = -1.0f;
 };
 Counters game;
 
@@ -76,15 +68,6 @@ struct Player : Unit
     Group* group = nullptr;
     uint64_t target = 0;
     PlayerbotAI* ai = nullptr;
-    bool IsInMap(Unit const*) const { return sight.inMap; }
-    bool InSamePhase(Unit const*) const { return sight.samePhase; }
-    bool IsWithinDistInMap(Unit const*, float distance) const
-    {
-        ++game.distanceCalls;
-        game.lastDistance = distance;
-        return sight.inDistance;
-    }
-    bool CanSeeOrDetect(Unit const*, bool, bool) const { return sight.canSee; }
     Group* GetGroup()
     {
         ++game.groupReads;
@@ -123,37 +106,219 @@ struct ObjectAccessor
     }
 };
 
-struct PlayerbotsMgr
+// ---- playerbots doubles: the executor boundary the unit calls (declared in the two headers above) ----------------
+namespace PlayerbotBridge
 {
-    static PlayerbotsMgr& instance()
-    {
-        static PlayerbotsMgr manager;
-        return manager;
-    }
-    PlayerbotAI* GetPlayerbotAI(Player* player) const { return player ? player->ai : nullptr; }
+struct Doubles
+{
+    bool current = true;  // What PostMapJoin::Current answers.
+    unsigned executes = 0;
+    unsigned reaches = 0;
+    unsigned authorizeCalled = 0;
+    bool authorizeResult = false;
+    bool reachable = false;
+    Result result = Result::Applied;
+    Refusal refusal = Refusal::None;  // DS.14: what Execute reports through its out-param.
+    Order order;
+    Order probe;
+    PostMapJoin const* phase = nullptr;
+    PostMapJoin const* reachPhase = nullptr;
+    // J12: each bot's lasting parts as playerbots holds them (Bot and Held are filled on every copy).
+    std::map<uint64_t, std::map<Part, Baseline>> state;
+    unsigned captures = 0;
+    unsigned capturesAtExecute = 0;  // Captures made before the latest Execute.
+    bool captureFails = false;
+    bool captureFailsAfterExecute = false;  // Execute sets captureFails (the bot left the world inside the call).
+    std::function<void()> duringExecute;    // Runs inside Execute (e.g. the ledger changes under the attempt).
+    bool writes = true;                     // Applied and Failed write the order's part (Failed: a partial write).
+    int64_t* clock = nullptr;               // Execute advances *clock by executeAdvanceMs (a slow attempt).
+    int64_t executeAdvanceMs = 0;
+    unsigned restores = 0;
+    std::optional<RestoreResult> restoreResult;  // Forced Restore outcome, else the real rule below.
+    uint64_t restoredBot = 0;
+    Baseline restoreBefore;
+    Baseline restoreApplied;
+    // LC3b: the span Execute of a stepped order.
+    unsigned spanExecutes = 0;
+    std::vector<Order> steps;               // The orders of the latest span Execute.
+    std::vector<StepOutcome> stepOutcomes;  // Per step; a step past the list applies.
+    std::optional<Result> spanEarly;        // Refused before authorize (a row-less verb, a malformed step).
+    Refusal wordsFor = Refusal::None;       // The latest RefusalWords argument.
 };
+Doubles pb;
+
+PostMapJoin::PostMapJoin() : _thread(std::this_thread::get_id()) {}
+bool PostMapJoin::Current() const { return pb.current; }
+
+Baseline HeldCopy(uint64_t bot, Part part)
+{
+    Baseline value = pb.state[bot][part];
+    value.Bot = bot;
+    value.Held = part;
+    return value;
+}
+
+// The table's Lasting column (BridgeAbilities.cpp): this double repeats its five.
+Part LastingPart(Intent operation)
+{
+    switch (operation)
+    {
+        case Intent::Follow:
+        case Intent::Stay:
+            return Part::Movement;
+        case Intent::Formation:
+            return Part::Formation;
+        case Intent::SaveMana:
+            return Part::ManaSave;
+        case Intent::FocusHealing:
+            return Part::FocusHeal;
+        default:
+            return Part::None;
+    }
+}
+
+void HeldWrite(Order const& order)
+{
+    Part const part = LastingPart(order.Operation);
+    if (part == Part::None)
+        return;
+    Baseline& value = pb.state[order.Bot][part];
+    switch (order.Operation)
+    {
+        case Intent::Follow:
+            value.Strategies = 1;
+            break;
+        case Intent::Stay:
+            value.Strategies = 2;
+            break;
+        case Intent::Formation:
+            value.Formation = "shape" + std::to_string(static_cast<int>(order.Shape));
+            break;
+        case Intent::SaveMana:
+            value.ManaSaveLevel = order.Enabled ? 0.5 : 1.0;
+            break;
+        default:
+            value.FocusHealTargets = {order.Target};
+            value.FocusHealStrategy = true;
+            break;
+    }
+}
+
+// The one-order Execute: the stepped executor must never call it (the cases check executes == 0).
+Result Execute(PostMapJoin const& phase, Order const& order, std::function<bool()> const& authorize, Refusal* why)
+{
+    ++pb.executes;
+    if (why)
+        *why = pb.refusal;
+    pb.capturesAtExecute = pb.captures;
+    pb.order = order;
+    pb.phase = &phase;
+    ++pb.authorizeCalled;
+    pb.authorizeResult = authorize();
+    if (pb.writes && (pb.result == Result::Applied || pb.result == Result::Failed))
+        HeldWrite(order);
+    return pb.result;
+}
+
+// LC3b: one order of steps, one authorize; each step's configured outcome, the first not Applied ends the order.
+Result Execute(PostMapJoin const& phase, std::span<Order const> steps, std::function<bool()> const& authorize,
+               std::vector<StepOutcome>* outcomes)
+{
+    ++pb.spanExecutes;
+    pb.capturesAtExecute = pb.captures;
+    pb.steps.assign(steps.begin(), steps.end());
+    pb.phase = &phase;
+    if (outcomes)
+        outcomes->clear();
+    if (pb.spanEarly)
+        return *pb.spanEarly;
+    ++pb.authorizeCalled;
+    pb.authorizeResult = authorize();
+    if (pb.clock)
+        *pb.clock += pb.executeAdvanceMs;
+    Result result = Result::Applied;
+    for (std::size_t index = 0; index < steps.size() && result == Result::Applied; ++index)
+    {
+        StepOutcome const outcome =
+            index < pb.stepOutcomes.size() ? pb.stepOutcomes[index] : StepOutcome{Result::Applied, Refusal::None};
+        if (outcomes)
+            outcomes->push_back(outcome);
+        if (pb.writes && (outcome.Outcome == Result::Applied || outcome.Outcome == Result::Failed))
+            HeldWrite(steps[index]);
+        result = outcome.Outcome;
+    }
+    if (pb.duringExecute)
+        pb.duringExecute();
+    if (pb.captureFailsAfterExecute)
+        pb.captureFails = true;
+    return result;
+}
+
+RefusalText const& RefusalWords(Refusal reason)
+{
+    static RefusalText words{Refusal::None, "pb_word", "A playerbots sentence."};
+    pb.wordsFor = reason;
+    words.Code = reason;
+    return words;
+}
+
+bool Capture(PostMapJoin const& phase, uint64_t bot, Part part, Baseline& out)
+{
+    ++pb.captures;
+    out = Baseline();
+    if (!phase.Current() || pb.captureFails || part == Part::None)
+        return false;
+    out = HeldCopy(bot, part);
+    return true;
+}
+
+RestoreResult Restore(PostMapJoin const& phase, uint64_t bot, Baseline const& before, Baseline const& applied)
+{
+    ++pb.restores;
+    pb.restoredBot = bot;
+    pb.restoreBefore = before;
+    pb.restoreApplied = applied;
+    if (!phase.Current() || before.Held == Part::None || before.Held != applied.Held || before.Bot != bot ||
+        applied.Bot != bot)
+        return RestoreResult::Rejected;
+    if (pb.restoreResult)
+        return *pb.restoreResult;
+    Baseline const current = HeldCopy(bot, before.Held);
+    if (current == before)
+        return RestoreResult::Restored;
+    if (current != applied)
+        return RestoreResult::Superseded;
+    Baseline written = before;
+    written.Bot = 0;
+    written.Held = Part::None;
+    pb.state[bot][before.Held] = written;
+    return RestoreResult::Restored;
+}
+
+bool PositionReachable(PostMapJoin const& phase, Order const& order)
+{
+    ++pb.reaches;
+    pb.probe = order;
+    pb.reachPhase = &phase;
+    return pb.reachable;
+}
+}  // namespace PlayerbotBridge
 
 namespace OllamaBridge
 {
 // The steady clock the executor reads once per order (bridge.cpp is not linked).
 int64_t testNowMs = 1000;
 Clock Now() { return {0, testNowMs}; }
-
-struct EffectPhase
-{
-    PlayerbotBridge::PostMapJoin join;
-};
-
-namespace
-{
-using BridgePlans = PlanLedger<PlayerbotBridge::Baseline>;  // As in bridge_effect.cpp.
-#include "bridge-effect-executor.inc"
-}  // namespace
 }  // namespace OllamaBridge
+
+#define OLLAMA_SELFTEST_GAME_DOUBLES
+#include "../src/mod-ollama-chat_bridge_effect.cpp"
 
 namespace
 {
 using namespace OllamaBridge;
+// The world phase of the running tick: only ::OllamaDispatch_Update (below) can build one.
+EffectPhase const* worldPhase = nullptr;
 unsigned checks = 0;
 void Check(bool value, char const* label)
 {
@@ -189,7 +354,7 @@ struct Env
     Group controllerGroup;
     Unit target;
     Unit other;
-    EffectPhase phase;
+    EffectPhase const& phase = *worldPhase;
     WorldTicket ticket;
     DispatchGuard guard;
     unsigned authorizeCalls = 0;
@@ -200,7 +365,6 @@ struct Env
     {
         game = Counters{};
         PlayerbotBridge::pb = PlayerbotBridge::Doubles{};
-        g_SayDistance = 17.5f;
         botGroup.guid = controllerGroup.guid = kGroup;
         botGroup.leader = controllerGroup.leader = kController;
         bot.group = &botGroup;
@@ -315,7 +479,7 @@ void Gates()
 {
     {
         Env env;
-        env.phase.join.current = false;
+        PlayerbotBridge::pb.current = false;
         Check(env.Run(ValidCmd(Intent::Follow)) == EffectResult::Rejected && Untouched(),
               "a phase that is no longer current reads nothing");
     }
@@ -327,7 +491,7 @@ void Gates()
     }
     {
         Env env;
-        env.phase.join.current = false;
+        PlayerbotBridge::pb.current = false;
         Check(env.Run(ValidCmd(Intent::Mark)) == EffectResult::Rejected,
               "a mark refused before playerbots is rejected");
     }
@@ -542,7 +706,7 @@ void PlanTick()
     {
         Env env;
         ApplyStay(env);
-        env.phase.join.current = false;
+        PlayerbotBridge::pb.current = false;
         BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
         Check(pb.restores == 0 && plans.Size() == 1 && !plans.Empty(), "no tick work outside the post-map-join phase");
     }
@@ -829,7 +993,7 @@ void SteppedOrders()
         Check(env.Run(Steps({mark, go, spot})) == EffectResult::Applied && env.why == CommandRefusal::None &&
                   AllApplied(env.ran, 3),
               "a stepped order applied, each step applied");
-        Check(pb.spanExecutes == 1 && pb.spanExecutes == 0 && env.authorizeCalls == 1 && pb.authorizeCalled == 1 &&
+        Check(pb.spanExecutes == 1 && pb.executes == 0 && env.authorizeCalls == 1 && pb.authorizeCalled == 1 &&
                   pb.phase == &env.phase.join,
               "one span Execute in the world phase, one authorize, no one-order Execute");
         Check(pb.steps.size() == 3 && pb.steps[0].Operation == Intent::Mark && pb.steps[0].TargetName == "Hogger" &&
@@ -947,9 +1111,10 @@ void SteppedOrders()
         Env env;
         ApplyStay(env);
         auto const captures = pb.captures;
+        auto const executes = pb.spanExecutes;
         env.guard.groupGuid = kOther;
         Check(env.Run(Steps({go, close})) == EffectResult::Rejected && env.why == CommandRefusal::Busy &&
-                  pb.spanExecutes == 0 && pb.captures == captures && env.ran.empty(),
+                  pb.spanExecutes == executes && pb.captures == captures && env.ran.empty(),
               "a blocked lasting step: busy, no capture, nothing runs");
     }
     {
@@ -961,7 +1126,7 @@ void SteppedOrders()
     }
     {
         Env env;
-        env.phase.join.current = false;
+        PlayerbotBridge::pb.current = false;
         Check(env.Run(Steps({go})) == EffectResult::Rejected && env.why == CommandRefusal::Unavailable &&
                   pb.spanExecutes == 0 && env.authorizeCalls == 0,
               "no current world phase: unavailable, nothing runs");
@@ -1003,17 +1168,37 @@ void SteppedOrders()
     }
 }
 
+// EffectPhase is built only by the world tick, its friend: the selftest's tick builds one and runs the cases in it.
+void OllamaDispatch_Update(uint32_t, PlayerbotBridge::PostMapJoin const& join)
+{
+    OllamaBridge::EffectPhase const phase(join);
+    worldPhase = &phase;
+    Gates();
+    Groups();
+    ResultMapping();
+    LastingOrders();
+    PlanFlow();
+    PlanTick();
+    SteppedOrders();
+    worldPhase = nullptr;
+}
+
+// PostMapJoin's one friend: the token is built on the stack of the world script's tick.
+class OllamaBotRandomChatter
+{
+public:
+    static void Tick()
+    {
+        PlayerbotBridge::PostMapJoin const join;
+        OllamaDispatch_Update(0, join);
+    }
+};
+
 int main()
 {
     try
     {
-        Gates();
-        Groups();
-        ResultMapping();
-        LastingOrders();
-        PlanFlow();
-        PlanTick();
-        SteppedOrders();
+        OllamaBotRandomChatter::Tick();
     }
     catch (std::exception const& error)
     {
