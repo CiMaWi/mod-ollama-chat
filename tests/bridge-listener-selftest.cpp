@@ -553,6 +553,25 @@ void Handoff(Harness& h)
     }
 }
 
+// The bridge's calls of one world tick: every mailbox slot is filled at once, none waits for a handler or is closed.
+void MailboxSlots()
+{
+    Harness h;
+    std::size_t const calls = WorldChannel::MaxPackets;
+    std::vector<std::future<Reply>> replies;
+    for (std::size_t i = 0; i < calls; ++i)
+        replies.push_back(std::async(std::launch::async,
+                                     [&h, i] { return Post(h.port, "gen-" + std::to_string(i), Envelope(5000)); }));
+    Check(WaitFor([&] { return h.mailbox.Receives() == calls; }, 3000),
+          "every mailbox slot's call reaches the mailbox at once");
+    for (uint64_t receipt = 1; receipt <= calls; ++receipt)
+        h.mailbox.Publish(receipt, ChannelError::None, R"({"type":"query.result"})");
+    std::size_t answered = 0;
+    for (auto& reply : replies)
+        answered += reply.get().status == 200 ? 1 : 0;
+    Check(answered == calls, "every call of a full mailbox is answered 200");
+}
+
 void BindAddress(Harness& h)
 {
     Check(LoopbackOnly(h.port), "the only listening socket is 127.0.0.1 (no wildcard, no IPv6)");
@@ -779,6 +798,7 @@ int main()
             BindAddress(h);
             Check(h.LogsClean(), "request handling logs nothing secret");
         }
+        MailboxSlots();
         Shutdown();
         RealChannel();
         slowLoris.get();
