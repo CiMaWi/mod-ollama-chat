@@ -26,7 +26,7 @@ work replies must preserve the original wall deadline exactly. Wall-clock rollba
 | Type | Additional exact fields | Owner/direction |
 | --- | --- | --- |
 | query | controllerGuid, botGuid, query:"observable_group" or "catalogue", or query:"bot_state" with topic (route: and place) | Authenticated native to game |
-| command | commandId, issuerGuid, botGuid, and intent, params (the old form) or steps (LC3b) | Authenticated native to game; staged typed proposal |
+| command | commandId, issuerGuid, botGuid, steps (LC3b; LCB2: the only form) | Authenticated native to game; staged typed proposal |
 | generation.result | text (1..4096 bytes, usable text, no NUL) | Authenticated native to game |
 | failure | code: unavailable/timeout/invalid_input/cancelled | Authenticated native to game, or game FinishFailure; terminal |
 | query.result | units; a catalogue query: catalogue | Game-created by FinishQuery, FinishCatalogue |
@@ -40,16 +40,13 @@ healthPercent (0..100), role (tank/healer/damage) and visibleTargetGuid. Unknown
 distinct units and 32768 encoded result bytes. The world adapter MUST establish group/visibility and observed
 provenance before supplying units; typed shape alone does not prove perception.
 
-Command intent/parameter shapes match J2 exactly: follow/stay/flee/regroup/attack_own_target `{}`;
-pull/focus_healing `{targetGuid}`; mark `{targetGuid,icon}`; assign_role `{role:tank|healer|damage}`;
-save_mana `{enabled:boolean}`; formation `{shape:close|spread|line}`; position `{x,y,z,mapId}` (finite numbers,
-uint32 map id); dungeon_clear `{mode:on|off|pause}`; WT18b's goal verbs go_to/meet_at `{place}` (1..64 bytes of
-text, not blank, no control characters), quest `{questId}` (uint32, nonzero) and
-errands/set_hearth/grind_here/gather_here/pause_plan/resume_plan `{}`. Parsing emits enums and variant values only. No literal command
+A command is the stepped form (LC3b, below); LCB2 removed the old form (`intent` and `params`), and a body with
+either key is `invalid_input`. Parsing emits typed steps only. No literal command
 syntax is built. A staged proposal reserves its effect id before any possible later attempt, including failure.
-`Receive` is NEVER an execution grant. The world executor re-resolves GUIDs, actual current controller/group, target
-observation/eligibility, map/phase/pathability/rate and activation/deadline at the actual execution seam. Proposed text
-must not enter order parsing. Executed verbs: attack_own_target, mark, flee and position are one-time moves;
+`Receive` is NEVER an execution grant. Playerbots' gate re-resolves GUIDs and names, actual current controller/group,
+target observation/eligibility, map/phase/pathability, and the world thread rate and activation/deadline, at the
+actual execution seam. Proposed text
+must not enter order parsing. Acts: attack_own_target, mark, flee and position are one-time moves;
 follow, stay, formation, save_mana and focus_healing are lasting plans (J12): the bot's state of that part is captured
 before every attempt, and the world tick restores it on expiry (10 minutes after the latest repeat), a group change,
 loss of the controller's authority (master, or leader of a masterless bot), or bridge retirement (a reload or
@@ -58,8 +55,7 @@ that part wins and is left alone, whoever makes it: another person, the controll
 playerbots itself; a change that leaves the part as the bridge set it (the same stay again) does not count. A
 logged-out bot's plan is dropped unrestored, and playerbots' own logout save can keep the bridge-set state in its
 database for the next login, as it does for its own commands. An attempt that may have changed the bot but left no
-plan (unreachable today) is counted as `unrecorded` in the "Bridge plans:" log line. regroup, pull, assign_role
-and dungeon_clear have no safe playerbots effect and stay a fixed refusal (DS.9). The goal verbs (WT18b) hand the
+plan (unreachable today) is counted as `unrecorded` in the "Bridge plans:" log line. The goal acts (WT18b) hand the
 bot's planner a goal through playerbots' plausibility gate; they need no group, have no lasting part (no capture, no
 plan, no restore) and are refused with not_planner, goal_held, unknown_place, no_route, no_such_quest, nothing_here or
 already_there. A bot_state query names one topic; route, and only route, also names its place (WT18b), which the
@@ -73,19 +69,18 @@ The record topics (LC7: history, lately, known) add text, one in-world sentence 
 (`ChannelMaxTopicText`, cut on a character boundary); an entry without one is dropped.
 Retirement selects no new epoch until every retired plan is restored or dropped.
 
-LC3: the verbs and the topic words are playerbots' (`PlayerbotBridge::IntentWord`/`FindIntent` and `TopicRows`).
+LC3: the acts and the topic words are playerbots' (its catalogue rows and `TopicRows`).
 The game adapter hands them to the channel once, on the world thread at startup (`OllamaDispatch_Start` calls
-`OllamaChat_BridgeInstallAbilities`), as a plain-data `AbilityIndex`: the catalogue rows, the 22 verbs and the
-hash. The module keeps no word list of its own; the 22 verbs and 11 topic words of the old wire are unchanged.
+`OllamaChat_BridgeInstallAbilities`), as a plain-data `AbilityIndex`: the catalogue rows and the hash. The module
+keeps no word list of its own; a step's act is its row's code, playerbots' `Intent` value (LCB2).
 A new topic still needs its `StateTopic` value and entry shape here (playerbots' `.agents/docs/ai-engine.md`).
-The install is fail-closed. An index whose verbs, row names, act/verb pairs or topic codes disagree installs
+The install is fail-closed. An index whose row names, act codes or topic codes repeat, or whose names are not words,
+installs
 nothing, and the module then takes no command and no bot_state query; the log says `Bridge ability catalogue
 refused` (error). LC3b: an index whose catalogue cannot be sent (text that is not UTF-8, or over 24576 encoded
 bytes) installs without it: commands and bot_state queries stand, the catalogue query answers `unavailable`, and
 the log says `Bridge ability catalogue not sent` (error). Otherwise the log says `Bridge ability catalogue:
-N rows, hash H, B bytes.` (info). The handler's static_assert ties playerbots' `IntentCount` to the module's
-`ChannelIntentCount` and its intent pairs, so a new playerbots act fails the build until the module has its
-`ChannelIntent` value and pair. A `catalogue` query carries observable_group's exact keys and is route-bound
+N rows, hash H, B bytes.` (info). A `catalogue` query carries observable_group's exact keys and is route-bound
 like every query. Its result is the envelope plus `catalogue`: `hash` (FNV-1a 64 of playerbots' `CatalogueText`
 as 16 lowercase hex digits, compared as a string, never recomputed), `version` (the catalogue format, 1),
 `abilities` (what this module takes beyond the old wire, `["catalogue", "names", "steps"]` today; not hashed), `maxSteps` and
@@ -96,19 +91,18 @@ rows outgrow that. Without an installed index the query fails `unavailable`; a m
 `invalid_input`. An order that names a unit or quest the bot cannot find is refused `unknown_name` ("I do not know
 what you mean by that.").
 
-LC3b, the stepped command (abilities `names` and `steps`): a `command` with `steps` in place of `intent` and
-`params`; both forms at once is `invalid_input`. `steps` holds 1..`maxSteps` (3) entries, each exactly
+LC3b, the stepped command (abilities `names` and `steps`): a `command` with `steps`. `steps` holds 1..`maxSteps` (3) entries, each exactly
 `{"act": <an act row's name>, "params": {...}}` with exactly that row's parameters by their catalogue names: a
 `unit` parameter as `<name>` (the unit's name) or `<name>Guid` (a guid string), a `quest` parameter as `<name>`
 (its title) or `<name>Id` (1..4294967295), exactly one of the two; a `place` parameter as a place name (go_to,
 meet_at) or, for `position`, the spot `"x,y,z,map"` (three finite decimal numbers and a map id, nothing else); a
 `choice` parameter as one of the row's choice words (an icon by its word, `star` .. `skull`, not 0-7: one
 catalogue-driven rule); a `flag` as a boolean. Names and places are 1..64 bytes without control characters. A
-topic, a verb without a row (regroup, pull, assign_role, dungeon_clear), an unknown word, a missing or an extra key
+topic, a word without an act row (regroup, pull, assign_role, dungeon_clear), a missing or an extra key
 are `invalid_input`. The issuer, bot and group are the scope's for every step. The order takes one command id,
 one rate slot and one authorization: the module builds one playerbots order per step and calls the span
 `Execute` once; playerbots' gate resolves each name among what the bot perceives or knows, checks visibility,
-group and the row's check per step (for `position` the same reachable path the old form's pre-check used), and the
+group and the row's check per step (for `position` a reachable path), and the
 first step not applied ends the order. Before it runs, every lasting step is admitted to the plan ledger and its
 part captured (`busy` when a plan refuses it, `cannot_now` for two steps of one lasting part, both before any step
 runs); each lasting step that ran and applied or failed is recorded after the order. The result keeps the old
@@ -117,7 +111,7 @@ shape: `outcome` is applied only when every step applied, else the ending step's
 order's own when it was refused before any step ran (`too_soon`, `unavailable`, `busy`, `cannot_now`). It adds
 `steps`: one entry per submitted step in order, `{"act", "outcome": applied/rejected/failed/skipped, "reason",
 "reasonText"}`, the reason only on rejected and failed; a step that did not run is `skipped`, so a fully refused
-order lists every step skipped and carries its own reason. The old form's result has no `steps`.
+order lists every step skipped and carries its own reason.
 
 The single world owner calls `Bind` only AFTER the existing activation owner has selected a fresh epoch and proved
 actual old-work drain and strategy restoration. Bind itself proves neither. Every bind retires the prior helper

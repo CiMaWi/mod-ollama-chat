@@ -89,8 +89,7 @@ struct Fixture
         j["commandId"] = std::move(id);
         j["issuerGuid"] = "22";
         j["botGuid"] = "11";
-        j["intent"] = "stay";
-        j["params"] = Json::object();
+        j["steps"] = Json::array({{{"act", "follow"}, {"params", Json::object()}}});
         return j.dump();
     }
     uint64_t Receive(std::string const& body)
@@ -383,7 +382,7 @@ void HeartbeatReplayLedger()
 
 int main()
 {
-    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    if (!InstallTestAbilities())  // LC3: the acts and topics are the installed index's.
     {
         std::cerr << "FAIL: the ability double was refused\n";
         return 1;

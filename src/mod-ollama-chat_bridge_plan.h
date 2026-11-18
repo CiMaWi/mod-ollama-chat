@@ -10,10 +10,10 @@
 
 #include "mod-ollama-chat_bridge_intent.h"
 
-// J12 lasting-plan ledger: pure bookkeeping, no game, playerbots, clock or transport types. It records, per bot and
-// plan kind, the restore target (the state before the bridge's first change, or a person's later change), the value
-// the bridge set last, the owner (group, partner, generation) and the expiry, and turns expiry, group or
-// partner change and retirement into restore-pending entries the world tick restores. Value is the game side's
+// J12 lasting-plan ledger: pure bookkeeping, no game, clock or transport types (acts are playerbots' Intent values). It
+// records, per bot and plan kind, the restore target (the state before the bridge's first change, or a person's later
+// change), the value the bridge set last, the owner (group, partner, generation) and the expiry, and turns expiry,
+// group or partner change and retirement into restore-pending entries the world tick restores. Value is the game side's
 // state type for one plan kind; its operator== compares that kind's state. World-thread only; the steady clock in
 // milliseconds is passed in. Memory only: a restart forgets it. While Empty(), every per-tick call is O(1) and
 // allocates nothing; otherwise LiveBots() is O(entries x bots) and Pending() allocates, both bounded by
@@ -40,18 +40,18 @@ enum class PlanKind : uint8_t
 
 // The lasting verbs. One-shot verbs (attack, flee, position, mark: raid icons are group state another bot or person
 // may move, so a per-bot restore could not compose) and refused verbs (DS.9) have no plan.
-inline std::optional<PlanKind> PlanKindFor(ChannelIntent intent)
+inline std::optional<PlanKind> PlanKindFor(PlayerbotBridge::Intent intent)
 {
     switch (intent)
     {
-        case ChannelIntent::Follow:
-        case ChannelIntent::Stay:
+        case PlayerbotBridge::Intent::Follow:
+        case PlayerbotBridge::Intent::Stay:
             return PlanKind::Movement;
-        case ChannelIntent::Formation:
+        case PlayerbotBridge::Intent::Formation:
             return PlanKind::Formation;
-        case ChannelIntent::SaveMana:
+        case PlayerbotBridge::Intent::SaveMana:
             return PlanKind::SaveMana;
-        case ChannelIntent::FocusHealing:
+        case PlayerbotBridge::Intent::FocusHealing:
             return PlanKind::FocusHealing;
         default:
             return std::nullopt;

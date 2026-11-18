@@ -773,18 +773,18 @@ void SendAct(OllamaBridge::WorldTicket const& ticket, OllamaBridge::EffectResult
 {
     static OllamaBridge::EffectPhase const phase{};
     executorResult = result;
-    nlohmann::json const act = {{"version", 1},
-                                {"instance", ticket.scope.instance},
-                                {"provider", ticket.scope.provider},
-                                {"epoch", ticket.scope.epoch},
-                                {"requestId", ticket.request.requestId},
-                                {"deadlineUnixMs", ticket.request.deadline.unixMs},
-                                {"type", "command"},
-                                {"commandId", "act-" + ticket.request.requestId},  // Ids are once per epoch.
-                                {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
-                                {"botGuid", std::to_string(ticket.scope.botGuid)},
-                                {"intent", "attack_own_target"},
-                                {"params", nlohmann::json::object()}};
+    nlohmann::json const act = {
+        {"version", 1},
+        {"instance", ticket.scope.instance},
+        {"provider", ticket.scope.provider},
+        {"epoch", ticket.scope.epoch},
+        {"requestId", ticket.request.requestId},
+        {"deadlineUnixMs", ticket.request.deadline.unixMs},
+        {"type", "command"},
+        {"commandId", "act-" + ticket.request.requestId},  // Ids are once per epoch.
+        {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
+        {"botGuid", std::to_string(ticket.scope.botGuid)},
+        {"steps", nlohmann::json::array({{{"act", "follow"}, {"params", nlohmann::json::object()}}})}};
     uint64_t receipt = 0;
     auto const before = g_bridgeChannel.Commands();
     Check(g_bridgeChannel.Receive(config.bridge.token, ticket.request.requestId, act.dump(), receipt) ==
@@ -1026,12 +1026,6 @@ void AdapterTests()
                   view.guard.nonRaid && !ticket.request.input.speakerControlsBot &&
                   ticket.request.input.party.size() == 2,
               "DS.14: the far whisper keeps the bot's group");
-        IntentContext facts;
-        facts.controllerGuid = ticket.scope.controllerGuid;
-        facts.botGuid = ticket.scope.botGuid;
-        facts.expectedGroupGuid = facts.controllerGroupGuid = facts.botGroupGuid = view.guard.groupGuid;
-        Check(MapIntent({"f", 33, 11, ChannelIntent::Follow, std::monostate{}}, facts).has_value(),
-              "DS.14: the far partner in the bot's group may ask it to follow");
     }
     done = Finish();
     Check(PrepareBridge(done), "DS.14: far whisper prepared");
@@ -1049,15 +1043,6 @@ void AdapterTests()
         Check(ticket.scope.controllerGuid == 33 && !view.guard.groupGuid && !view.guard.nonRaid &&
                   ticket.request.input.party.size() == 2,
               "DS.14: an ungrouped bot's whisper carries no group");
-        IntentContext facts;
-        facts.controllerGuid = ticket.scope.controllerGuid;
-        facts.botGuid = ticket.scope.botGuid;
-        facts.controllerGroupGuid = 99;
-        CommandRefusal why = CommandRefusal::None;
-        Check(MapIntent({"s", 33, 11, ChannelIntent::Stay, std::monostate{}}, facts).has_value() &&
-                  !MapIntent({"f", 33, 11, ChannelIntent::Follow, std::monostate{}}, facts, &why) &&
-                  why == CommandRefusal::NotWithYou,
-              "DS.14: an ungrouped bot may stay; it follows nobody");
     }
     // DS.14: an addressed say or yell reaches an unled bot within hearing; party still needs the bot's group.
     AdapterFixture();
@@ -1534,18 +1519,18 @@ nlohmann::json WakeAct(OllamaBridge::WorldTicket const& ticket, std::string cons
 {
     static OllamaBridge::EffectPhase const phase{};
     executorResult = OllamaBridge::EffectResult::Applied;
-    nlohmann::json const act = {{"version", 1},
-                                {"instance", ticket.scope.instance},
-                                {"provider", ticket.scope.provider},
-                                {"epoch", ticket.scope.epoch},
-                                {"requestId", ticket.request.requestId},
-                                {"deadlineUnixMs", ticket.request.deadline.unixMs},
-                                {"type", "command"},
-                                {"commandId", id},
-                                {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
-                                {"botGuid", std::to_string(ticket.scope.botGuid)},
-                                {"intent", "attack_own_target"},
-                                {"params", nlohmann::json::object()}};
+    nlohmann::json const act = {
+        {"version", 1},
+        {"instance", ticket.scope.instance},
+        {"provider", ticket.scope.provider},
+        {"epoch", ticket.scope.epoch},
+        {"requestId", ticket.request.requestId},
+        {"deadlineUnixMs", ticket.request.deadline.unixMs},
+        {"type", "command"},
+        {"commandId", id},
+        {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
+        {"botGuid", std::to_string(ticket.scope.botGuid)},
+        {"steps", nlohmann::json::array({{{"act", "follow"}, {"params", nlohmann::json::object()}}})}};
     uint64_t receipt = 0;
     Check(g_bridgeChannel.Receive(config.bridge.token, ticket.request.requestId, act.dump(), receipt) ==
               OllamaBridge::ChannelError::None,

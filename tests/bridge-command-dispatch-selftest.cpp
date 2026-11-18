@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 
@@ -18,6 +19,7 @@ struct EffectPhase
 namespace
 {
 using namespace OllamaBridge;
+using PlayerbotBridge::Intent;
 using Json = nlohmann::json;
 unsigned checks = 0;
 void Check(bool value, char const* label)
@@ -29,11 +31,10 @@ void Check(bool value, char const* label)
 
 EffectPhase const phase{};
 
-// Simulated world facts and one game effect, in the order the PB boundary uses them: map the order from fresh
-// facts, ask authorize once, mutate only when granted.
+// One game effect, in the order the PB boundary uses it: ask authorize once for the whole order, mutate only when
+// granted (playerbots checks each step against fresh facts).
 struct Probe final : CommandExecutor
 {
-    IntentContext facts{22, 11, 33, 33, 33, 44, 44, std::nullopt};
     std::optional<EffectResult> early;            // Refusal before the final check (PB Rejected/Unavailable).
     EffectResult result = EffectResult::Applied;  // Reported after the final check granted the attempt.
     bool skipAuthorize = false;
@@ -46,34 +47,25 @@ struct Probe final : CommandExecutor
     unsigned mutations = 0;
     uint64_t controller = 0;
     uint64_t group = 0;
-    std::optional<IntentOrder> order;
-    std::size_t stepCount = 0;                   // LC3b: the steps of the latest stepped order.
-    std::vector<ChannelStepResult> stepResults;  // LC3b: what a stepped order reports per step that ran.
+    std::optional<ChannelCommand> order;         // The latest order that mutated.
+    std::size_t stepCount = 0;                   // LC3b: the steps of the latest order.
+    std::vector<ChannelStepResult> stepResults;  // LC3b: what an order reports per step that ran, when a test sets it.
+    std::vector<ChannelStepResult> ran;          // Otherwise: every step applied, or the one failed step.
 
-    std::vector<ChannelStepResult> Steps() const override { return stepResults; }
+    std::vector<ChannelStepResult> Steps() const override { return stepResults.empty() ? ran : stepResults; }
 
     EffectResult Execute(EffectPhase const&, WorldTicket const& ticket, DispatchGuard const& guard,
                          ChannelCommand const& command, std::function<bool()> const& authorize) override
     {
         ++calls;
+        ran.clear();
         controller = ticket.scope.controllerGuid;
         group = guard.groupGuid;
         if (before)
             before();
         if (early)
             return *early;
-        if (!command.steps.empty())  // LC3b: one authorize for the whole order, as playerbots' span Execute.
-        {
-            stepCount = command.steps.size();
-            bool const granted = authorize();
-            ++(granted ? grants : denials);
-            if (granted && result != EffectResult::Rejected && result != EffectResult::Unavailable)
-                ++mutations;
-            return granted ? result : EffectResult::Rejected;
-        }
-        auto const mapped = MapIntent(command, facts);
-        if (!mapped)
-            return EffectResult::Rejected;
+        stepCount = command.steps.size();
         if (skipAuthorize)
             return result;
         bool const granted = authorize();
@@ -83,7 +75,11 @@ struct Probe final : CommandExecutor
         if (!granted || result == EffectResult::Rejected || result == EffectResult::Unavailable)
             return granted ? result : EffectResult::Rejected;
         ++mutations;
-        order = mapped;
+        order = command;
+        if (result == EffectResult::Applied)
+            ran.assign(command.steps.size(), {ChannelOutcome::Applied, "", ""});
+        else
+            ran = {{ChannelOutcome::Failed, "", ""}};
         if (after)
             after();
         return result;
@@ -168,17 +164,12 @@ struct Fixture
         j["query"] = "observable_group";
         return j.dump();
     }
-    std::string Command(std::string const& id, char const* intent, Json params = Json::object()) const
+    // A one-step order.
+    std::string Command(std::string const& id, char const* act, Json params = Json::object()) const
     {
-        auto j = Wire("command", ticket.request.requestId);
-        j["commandId"] = id;
-        j["issuerGuid"] = "22";
-        j["botGuid"] = "11";
-        j["intent"] = intent;
-        j["params"] = std::move(params);
-        return j.dump();
+        return Steps(id, Json::array({{{"act", act}, {"params", std::move(params)}}}));
     }
-    // LC3b: a stepped order.
+    // LC3b: an order of several steps.
     std::string Steps(std::string const& id, Json steps) const
     {
         auto j = Wire("command", ticket.request.requestId);
@@ -188,10 +179,10 @@ struct Fixture
         j["steps"] = std::move(steps);
         return j.dump();
     }
-    std::string Attack(std::string const& id) const { return Command(id, "attack_own_target"); }
-    std::string Mark(std::string const& id, char const* target = "44") const
+    std::string Attack(std::string const& id) const { return Command(id, "attack_own_target", {{"targetGuid", "44"}}); }
+    std::string Mark(std::string const& id) const
     {
-        return Command(id, "mark", {{"targetGuid", target}, {"icon", 3}});
+        return Command(id, "mark", {{"targetGuid", "44"}, {"icon", "triangle"}});
     }
     uint64_t Receive(std::string const& body)
     {
@@ -217,7 +208,7 @@ struct Fixture
     // J5e: the last Result's refusal reason and sentence (empty when applied) and its packet error.
     std::string reason;
     std::string reasonText;
-    Json steps;  // LC3b: a stepped result's step list (null for the old form).
+    Json steps;  // LC3b: a result's step list (null for a fixed error).
     ChannelError packetError = ChannelError::None;
     // The single correlated receipt: its outcome, a fixed error name, or "absent" when withheld or disposed.
     std::string Result(uint64_t receipt, std::string const& id)
@@ -240,10 +231,9 @@ struct Fixture
         auto const body = Json::parse(packet->body);
         bool const refused = body.value("outcome", "") != "applied";
         steps = body.contains("steps") ? body.at("steps") : Json();
-        Check(steps.is_null() || !steps.empty(), "only a stepped order's result lists steps, one per step");
-        Check(body.size() == (refused ? 11u : 9u) + (steps.is_null() ? 0u : 1u) && body["type"] == "command.result" &&
-                  body["commandId"] == id && body["requestId"] == ticket.request.requestId &&
-                  body["epoch"] == "epoch-1",
+        Check(steps.is_array() && !steps.empty(), "a result lists the order's steps");
+        Check(body.size() == (refused ? 12u : 10u) && body["type"] == "command.result" && body["commandId"] == id &&
+                  body["requestId"] == ticket.request.requestId && body["epoch"] == "epoch-1",
               "correlated command.result");
         if (refused)
         {
@@ -261,21 +251,6 @@ struct Fixture
 
 void PureSeam()
 {
-    Check(kBridgeEffectsReleased, "typed effects are on since the J6 release join (J6b4)");
-    unsigned supported = 0;
-    for (int intent = 0; intent <= static_cast<int>(ChannelIntent::ResumePlan); ++intent)
-        supported += EffectSupported(static_cast<ChannelIntent>(intent)) ? 1 : 0;
-    Check(supported == 18 && EffectSupported(ChannelIntent::AttackOwnTarget) && EffectSupported(ChannelIntent::Mark) &&
-              EffectSupported(ChannelIntent::Follow) && EffectSupported(ChannelIntent::Stay) &&
-              EffectSupported(ChannelIntent::Flee) && EffectSupported(ChannelIntent::Position) &&
-              EffectSupported(ChannelIntent::Formation) && EffectSupported(ChannelIntent::SaveMana) &&
-              EffectSupported(ChannelIntent::FocusHealing),
-          "only the PB-backed verbs reach an executor (J12 adds the three lasting settings, WT18b the goal verbs)");
-    for (auto const intent : {ChannelIntent::GoTo, ChannelIntent::Quest, ChannelIntent::Errands,
-                              ChannelIntent::SetHearth, ChannelIntent::GrindHere, ChannelIntent::GatherHere,
-                              ChannelIntent::MeetAt, ChannelIntent::PausePlan, ChannelIntent::ResumePlan})
-        Check(EffectSupported(intent) && !IntentNeedsGroup(intent) && !IntentNeedsPartnerInGroup(intent),
-              "WT18b: every goal verb reaches its executor and needs no group");
     Check(EffectOutcome(EffectResult::Applied, true) == ChannelOutcome::Applied &&
               EffectOutcome(EffectResult::Failed, true) == ChannelOutcome::Failed &&
               EffectOutcome(EffectResult::Rejected, true) == ChannelOutcome::Rejected &&
@@ -308,210 +283,48 @@ void PureSeam()
           "only lanes whose interval passed are evicted");
 }
 
-// The production adapter's pure order step: fresh facts in, playerbots order fields out; nothing wire-authored.
-void EffectOrders()
-{
-    IntentContext const facts{22, 11, 33, 33, 33, 44, 44, std::nullopt};
-    ChannelCommand const attack{"a", 22, 11, ChannelIntent::AttackOwnTarget, std::monostate{}, {}};
-    ChannelCommand const mark{"m", 22, 11, ChannelIntent::Mark, ChannelMark{44, 7}, {}};
-    Check(EffectTargetGuid(attack, 44) == 44 && EffectTargetGuid(attack, 0) == 0 && EffectTargetGuid(mark, 99) == 44,
-          "an attack resolves the bot's own target, a mark its payload target");
-    auto const attacking = BuildEffectOrder(attack, facts);
-    Check(attacking && attacking->intent == ChannelIntent::AttackOwnTarget && attacking->botGuid == 11 &&
-              attacking->controllerGuid == 22 && attacking->groupGuid == 33 && attacking->targetGuid == 44 &&
-              attacking->icon == 0,
-          "attack order from fresh facts and the captured group");
-    auto const marking = BuildEffectOrder(mark, facts);
-    Check(marking && marking->intent == ChannelIntent::Mark && marking->botGuid == 11 &&
-              marking->controllerGuid == 22 && marking->groupGuid == 33 && marking->targetGuid == 44 &&
-              marking->icon == 7,
-          "mark order carries its target and icon");
-
-    IntentContext unseen = facts;
-    unseen.eligibleVisibleTargetGuid = 0;
-    Check(!BuildEffectOrder(attack, unseen) && !BuildEffectOrder(mark, unseen), "an unseen target builds no order");
-    IntentContext retargeted = facts;
-    retargeted.ownTargetGuid = 45;
-    Check(!BuildEffectOrder(attack, retargeted), "an attack needs its own target to be the eligible one");
-    IntentContext elsewhere = facts;
-    elsewhere.eligibleVisibleTargetGuid = 45;
-    Check(!BuildEffectOrder(mark, elsewhere), "a mark needs its payload target to be the eligible one");
-    IntentContext moved = facts;
-    moved.botGroupGuid = 34;
-    Check(!BuildEffectOrder(attack, moved) && !BuildEffectOrder(mark, moved), "a changed group builds no order");
-    IntentContext ungrouped = facts;
-    ungrouped.expectedGroupGuid = ungrouped.controllerGroupGuid = ungrouped.botGroupGuid = 0;
-    auto const alone = BuildEffectOrder(attack, ungrouped);
-    Check(alone && alone->groupGuid == 0 && alone->targetGuid == 44,
-          "DS.14: an ungrouped bot attacks its own target with no group");
-    Check(!BuildEffectOrder(mark, ungrouped), "DS.14: an ungrouped bot sets no group mark");
-    IntentContext outside = facts;
-    outside.controllerGroupGuid = 0;
-    auto const markedOutside = BuildEffectOrder(mark, outside);
-    Check(markedOutside && markedOutside->groupGuid == 33,
-          "DS.14: a partner outside the bot's group may still ask for a mark in the bot's group");
-    ChannelCommand foreign = attack;
-    foreign.issuerGuid = 23;
-    Check(!BuildEffectOrder(foreign, facts), "another issuer builds no order");
-    ChannelCommand wired = attack;
-    wired.params = ChannelTarget{44};
-    Check(!BuildEffectOrder(wired, facts), "an attack never takes a wire target");
-    ChannelCommand icon = mark;
-    icon.params = ChannelMark{44, 8};
-    Check(!BuildEffectOrder(icon, facts), "an out-of-range icon builds no order");
-
-    for (ChannelIntent const intent : {ChannelIntent::Follow, ChannelIntent::Stay, ChannelIntent::Flee})
-    {
-        ChannelCommand const oneShot{"o", 22, 11, intent, std::monostate{}, {}};
-        auto const ordered = BuildEffectOrder(oneShot, facts);
-        Check(ordered && ordered->intent == intent && ordered->botGuid == 11 && ordered->controllerGuid == 22 &&
-                  ordered->groupGuid == 33 && ordered->targetGuid == 0 && ordered->icon == 0 &&
-                  ordered->position == ChannelPosition{},
-              "a target-less one-shot order carries the captured group, no target and no position");
-        Check(EffectTargetGuid(oneShot, 44) == 0, "a target-less one-shot resolves no unit");
-        auto const unseenOrder = BuildEffectOrder(oneShot, unseen);
-        auto const retargetedOrder = BuildEffectOrder(oneShot, retargeted);
-        Check(unseenOrder && !unseenOrder->targetGuid && retargetedOrder && !retargetedOrder->targetGuid,
-              "own or eligible target facts never enter a target-less order");
-        Check(!BuildEffectOrder(oneShot, moved), "a one-shot needs the bot's group unchanged since the capture");
-        auto const lone = BuildEffectOrder(oneShot, ungrouped);
-        Check(intent == ChannelIntent::Follow ? !lone : lone && lone->groupGuid == 0,
-              "DS.14: an ungrouped bot stays or flees on its own; it follows nobody");
-        auto const away = BuildEffectOrder(oneShot, outside);
-        Check(intent == ChannelIntent::Follow ? !away : away && away->groupGuid == 33,
-              "DS.14: a partner outside the bot's group gets a stay or a flee, not a follow");
-        ChannelCommand other = oneShot;
-        other.issuerGuid = 23;
-        Check(!BuildEffectOrder(other, facts), "another issuer builds no one-shot");
-        other = oneShot;
-        other.botGuid = 12;
-        Check(!BuildEffectOrder(other, facts), "another bot builds no one-shot");
-        other = oneShot;
-        other.params = ChannelTarget{44};
-        Check(!BuildEffectOrder(other, facts), "a one-shot never takes a wire target");
-        other.params = ChannelMark{44, 3};
-        Check(!BuildEffectOrder(other, facts), "a one-shot never takes a wire mark");
-        other.params = ChannelPosition{1.5, -2.25, 3.0, 1};
-        IntentContext pathable = facts;
-        pathable.pathableNearbyPosition = ChannelPosition{1.5, -2.25, 3.0, 1};
-        Check(!BuildEffectOrder(other, pathable), "a one-shot never takes a wire position");
-    }
-
-    ChannelPosition const spot{1.5, -2.25, 3.0, 1};
-    ChannelCommand const position{"x", 22, 11, ChannelIntent::Position, spot, {}};
-    Check(!MapIntent(position, facts) && !BuildEffectOrder(position, facts),
-          "a position without the pathable fact builds no order");
-    IntentContext pathable = facts;
-    pathable.pathableNearbyPosition = spot;
-    auto const moving = BuildEffectOrder(position, pathable);
-    Check(moving && moving->intent == ChannelIntent::Position && moving->botGuid == 11 &&
-              moving->controllerGuid == 22 && moving->groupGuid == 33 && moving->targetGuid == 0 && moving->icon == 0 &&
-              moving->position == spot,
-          "a position order copies the checked coordinates and map");
-    Check(EffectTargetGuid(position, 44) == 0, "a position resolves no unit");
-    for (ChannelPosition const checked : {ChannelPosition{1.5, -2.25, 3.0, 2}, ChannelPosition{1.5, -2.25, 3.5, 1},
-                                          ChannelPosition{-2.25, 1.5, 3.0, 1}})
-    {
-        IntentContext checkedElsewhere = facts;
-        checkedElsewhere.pathableNearbyPosition = checked;
-        Check(!BuildEffectOrder(position, checkedElsewhere), "a position other than the checked one builds no order");
-    }
-    IntentContext pathableMoved = pathable;
-    pathableMoved.botGroupGuid = 34;
-    IntentContext pathableUngrouped = pathable;
-    pathableUngrouped.expectedGroupGuid = pathableUngrouped.controllerGroupGuid = pathableUngrouped.botGroupGuid = 0;
-    auto const movingAlone = BuildEffectOrder(position, pathableUngrouped);
-    Check(!BuildEffectOrder(position, pathableMoved) && movingAlone && movingAlone->groupGuid == 0 &&
-              movingAlone->position == spot,
-          "a position needs the bot's group unchanged; an ungrouped bot moves with no group");
-    ChannelCommand stray = position;
-    stray.issuerGuid = 23;
-    Check(!BuildEffectOrder(stray, pathable), "another issuer builds no position");
-    stray = position;
-    stray.botGuid = 12;
-    Check(!BuildEffectOrder(stray, pathable), "another bot builds no position");
-    stray = position;
-    stray.params = ChannelTarget{44};
-    Check(!BuildEffectOrder(stray, pathable), "a position never takes a wire target");
-    stray.params = std::monostate{};
-    Check(!BuildEffectOrder(stray, pathable), "a position needs its coordinates");
-    ChannelPosition const unbounded{std::numeric_limits<double>::infinity(), -2.25, 3.0, 1};
-    stray.params = unbounded;
-    IntentContext infinite = facts;
-    infinite.pathableNearbyPosition = unbounded;
-    Check(!BuildEffectOrder(stray, infinite), "a non-finite position never maps, even as a matching fact");
-
-    ChannelCommand const pull{"p", 22, 11, ChannelIntent::Pull, ChannelTarget{44}, {}};
-    Check(MapIntent(pull, facts) && !BuildEffectOrder(pull, facts) && EffectTargetGuid(pull, 44) == 0,
-          "a mappable verb without an accepted effect builds no order");
-    unsigned orders = 0;
-    for (int intent = 0; intent <= static_cast<int>(ChannelIntent::ResumePlan); ++intent)
-    {
-        ChannelCommand other = attack;
-        other.intent = static_cast<ChannelIntent>(intent);
-        if (!EffectSupported(other.intent))
-            orders += (BuildEffectOrder(other, facts) || EffectTargetGuid(other, 44)) ? 1 : 0;
-    }
-    Check(orders == 0, "no other verb resolves a target or builds an order");
-}
-
-void TypedVerbs()
+// LCB2: each act reaches the executor as its row's step: the act's playerbots Intent and its parameters as given.
+void StepVerbs()
 {
     Fixture f;
     auto receipt = f.Send(f.Attack("attack-1"));
     Check(f.probe.calls == 1 && f.probe.grants == 1 && f.probe.mutations == 1, "one authorized attack");
     Check(f.probe.controller == 22 && f.probe.group == 33, "executor gets the captured route and guard");
-    auto const* target = std::get_if<ChannelTarget>(&f.probe.order->params);
-    Check(f.probe.order->intent == ChannelIntent::AttackOwnTarget && target && target->guid == 44,
-          "typed own-target order from fresh facts");
+    auto const* step = &f.probe.order->steps.front();
+    Check(f.probe.order->steps.size() == 1 && step->intent == Intent::AttackOwnTarget && step->targetGuid == 44,
+          "the attack's step and its target");
     Check(f.Result(receipt, "attack-1") == "applied", "attack receipt");
     f.Advance(CommandRate::IntervalMs);
     receipt = f.Send(f.Mark("mark-1"));
-    auto const* mark = std::get_if<ChannelMark>(&f.probe.order->params);
-    Check(f.probe.calls == 2 && f.probe.mutations == 2 && f.probe.order->intent == ChannelIntent::Mark && mark &&
-              mark->guid == 44 && mark->icon == 3,
-          "typed mark order");
+    step = &f.probe.order->steps.front();
+    Check(f.probe.calls == 2 && f.probe.mutations == 2 && step->intent == Intent::Mark && step->targetGuid == 44 &&
+              step->icon == 3,
+          "the mark's step, target and icon");
     Check(f.Result(receipt, "mark-1") == "applied", "mark receipt");
     unsigned calls = 2;
-    std::pair<char const*, ChannelIntent> const oneShots[] = {
-        {"follow", ChannelIntent::Follow}, {"stay", ChannelIntent::Stay}, {"flee", ChannelIntent::Flee}};
-    for (auto const& [intent, typed] : oneShots)
+    std::pair<char const*, Intent> const oneShots[] = {{"follow", Intent::Follow}, {"stay", Intent::Stay}};
+    for (auto const& [act, typed] : oneShots)
     {
         f.Advance(CommandRate::IntervalMs);
-        receipt = f.Send(f.Command(intent, intent));
+        receipt = f.Send(f.Command(act, act));
         ++calls;
+        step = &f.probe.order->steps.front();
         Check(f.probe.calls == calls && f.probe.grants == calls && f.probe.mutations == calls &&
-                  f.probe.order->intent == typed && std::holds_alternative<std::monostate>(f.probe.order->params),
+                  step->intent == typed && !step->targetGuid && step->targetName.empty(),
               "one authorized target-less one-shot order");
-        Check(f.Result(receipt, intent) == "applied", "one-shot receipt");
+        Check(f.Result(receipt, act) == "applied", "one-shot receipt");
     }
-    Json const spot{{"x", 1.5}, {"y", -2.25}, {"z", 3.0}, {"mapId", 1}};
     f.Advance(CommandRate::IntervalMs);
-    f.probe.facts.pathableNearbyPosition = ChannelPosition{1.5, -2.25, 3.0, 1};
-    receipt = f.Send(f.Command("position-1", "position", spot));
-    auto const* position = std::get_if<ChannelPosition>(&f.probe.order->params);
-    Check(f.probe.calls == 6 && f.probe.grants == 6 && f.probe.mutations == 6 &&
-              f.probe.order->intent == ChannelIntent::Position && position &&
-              *position == ChannelPosition{1.5, -2.25, 3.0, 1},
-          "one authorized position order with the exact checked coordinates");
+    receipt = f.Send(f.Command("position-1", "position", {{"place", "1.5,-2.25,3,1"}}));
+    step = &f.probe.order->steps.front();
+    Check(f.probe.calls == 5 && f.probe.grants == 5 && f.probe.mutations == 5 && step->intent == Intent::Position &&
+              step->position == ChannelPosition{1.5, -2.25, 3.0, 1},
+          "one authorized position order with the exact coordinates");
     Check(f.Result(receipt, "position-1") == "applied", "position receipt");
     auto const& stats = f.channel.Commands();
-    Check(stats.proposed == 6 && stats.attempts == 6 && stats.applied == 6 && !stats.refused && !stats.failed &&
+    Check(stats.proposed == 5 && stats.attempts == 5 && stats.applied == 5 && !stats.refused && !stats.failed &&
               !stats.withheld && !stats.duplicates && f.channel.Drained(),
           "watchlist counters and slots");
-
-    // Without the adapter's pathable fact, or with a different checked position, the order never maps.
-    Fixture g;
-    Check(g.Result(g.Send(g.Command("unpathable", "position", spot)), "unpathable") == "rejected" &&
-              g.probe.calls == 1 && !g.probe.grants && !g.probe.mutations,
-          "an unpathable position is refused before authorization");
-    g.Advance(CommandRate::IntervalMs);
-    g.probe.facts.pathableNearbyPosition = ChannelPosition{1.5, -2.25, 4.0, 1};
-    Check(g.Result(g.Send(g.Command("elsewhere", "position", spot)), "elsewhere") == "rejected" && g.probe.calls == 2 &&
-              !g.probe.grants && !g.probe.mutations,
-          "a position other than the checked one is refused before authorization");
-    Check(g.channel.Commands().attempts == 2 && g.channel.Commands().refused == 2 && !g.channel.Commands().applied,
-          "refused positions are counted attempts without an effect");
 }
 
 void OutcomesNeverReplay()
@@ -547,23 +360,6 @@ void OutcomesNeverReplay()
 
 void FixedRefusals()
 {
-    Fixture f;
-    // J12: focus_healing, save_mana and formation are lasting plans now; the four without a playerbots effect stay
-    // refused (DS.9).
-    std::pair<char const*, Json> const others[] = {{"regroup", Json::object()},
-                                                   {"pull", Json{{"targetGuid", "44"}}},
-                                                   {"assign_role", Json{{"role", "tank"}}},
-                                                   {"dungeon_clear", Json{{"mode", "on"}}}};
-    unsigned refused = 0;
-    for (auto const& [intent, params] : others)
-    {
-        auto const id = "refused-" + std::to_string(refused++);
-        Check(f.Result(f.Send(f.Command(id, intent, params)), id) == "rejected", "fixed refusal receipt");
-    }
-    Check(refused == 4 && f.probe.calls == 0 && f.channel.Commands().refused == 4 && !f.channel.Commands().attempts,
-          "all four other verbs refused with no executor call");
-    Check(f.Result(f.Send(f.Attack("after-refusals")), "after-refusals") == "applied" && f.probe.calls == 1,
-          "refusals spend no rate interval");
     Fixture lasting;
     lasting.Send(lasting.Command("lasting", "formation", Json{{"shape", "close"}}));
     Check(lasting.probe.calls == 1 && lasting.channel.Commands().attempts == 1,
@@ -574,10 +370,7 @@ void FixedRefusals()
               !closed.channel.Commands().attempts,
           "null executor keeps today's refusal");
     std::pair<char const*, Json> const oneShots[] = {
-        {"follow", Json::object()},
-        {"stay", Json::object()},
-        {"flee", Json::object()},
-        {"position", Json{{"x", 1.0}, {"y", 2.0}, {"z", 3.0}, {"mapId", 1}}}};
+        {"follow", Json::object()}, {"stay", Json::object()}, {"position", Json{{"place", "1,2,3,1"}}}};
     for (auto const& [intent, params] : oneShots)
     {
         Fixture none({.executor = false});
@@ -603,90 +396,63 @@ void FixedRefusals()
           "a phase-less refusal spends no rate interval");
 }
 
-// The J6 action matrix: each of the 22 wire verbs ends as exactly one of a delivered effect (one executor call, one
-// authorized mutation, an applied receipt, the bot's rate interval spent) or its fixed refusal (a rejected receipt, no
-// executor call, nothing attempted, no rate interval spent). A fresh channel per verb keeps the rows independent.
-void VerbMatrix()
+// The action matrix: each act of the installed catalogue ends as a delivered effect (one executor call, one authorized
+// mutation, an applied receipt, the bot's rate interval spent). LCB2: a body of the old form (a verb and its params)
+// has no shape: the channel refuses it as invalid input before any command exists, so nothing is admitted, attempted
+// or executed and no rate interval is spent. A fresh channel per row keeps the rows independent.
+void ActMatrix()
 {
-    struct Row
+    std::map<std::string, Json> const rows = {{"follow", Json::object()},
+                                              {"mark", {{"target", "Hogger"}, {"icon", "skull"}}},
+                                              {"go_to", {{"place", "Goldshire"}}},
+                                              {"stay", Json::object()},
+                                              {"quest", {{"questId", 42}}},
+                                              {"position", {{"place", "1.5,-2.25,3,1"}}},
+                                              {"formation", {{"shape", "close"}}},
+                                              {"save_mana", {{"enabled", true}}},
+                                              {"focus_healing", {{"targetGuid", "44"}}},
+                                              {"attack_own_target", {{"targetGuid", "44"}}}};
+    std::size_t delivered = 0;
+    for (auto const& row : Abilities().rows)
     {
-        char const* intent;
-        Json params;
-        bool delivered;
-    };
-    Json const spot{{"x", 1.5}, {"y", -2.25}, {"z", 3.0}, {"mapId", 1}};
-    Row const rows[] = {{"attack_own_target", Json::object(), true},
-                        {"mark", Json{{"targetGuid", "44"}, {"icon", 3}}, true},
-                        {"follow", Json::object(), true},
-                        {"stay", Json::object(), true},
-                        {"flee", Json::object(), true},
-                        {"position", spot, true},
-                        {"pull", Json{{"targetGuid", "44"}}, false},
-                        {"regroup", Json::object(), false},
-                        {"formation", Json{{"shape", "close"}}, true},
-                        {"save_mana", Json{{"enabled", true}}, true},
-                        {"focus_healing", Json{{"targetGuid", "44"}}, true},
-                        {"assign_role", Json{{"role", "tank"}}, false},
-                        {"dungeon_clear", Json{{"mode", "on"}}, false},
-                        {"go_to", Json{{"place", "Goldshire"}}, true},
-                        {"quest", Json{{"questId", 42}}, true},
-                        {"errands", Json::object(), true},
-                        {"set_hearth", Json::object(), true},
-                        {"grind_here", Json::object(), true},
-                        {"gather_here", Json::object(), true},
-                        {"meet_at", Json{{"place", "Goldshire"}}, true},
-                        {"pause_plan", Json::object(), true},
-                        {"resume_plan", Json::object(), true}};
-    Check(std::size(rows) == static_cast<size_t>(ChannelIntent::ResumePlan) + 1, "the matrix names every wire verb");
-    unsigned delivered = 0;
-    unsigned refusals = 0;
-    for (auto const& row : rows)
+        if (row.topic)
+            continue;
+        auto const params = rows.find(row.name);
+        Check(params != rows.end(), "the matrix names every act of the catalogue");
+        Fixture f;
+        Check(f.Result(f.Send(f.Command("matrix", row.name.c_str(), params->second)), "matrix") == "applied" &&
+                  f.reason.empty(),
+              "matrix receipt");
+        auto const& stats = f.channel.Commands();
+        Check(f.probe.calls == 1 && f.probe.grants == 1 && f.probe.mutations == 1 && stats.attempts == 1 &&
+                  stats.applied == 1 && !stats.refused &&
+                  f.probe.order->steps.front().intent == static_cast<Intent>(row.code),
+              "a delivered act reaches the executor once with one authorized mutation, as its row's Intent");
+        Check(f.Result(f.Send(f.Attack("after-delivered")), "after-delivered") == "rejected" && f.probe.calls == 1,
+              "a delivered act spends the bot's rate interval");
+        Check(f.reason == "too_soon", "a rate refusal names its reason (too_soon)");
+        ++delivered;
+    }
+    Check(delivered == rows.size(), "every act of the matrix delivered");
+    std::pair<char const*, Json> const old[] = {{"attack_own_target", Json::object()},
+                                                {"mark", {{"targetGuid", "44"}, {"icon", 3}}},
+                                                {"follow", Json::object()},
+                                                {"stay", {{"standing", true}}},
+                                                {"pull", {{"targetGuid", "44"}}}};
+    for (auto const& [verb, params] : old)
     {
         Fixture f;
-        f.probe.facts.pathableNearbyPosition = ChannelPosition{1.5, -2.25, 3.0, 1};
-        Check(f.Result(f.Send(f.Command("matrix", row.intent, row.params)), "matrix") ==
-                  (row.delivered ? "applied" : "rejected"),
-              "matrix receipt");
-        Check(row.delivered ? f.reason.empty() : f.reason == "not_supported",
-              "a fixed refusal names its reason (not_supported)");
-        auto const& stats = f.channel.Commands();
-        if (row.delivered)
-        {
-            ++delivered;
-            Check(f.probe.calls == 1 && f.probe.grants == 1 && f.probe.mutations == 1 && stats.attempts == 1 &&
-                      stats.applied == 1 && !stats.refused,
-                  "a delivered verb reaches the executor once with one authorized mutation");
-            Check(f.Result(f.Send(f.Attack("after-delivered")), "after-delivered") == "rejected" && f.probe.calls == 1,
-                  "a delivered verb spends the bot's rate interval");
-            Check(f.reason == "too_soon", "a rate refusal names its reason (too_soon)");
-        }
-        else
-        {
-            ++refusals;
-            Check(f.probe.calls == 0 && f.probe.grants == 0 && f.probe.mutations == 0 && !stats.attempts &&
-                      stats.refused == 1 && !stats.applied && !stats.failed,
-                  "a fixed refusal never reaches the executor and is not an attempt");
-            Check(f.Result(f.Send(f.Attack("after-refusal")), "after-refusal") == "applied" && f.probe.calls == 1,
-                  "a fixed refusal spends no rate interval");
-        }
+        auto body = Json::parse(f.Command("old", "stay"));
+        body.erase("steps");
+        body["intent"] = verb;
+        body["params"] = params;
+        Check(f.Result(f.Send(body.dump()), "old") == "invalid_input" && f.packetError == ChannelError::Invalid,
+              "LCB2: an old-form body is invalid input");
+        Check(f.probe.calls == 0 && !f.channel.Commands().proposed && !f.channel.Commands().attempts,
+              "an old-form body never reaches the executor");
+        Check(f.Result(f.Send(f.Attack("after-old")), "after-old") == "applied",
+              "a refused old-form body spends no rate interval");
     }
-    Check(delivered == 18 && refusals == 4, "eighteen delivered verbs and four fixed refusals");
-    // Standing follow and stay (a duration or a standing flag) have no wire shape: the exact parameter check refuses
-    // the packet as invalid input before any command exists, so nothing is admitted, attempted or executed.
-    // J5e: the refusal is the Standing error, which the listener words as invalid_input with reason
-    // standing_not_supported.
-    for (char const* intent : {"follow", "stay"})
-        for (Json const& extra : {Json{{"standing", true}}, Json{{"durationMs", 30000}}})
-        {
-            Fixture f;
-            Check(f.Result(f.Send(f.Command("standing", intent, extra)), "standing") == "invalid_input" &&
-                      f.packetError == ChannelError::Standing,
-                  "a standing follow or stay has no typed shape and names its reason");
-            Check(f.probe.calls == 0 && !f.channel.Commands().proposed && !f.channel.Commands().attempts,
-                  "a standing verb never reaches the executor");
-            Check(f.Result(f.Send(f.Attack("after-standing")), "after-standing") == "applied",
-                  "a refused standing verb spends no rate interval");
-        }
 }
 
 void TerminalAndIds()
@@ -799,26 +565,6 @@ void LostGuards()
                   f.channel.Commands().withheld == 1 && f.channel.Drained(),
               "lost authority publishes no receipt");
     }
-    // Fresh facts that do not map to the order: refused before the final check, no authorization asked.
-    Case const unmapped[] = {
-        {"other controller", [](Fixture& f) { f.probe.facts.controllerGuid = 23; }},
-        {"bot left the group", [](Fixture& f) { f.probe.facts.botGroupGuid = 34; }},
-        {"own target changed", [](Fixture& f) { f.probe.facts.ownTargetGuid = 45; }},
-        {"no eligible target", [](Fixture& f) { f.probe.facts.eligibleVisibleTargetGuid = 0; }},
-    };
-    for (auto const& c : unmapped)
-    {
-        Fixture f;
-        c.change(f);
-        Check(f.Result(f.Send(f.Attack("unmapped")), "unmapped") == "rejected" && f.probe.calls == 1 &&
-                  !f.probe.grants && !f.probe.denials && !f.probe.mutations,
-              c.label);
-    }
-    Fixture m;
-    Check(m.Result(m.Send(m.Mark("invisible", "45")), "invisible") == "rejected" && m.probe.calls == 1 &&
-              !m.probe.mutations,
-          "mark of an ineligible target");
-
     Fixture retry;
     retry.probe.before = [&retry] { retry.guard.authority = false; };
     retry.Result(retry.Send(retry.Attack("lost")), "lost");
@@ -1096,7 +842,8 @@ void SteppedDispatch()
 
 int main()
 {
-    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    OllamaBridge::SetAbilityIndex(TestStepAbilityIndex());  // LC3: the acts and topics are the installed index's.
+    if (OllamaBridge::Abilities().rows.empty())
     {
         std::cerr << "FAIL: the ability double was refused\n";
         return 1;
@@ -1104,11 +851,10 @@ int main()
     try
     {
         PureSeam();
-        EffectOrders();
-        TypedVerbs();
+        StepVerbs();
         OutcomesNeverReplay();
         FixedRefusals();
-        VerbMatrix();
+        ActMatrix();
         TerminalAndIds();
         RetirementBeforeTick();
         QueueAndRate();

@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 
 #include "bridge-ability-double.h"
 #include "mod-ollama-chat_bridge_channel.h"
@@ -63,8 +64,7 @@ struct Fixture
         json["commandId"] = std::move(id);
         json["issuerGuid"] = std::to_string(scope.controllerGuid);
         json["botGuid"] = std::to_string(scope.botGuid);
-        json["intent"] = "stay";
-        json["params"] = Json::object();
+        json["steps"] = Json::array({{{"act", "follow"}, {"params", Json::object()}}});
         return json;
     }
     ChannelError Receive(Json const& json, Clock clock = now)
@@ -232,77 +232,43 @@ void Schemas()
                                                                       {"issuerGuid", "18446744073709551616"},
                                                                       {"issuerGuid", "0"},
                                                                       {"commandId", std::string(129, 'a')},
-                                                                      {"intent", "stay;delete"},
-                                                                      {"params", Json::array()},
+                                                                      {"steps", "follow"},
+                                                                      {"steps", Json::array()},
+                                                                      {"intent", "follow"},
+                                                                      {"params", Json::object()},
                                                                       {"extra", "private"}})
     {
         auto bad = f.Command();
         bad[pair.first] = pair.second;
         Check(f.Receive(bad) == ChannelError::Invalid, "strict exact envelope or payload field");
     }
+    // LCB2: one form; a follow or stay with any keyed params (the old standing shape) is invalid like any other.
     for (auto const& pair :
-         std::vector<std::pair<std::string, Json>>{{"pull", {{"targetGuid", "01"}}},
-                                                   {"mark", {{"targetGuid", "1"}, {"icon", 8}}},
-                                                   {"mark", {{"targetGuid", "1"}, {"icon", 1.0}}},
-                                                   {"assign_role", {{"role", "leader"}}},
-                                                   {"save_mana", {{"enabled", 1}}},
-                                                   {"formation", {{"shape", "circle"}}},
-                                                   {"dungeon_clear", {{"mode", "restart"}}},
+         std::vector<std::pair<std::string, Json>>{{"mark", {{"targetGuid", "01"}, {"icon", "star"}}},
+                                                   {"mark", {{"target", "Hogger"}, {"icon", 7}}},
+                                                   {"mark", {{"target", "Hogger"}, {"icon", "Skull"}}},
                                                    {"go_to", {{"place", ""}}},
-                                                   {"meet_at", {{"questId", 1}}},
-                                                   {"quest", {{"questId", 0}}},
-                                                   {"quest", {{"place", "Goldshire"}}},
-                                                   {"errands", {{"place", "Goldshire"}}},
-                                                   {"position", {{"x", 1}, {"y", 2}, {"z", 3}, {"mapId", -1}}},
-                                                   {"position", {{"x", "1"}, {"y", 2}, {"z", 3}, {"mapId", 0}}}})
+                                                   {"go_to", {{"questId", 1}}},
+                                                   {"follow", {{"targetGuid", "1"}}},
+                                                   {"follow", {{"standing", true}}},
+                                                   {"follow", {{"durationMs", 30000}}}})
     {
         auto bad = f.Command();
-        bad["intent"] = pair.first;
-        bad["params"] = pair.second;
-        Check(f.Receive(bad) == ChannelError::Invalid, "strict intent parameters");
-    }
-    // J5e: follow or stay with any keyed params is a standing shape: still 400 invalid_input, but with its reason.
-    for (auto const& pair : std::vector<std::pair<std::string, Json>>{
-             {"stay", {{"targetGuid", "1"}}}, {"follow", {{"standing", true}}}, {"stay", {{"durationMs", 30000}}}})
-    {
-        auto bad = f.Command();
-        bad["intent"] = pair.first;
-        bad["params"] = pair.second;
-        Check(f.Receive(bad) == ChannelError::Standing, "J5e: follow or stay with params is a standing shape");
+        bad["steps"] = Json::array({{{"act", pair.first}, {"params", pair.second}}});
+        Check(f.Receive(bad) == ChannelError::Invalid, "strict act parameters");
     }
     Check(f.policy.CommandReservations() == 0, "malformed payloads reserve no effect ids");
     unsigned sequence = 0;
-    for (auto const& pair :
-         std::vector<std::pair<std::string, Json>>{{"follow", Json::object()},
-                                                   {"stay", Json::object()},
-                                                   {"flee", Json::object()},
-                                                   {"regroup", Json::object()},
-                                                   {"attack_own_target", Json::object()},
-                                                   {"pull", {{"targetGuid", "18446744073709551615"}}},
-                                                   {"mark", {{"targetGuid", "1"}, {"icon", 7}}},
-                                                   {"focus_healing", {{"targetGuid", "2"}}},
-                                                   {"assign_role", {{"role", "healer"}}},
-                                                   {"save_mana", {{"enabled", false}}},
-                                                   {"formation", {{"shape", "spread"}}},
-                                                   {"position", {{"x", 1.5}, {"y", -2}, {"z", 3}, {"mapId", 0}}},
-                                                   {"dungeon_clear", {{"mode", "pause"}}},
-                                                   {"go_to", {{"place", "Goldshire"}}},
-                                                   {"quest", {{"questId", 4294967295ULL}}},
-                                                   {"errands", Json::object()},
-                                                   {"set_hearth", Json::object()},
-                                                   {"grind_here", Json::object()},
-                                                   {"gather_here", Json::object()},
-                                                   {"meet_at", {{"place", std::string(64, 'm')}}},
-                                                   {"pause_plan", Json::object()},
-                                                   {"resume_plan", Json::object()}})
+    for (auto const& [act, params, intent] : std::vector<std::tuple<std::string, Json, PlayerbotBridge::Intent>>{
+             {"follow", Json::object(), PlayerbotBridge::Intent::Follow},
+             {"mark", {{"targetGuid", "18446744073709551615"}, {"icon", "skull"}}, PlayerbotBridge::Intent::Mark},
+             {"go_to", {{"place", std::string(64, 'm')}}, PlayerbotBridge::Intent::GoTo}})
     {
         auto good = f.Command("effect-" + std::to_string(++sequence));
-        good["intent"] = pair.first;
-        good["params"] = pair.second;
+        good["steps"] = Json::array({{{"act", act}, {"params", params}}});
         Check(f.policy.Receive(bearer, good.dump(), f.scope, now, result, "work") == ChannelError::None,
-              "whitelist decodes into typed values");
-        Check(static_cast<unsigned>(std::get<ChannelCommand>(result.payload).intent) == sequence - 1,
-              "typed intent preserved");
+              "the catalogue's acts decode into typed steps");
+        Check(std::get<ChannelCommand>(result.payload).steps.front().intent == intent, "the act's code preserved");
     }
     auto terminal = f.Wire("generation.result");
     for (std::string text : {std::string(4097, 'x'), std::string("\0", 1), std::string("  \n")})
@@ -835,29 +801,21 @@ Json CatalogueQuery(Fixture const& f, std::string const& id)
 void Catalogue()
 {
     auto const bytes = SetAbilityIndex(TestAbilityIndex());
-    Check(bytes > 0 && bytes <= ChannelMaxCatalogueBytes && Abilities().rows.size() == 17 &&
-              Abilities().verbs.size() == 22 && CatalogueInstalled(),
+    Check(bytes > 0 && bytes <= ChannelMaxCatalogueBytes && Abilities().rows.size() == 17 && CatalogueInstalled(),
           "the double installs");
     Check(ChannelMaxCatalogueBytes == 49152 && ChannelMaxCatalogueBytes + 4096 < MaxCatalogueResponseBytes &&
               MaxResponseBytes == 32768,
           "the catalogue's budget leaves its answer headroom; the other bodies keep 32 KB");
 
-    // A refused index leaves the channel none: no verb, no topic, no catalogue.
+    // A refused index leaves the channel none: no act, no topic, no catalogue.
     using Change = void (*)(AbilityIndex&);
     Change const refused[] = {
-        [](AbilityIndex& index) { index.verbs.pop_back(); },
-        [](AbilityIndex& index) { index.verbs[1].name = index.verbs[0].name; },
-        [](AbilityIndex& index) { index.verbs[1].intent = ChannelIntent::Follow; },
-        [](AbilityIndex& index) { index.verbs[0].name = "Follow"; },
-        [](AbilityIndex& index) { index.verbs[0].intent = static_cast<ChannelIntent>(22); },
-        [](AbilityIndex& index) { index.verbs[3].name = "Regroup"; },
-        [](AbilityIndex& index) { index.verbs[3].intent = static_cast<ChannelIntent>(22); },
-        [](AbilityIndex& index) { index.rows[0].name = "chase"; },
-        [](AbilityIndex& index) { index.rows[1].code = static_cast<uint8_t>(ChannelIntent::Stay); },
+        [](AbilityIndex& index) { index.rows[0].name = "Follow"; },
+        [](AbilityIndex& index) { index.rows[1].name = index.rows[0].name; },
+        [](AbilityIndex& index) { index.rows[1].code = index.rows[0].code; },
         [](AbilityIndex& index) { index.rows[4].name = index.rows[3].name; },
         [](AbilityIndex& index) { index.rows[4].code = index.rows[3].code; },
         [](AbilityIndex& index) { index.rows[10].params.push_back(index.rows[10].params.front()); },
-        [](AbilityIndex& index) { index.rows[1].code = static_cast<uint8_t>(ChannelIntentCount); },
         [](AbilityIndex& index) { index.rows[3].name = "inventory items"; },
         [](AbilityIndex& index) { index.rows.clear(); },
         [](AbilityIndex& index) { index.version = 0; },
@@ -870,19 +828,18 @@ void Catalogue()
         Check(SetAbilityIndex(std::move(index)) == 0, "a malformed index is refused before it is encoded");
         Fixture f;
         f.Open();
-        Check(Abilities().rows.empty() && Abilities().verbs.empty() && !CatalogueInstalled() &&
-                  f.Receive(f.Command()) == ChannelError::Invalid &&
+        Check(Abilities().rows.empty() && !CatalogueInstalled() && f.Receive(f.Command()) == ChannelError::Invalid &&
                   f.Receive(StateQuery(f, "refused-topic", "quests")) == ChannelError::Invalid &&
                   !*StateTopicName(StateTopic::Quests) && f.policy.CommandReservations() == 0,
-              "a refused index leaves no verb, no topic and no topic name");
+              "a refused index leaves no act, no topic and no topic name");
     }
     // LC3b (LC3a review 1): a catalogue the query cannot send, over its budget or not UTF-8, drops only the
-    // catalogue: the verbs and topics stand.
+    // catalogue: the acts and topics stand.
     auto const standing = [](char const* label)
     {
         Fixture f;
         f.Open();
-        Check(Abilities().rows.size() == 17 && Abilities().verbs.size() == 22 && !CatalogueInstalled() &&
+        Check(Abilities().rows.size() == 17 && !CatalogueInstalled() &&
                   f.Receive(f.Command("standing")) == ChannelError::None &&
                   f.Receive(StateQuery(f, "standing-topic", "quests")) == ChannelError::None &&
                   std::string(StateTopicName(StateTopic::Quests)) == "quests",
@@ -897,22 +854,22 @@ void Catalogue()
     Check(SetAbilityIndex(std::move(broken)) == 0, "a catalogue that is not UTF-8 has no size");
     standing("a catalogue that is not UTF-8 drops only the catalogue");
 
-    // The words are the index's: a renamed verb or topic is taken under its new word only.
+    // The words are the index's: a renamed act or topic is taken under its new word only.
     auto renamed = TestAbilityIndex();
-    renamed.verbs[1].name = "hold";
+    renamed.rows[0].name = "chase";
     renamed.rows[8].name = "plans";
     renamed.rows.erase(renamed.rows.begin() + 4);
     Check(SetAbilityIndex(std::move(renamed)) > 0, "a renamed double installs");
     {
         Fixture f;
         f.Open();
-        auto stay = f.Command("renamed");
-        Check(f.Receive(stay) == ChannelError::Invalid, "the old word is no verb once the index renames it");
-        stay["intent"] = "hold";
+        auto chase = f.Command("renamed");
+        Check(f.Receive(chase) == ChannelError::Invalid, "the old word is no act once the index renames it");
+        chase["steps"][0]["act"] = "chase";
         ChannelMessage result;
-        Check(f.policy.Receive(bearer, stay.dump(), f.scope, now, result, "work") == ChannelError::None &&
-                  std::get<ChannelCommand>(result.payload).intent == ChannelIntent::Stay,
-              "the index's word decodes to its intent");
+        Check(f.policy.Receive(bearer, chase.dump(), f.scope, now, result, "work") == ChannelError::None &&
+                  std::get<ChannelCommand>(result.payload).steps.front().intent == PlayerbotBridge::Intent::Follow,
+              "the index's word decodes to its row's code");
         Check(f.Receive(StateQuery(f, "old-topic", "plan")) == ChannelError::Invalid &&
                   f.Receive(StateQuery(f, "gone-topic", "quests")) == ChannelError::Invalid &&
                   f.Receive(StateQuery(f, "kept-topic", "inventory")) == ChannelError::None,
@@ -926,9 +883,9 @@ void Catalogue()
         Fixture f;
         f.Open();
         Check(f.Receive(StateQuery(f, "act-topic", "follow")) == ChannelError::Invalid, "an act is no bot_state topic");
-        auto verb = f.Command("topic-verb");
-        verb["intent"] = "inventory";
-        Check(f.Receive(verb) == ChannelError::Invalid, "a topic is no verb");
+        auto act = f.Command("topic-act");
+        act["steps"][0]["act"] = "inventory";
+        Check(f.Receive(act) == ChannelError::Invalid, "a topic is no act");
     }
 
     // The query: observable_group's keys, the route's own bot, an id of its own.
@@ -1128,8 +1085,6 @@ void Watches()
 Json StepWire(Fixture const& f, std::string const& id, Json steps)
 {
     auto json = f.Command(id);
-    json.erase("intent");
-    json.erase("params");
     json["steps"] = std::move(steps);
     return json;
 }
@@ -1156,31 +1111,32 @@ void Stepped()
         Decoded(Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
                              Step("go_to", {{"place", "Goldshire"}}), Step("position", {{"place", "1.5,-2.25,30,0"}})}),
                 "three steps decode");
-    Check(three.size() == 3 && three[0].intent == ChannelIntent::Mark && three[0].targetName == "Hogger" &&
-              !three[0].targetGuid && three[0].icon == 7 && three[1].intent == ChannelIntent::GoTo &&
-              three[1].place == "Goldshire" && three[2].intent == ChannelIntent::Position && three[2].position &&
-              three[2].position->x == 1.5 && three[2].position->y == -2.25 && three[2].position->z == 30 &&
-              three[2].position->mapId == 0 && three[2].place.empty(),
+    Check(three.size() == 3 && three[0].intent == PlayerbotBridge::Intent::Mark && three[0].targetName == "Hogger" &&
+              !three[0].targetGuid && three[0].icon == 7 && three[1].intent == PlayerbotBridge::Intent::GoTo &&
+              three[1].place == "Goldshire" && three[2].intent == PlayerbotBridge::Intent::Position &&
+              three[2].position && three[2].position->x == 1.5 && three[2].position->y == -2.25 &&
+              three[2].position->z == 30 && three[2].position->mapId == 0 && three[2].place.empty(),
           "each step's act and parameters, in order; a name as given, a choice as its index, a spot parsed");
     auto const ids =
         Decoded(Json::array({Step("focus_healing", {{"targetGuid", "44"}}), Step("quest", {{"questId", 42}}),
                              Step("mark", {{"targetGuid", "45"}, {"icon", "star"}})}),
                 "ids decode");
-    Check(ids[0].intent == ChannelIntent::FocusHealing && ids[0].targetGuid == 44 && ids[0].targetName.empty() &&
-              ids[1].intent == ChannelIntent::Quest && ids[1].questId == 42 && ids[1].questName.empty() &&
-              ids[2].targetGuid == 45 && ids[2].icon == 0,
+    Check(ids[0].intent == PlayerbotBridge::Intent::FocusHealing && ids[0].targetGuid == 44 &&
+              ids[0].targetName.empty() && ids[1].intent == PlayerbotBridge::Intent::Quest && ids[1].questId == 42 &&
+              ids[1].questName.empty() && ids[2].targetGuid == 45 && ids[2].icon == 0,
           "a unit and a quest by id");
     auto const named =
         Decoded(Json::array({Step("quest", {{"quest", "The Collector"}}),
                              Step("attack_own_target", {{"target", std::string(ChannelMaxPlaceName, 'a')}})}),
                 "names decode");
     Check(named[0].questName == "The Collector" && !named[0].questId &&
-              named[1].intent == ChannelIntent::AttackOwnTarget && named[1].targetName.size() == ChannelMaxPlaceName,
+              named[1].intent == PlayerbotBridge::Intent::AttackOwnTarget &&
+              named[1].targetName.size() == ChannelMaxPlaceName,
           "a quest by title, a unit by a name of the longest length");
     auto const choices = Decoded(
         Json::array({Step("formation", {{"shape", "line"}}), Step("save_mana", {{"enabled", false}}), Step("stay")}),
         "choices and flags decode");
-    Check(choices[0].shape == 2 && choices[1].enabled == false && choices[2].intent == ChannelIntent::Stay &&
+    Check(choices[0].shape == 2 && choices[1].enabled == false && choices[2].intent == PlayerbotBridge::Intent::Stay &&
               !choices[2].icon && !choices[2].shape && !choices[2].enabled,
           "a shape as its choice's index, a flag as given, an act without parameters");
     {
@@ -1262,12 +1218,13 @@ void Stepped()
         auto noBot = StepWire(f, "no-bot", Json::array({Step("stay")}));
         noBot.erase("botGuid");
         auto oldNamed = f.Command("old-named");
+        oldNamed.erase("steps");
         oldNamed["intent"] = "mark";
         oldNamed["params"] = {{"target", "Hogger"}, {"icon", 3}};
         Check(f.Receive(both) == ChannelError::Invalid && f.Receive(withParams) == ChannelError::Invalid &&
                   f.Receive(noBot) == ChannelError::Invalid && f.Receive(oldNamed) == ChannelError::Invalid &&
                   f.policy.CommandReservations() == 0,
-              "steps beside intent or params, without the scope's keys, or a name in the old form: invalid");
+              "steps beside intent or params, without the scope's keys, or a body of the old form: invalid");
     }
     auto two = TestStepAbilityIndex();
     two.maxSteps = 2;
@@ -1297,15 +1254,14 @@ struct Finished
     Json json;
 };
 
-// Admits the command (old form when steps is null) on a fresh route and finishes it once, then checks a second
-// finish is refused.
+// Admits the command on a fresh route and finishes it once, then checks a second finish is refused.
 Finished Finish(Json const& steps, ChannelOutcome outcome, std::vector<ChannelStepResult> const& ran,
                 CommandRefusal refusal)
 {
     Fixture f;
     f.Open();
     ChannelMessage message;
-    auto const wire = steps.is_null() ? f.Command("done") : StepWire(f, "done", steps);
+    auto const wire = StepWire(f, "done", steps);
     Check(f.policy.Receive(bearer, wire.dump(), f.scope, now, message, "work") == ChannelError::None,
           "the command admitted");
     auto const& command = std::get<ChannelCommand>(message.payload);
@@ -1329,10 +1285,6 @@ void SteppedResults()
     ChannelStepResult const place{ChannelOutcome::Rejected, "unknown_place", "You do not know that place."};
     Json const three = Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
                                     Step("go_to", {{"place", "Goldshire"}}), Step("stay")});
-    auto const old = Finish(Json(), ChannelOutcome::Applied, {}, CommandRefusal::None);
-    Check(old.error == ChannelError::None && old.json.at("outcome") == "applied" && !old.json.contains("steps") &&
-              !old.json.contains("reason"),
-          "the old form's result has no steps");
     auto const applied = Finish(three, ChannelOutcome::Applied, {ok, ok, ok}, CommandRefusal::None);
     Check(applied.error == ChannelError::None && applied.json.at("outcome") == "applied" &&
               !applied.json.contains("reason") && applied.json.size() == 10 &&
@@ -1355,7 +1307,7 @@ void SteppedResults()
                                                     {"reason", failedWords.code},
                                                     {"reasonText", failedWords.text}} &&
               failed.json.at("steps").at(1) == Json{{"act", "go_to"}, {"outcome", "skipped"}},
-          "an unworded failure reads as the old form's failed");
+          "an unworded failure reads failed");
     auto const cannot = DescribeRefusal(CommandRefusal::CannotNow);
     auto const unworded =
         Finish(three, ChannelOutcome::Rejected, {ok, {ChannelOutcome::Rejected, "", ""}}, CommandRefusal::None);
@@ -1391,12 +1343,11 @@ void SteppedResults()
 // ---- LC16c: a row the module has never heard of ---------------------------------------------------------------------
 void OpenRows()
 {
-    // Malformed rows first: an open act or topic never loosens the old verbs' authority.
+    // Malformed rows first: an open act or topic keeps every row rule.
     using Change = void (*)(AbilityIndex&);
     Change const refused[] = {
-        [](AbilityIndex& index) { index.rows[3].name = "regroup"; },
-        [](AbilityIndex& index) { index.rows[3].name = "stay"; },
-        [](AbilityIndex& index) { index.rows[3].code = static_cast<uint8_t>(ChannelIntent::Stay); },
+        [](AbilityIndex& index) { index.rows[3].name = "mark"; },
+        [](AbilityIndex& index) { index.rows[3].code = index.rows[1].code; },
         [](AbilityIndex& index) { index.rows[3].params[3].field = static_cast<AbilityField>(11); },
         [](AbilityIndex& index)
         {
@@ -1413,16 +1364,15 @@ void OpenRows()
         auto index = TestOpenAbilityIndex();
         change(index);
         Check(SetAbilityIndex(std::move(index)) == 0 && Abilities().rows.empty(),
-              "an open row named like a verb, below 22 as another verb, with an unknown field, a twin code, a "
-              "duplicate topic, two topic parameters or a bad word refuses the index");
+              "an open row named or coded like another act, with an unknown field, a twin code, a duplicate topic, "
+              "two topic parameters or a bad word refuses the index");
     }
     auto high = TestOpenAbilityIndex();
     high.rows[3].code = 255;
     high.rows.back().code = 200;
-    Check(SetAbilityIndex(std::move(high)) > 0, "any act or topic value past the old ones");
-    Check(SetAbilityIndex(TestOpenAbilityIndex()) > 0 && Abilities().rows.size() == 19 && CatalogueInstalled() &&
-              Abilities().verbs.size() == 22,
-          "the open double installs: an act past the 22 verbs, a topic past the 14");
+    Check(SetAbilityIndex(std::move(high)) > 0, "any act or topic value");
+    Check(SetAbilityIndex(TestOpenAbilityIndex()) > 0 && Abilities().rows.size() == 19 && CatalogueInstalled(),
+          "the open double installs: an act and a topic the module has no code for");
 
     // A stepped order: the act's value from the index, the four new fields by kind.
     Json const cast =
@@ -1433,9 +1383,9 @@ void OpenRows()
               open[0].itemName == "Hearthstone" && open[0].spellName == "Frost Nova" && open[0].count == 1000 &&
               open[0].choice == 1 && !open[0].icon && !open[0].shape && !open[0].enabled && !open[0].position &&
               open[0].place.empty() && !open[0].targetGuid && open[0].targetName.empty() &&
-              open[1].intent == ChannelIntent::Mark && open[1].icon == 7 && !open[1].choice && !open[1].count &&
-              open[1].itemName.empty(),
-          "an item and a spell as named, a count as given, a choice as its index; the old act beside it unchanged");
+              open[1].intent == PlayerbotBridge::Intent::Mark && open[1].icon == 7 && !open[1].choice &&
+              !open[1].count && open[1].itemName.empty(),
+          "an item and a spell as named, a count as given, a choice as its index; the act beside it unchanged");
     auto const least = Decoded(Json::array({Step("cast_on", {{"item", std::string(ChannelMaxPlaceName, 'i')},
                                                              {"spell", "Blink"},
                                                              {"times", 1},
@@ -1497,17 +1447,20 @@ void OpenRows()
         Fixture f;
         f.Open();
         auto old = f.Command("old-open");
+        old.erase("steps");
         old["intent"] = "cast_on";
         old["params"] = cast.at("params");
         auto bare = f.Command("old-open-bare");
+        bare.erase("steps");
         bare["intent"] = "cast_on";
         bare["params"] = Json::object();
         auto topic = f.Command("old-open-topic");
+        topic.erase("steps");
         topic["intent"] = "deeds_of";
         topic["params"] = Json::object();
         Check(f.Receive(old) == ChannelError::Invalid && f.Receive(bare) == ChannelError::Invalid &&
                   f.Receive(topic) == ChannelError::Invalid && f.policy.CommandReservations() == 0,
-              "the old form refuses an act it lacks: its verbs stay the 22");
+              "LCB2: a body of the old form is invalid for an open act or topic too");
         Check(f.Receive(StepWire(f, "open-once", Json::array({cast}))) == ChannelError::None &&
                   f.policy.CommandReservations() == 1,
               "one reservation for an open act's order");
@@ -1610,7 +1563,7 @@ void OpenRows()
 
 int main()
 {
-    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    if (!InstallTestAbilities())  // LC3: the acts and topics are the installed index's.
     {
         std::cerr << "FAIL: the ability double was refused\n";
         return 1;

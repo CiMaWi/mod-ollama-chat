@@ -192,13 +192,11 @@ ChannelError WorldChannel::Command(Binding const& binding, ChannelEnvelope const
     // Receive already consumed this command id in the replay ledger; no path below can run it twice.
     attempted = false;
     ++_stats.proposed;
-    // DS.3 fixed refusal before any game read: unsupported verb, no executor or world phase, or rate denial.
-    // J5e: each refusal names its reason (the rate gate is consulted only when the others pass, as before). LC3: a
-    // stepped command's acts are catalogue rows, each with its effect (Receive takes no other verb in that form), and
-    // the rate gate admits the whole order once: one slot, one authorization, however many steps it holds.
-    bool const supported = !command.steps.empty() || EffectSupported(command.intent);
-    CommandRefusal const fixed = !supported                                             ? CommandRefusal::NotSupported
-                                 : !_executor || !phase                                 ? CommandRefusal::Unavailable
+    // DS.3 fixed refusal before any game read: no executor or world phase, or rate denial. J5e: each refusal names
+    // its reason (the rate gate is consulted only when the other passes). LC3: the acts are catalogue rows, each with
+    // its effect (Receive takes no other), and the rate gate admits the whole order once: one slot, one
+    // authorization, however many steps it holds.
+    CommandRefusal const fixed = !_executor || !phase                                   ? CommandRefusal::Unavailable
                                  : !_rate.Admit(binding.ticket.scope.botGuid, _clock()) ? CommandRefusal::TooSoon
                                                                                         : CommandRefusal::None;
     if (fixed != CommandRefusal::None)

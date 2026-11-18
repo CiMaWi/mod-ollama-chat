@@ -481,7 +481,8 @@ static_assert(static_cast<uint8_t>(PlayerbotBridge::BotStateTopic::Spells) ==
               OllamaBridge::StateTopicCount <= PlayerbotBridge::TopicRows().size());
 // LC16c: the fourteen topics above keep their values; a topic playerbots appends is answered in the lines form.
 
-// LC3: the channel takes an act's intent and a parameter's field as playerbots' values; each pair is one value.
+// LC3: the channel takes a parameter's field as playerbots' value (an act's code is its Intent value); each pair
+// is one value.
 template <typename Pairs>
 constexpr bool BridgeValuesAgree(Pairs const& pairs)
 {
@@ -494,35 +495,6 @@ constexpr bool BridgeValuesAgree(Pairs const& pairs)
     }
     return true;
 }
-
-constexpr std::pair<PlayerbotBridge::Intent, OllamaBridge::ChannelIntent> BridgeIntentPairs[] = {
-    {PlayerbotBridge::Intent::Follow, OllamaBridge::ChannelIntent::Follow},
-    {PlayerbotBridge::Intent::Stay, OllamaBridge::ChannelIntent::Stay},
-    {PlayerbotBridge::Intent::Flee, OllamaBridge::ChannelIntent::Flee},
-    {PlayerbotBridge::Intent::Regroup, OllamaBridge::ChannelIntent::Regroup},
-    {PlayerbotBridge::Intent::AttackOwnTarget, OllamaBridge::ChannelIntent::AttackOwnTarget},
-    {PlayerbotBridge::Intent::Pull, OllamaBridge::ChannelIntent::Pull},
-    {PlayerbotBridge::Intent::Mark, OllamaBridge::ChannelIntent::Mark},
-    {PlayerbotBridge::Intent::FocusHealing, OllamaBridge::ChannelIntent::FocusHealing},
-    {PlayerbotBridge::Intent::AssignRole, OllamaBridge::ChannelIntent::AssignRole},
-    {PlayerbotBridge::Intent::SaveMana, OllamaBridge::ChannelIntent::SaveMana},
-    {PlayerbotBridge::Intent::Formation, OllamaBridge::ChannelIntent::Formation},
-    {PlayerbotBridge::Intent::Position, OllamaBridge::ChannelIntent::Position},
-    {PlayerbotBridge::Intent::DungeonClear, OllamaBridge::ChannelIntent::DungeonClear},
-    {PlayerbotBridge::Intent::GoTo, OllamaBridge::ChannelIntent::GoTo},
-    {PlayerbotBridge::Intent::Quest, OllamaBridge::ChannelIntent::Quest},
-    {PlayerbotBridge::Intent::Errands, OllamaBridge::ChannelIntent::Errands},
-    {PlayerbotBridge::Intent::SetHearth, OllamaBridge::ChannelIntent::SetHearth},
-    {PlayerbotBridge::Intent::GrindHere, OllamaBridge::ChannelIntent::GrindHere},
-    {PlayerbotBridge::Intent::GatherHere, OllamaBridge::ChannelIntent::GatherHere},
-    {PlayerbotBridge::Intent::MeetAt, OllamaBridge::ChannelIntent::MeetAt},
-    {PlayerbotBridge::Intent::PausePlan, OllamaBridge::ChannelIntent::PausePlan},
-    {PlayerbotBridge::Intent::ResumePlan, OllamaBridge::ChannelIntent::ResumePlan}};
-// The old form's 22 verbs have a ChannelIntent of the same value; the old form stays frozen at them (LC.23). LC16c: a
-// verb playerbots appends is an act of its table only: a stepped order takes its row's Intent value from the index.
-static_assert(BridgeValuesAgree(BridgeIntentPairs) && std::size(BridgeIntentPairs) == 22 &&
-              OllamaBridge::ChannelIntentCount == 22 &&
-              PlayerbotBridge::IntentCount >= OllamaBridge::ChannelIntentCount);
 
 constexpr std::pair<PlayerbotBridge::OrderField, OllamaBridge::AbilityField> BridgeFieldPairs[] = {
     {PlayerbotBridge::OrderField::Target, OllamaBridge::AbilityField::Target},
@@ -567,8 +539,7 @@ bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic, std::
 }
 
 // LC3: the channel's ability index from playerbots' table: the catalogue with its hash, each row's intent or topic and
-// parameter fields, and every intent's wire word. Empty (refused by the channel) when the catalogue and the table
-// disagree.
+// parameter fields. Empty (refused by the channel) when the catalogue and the table disagree.
 static OllamaBridge::AbilityIndex BridgeAbilityIndex()
 {
     std::vector<PlayerbotBridge::AbilityData> const catalogue = PlayerbotBridge::Catalogue();
@@ -606,14 +577,6 @@ static OllamaBridge::AbilityIndex BridgeAbilityIndex()
         row.state = data.StatePhrase;
         row.event = data.Event;
         row.limit = data.Limit;
-    }
-    for (std::size_t value = 0; value < std::size(BridgeIntentPairs); ++value)
-    {
-        auto const operation = static_cast<PlayerbotBridge::Intent>(value);
-        char const* const word = PlayerbotBridge::IntentWord(operation);
-        if (PlayerbotBridge::FindIntent(word) != operation)
-            return {};
-        index.verbs.push_back({word, static_cast<OllamaBridge::ChannelIntent>(value)});
     }
     return index;
 }

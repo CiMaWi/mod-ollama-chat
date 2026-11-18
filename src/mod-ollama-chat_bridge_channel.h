@@ -32,8 +32,7 @@ enum class ChannelError : uint8_t
     Duplicate,
     Capacity,
     Closed,
-    Unknown,
-    Standing  // J5e: named invalid_input on the wire, with reason standing_not_supported.
+    Unknown
 };
 
 char const* ChannelErrorName(ChannelError error);
@@ -109,7 +108,7 @@ char const* StateTopicName(StateTopic topic);
 
 // LC3: the ability catalogue as plain data, mod-playerbots' one table of acts and topics (PlayerbotBridge::Catalogue)
 // with its hash. The game adapter installs it once on the world thread before the channel takes requests; a selftest
-// installs a double. Commands and bot_state queries read their verbs and topic names from it and query: catalogue
+// installs a double. Commands and bot_state queries read their acts and topic names from it and query: catalogue
 // answers with it, so the channel keeps no word list of its own.
 enum class AbilityField : uint8_t  // PlayerbotBridge::OrderField: the order field an act's parameter fills.
 {
@@ -145,7 +144,7 @@ struct AbilityRefusal
 struct AbilityRow
 {
     bool topic = false;
-    uint8_t code = 0;  // An act's playerbots Intent value (a ChannelIntent below 22), a topic's BotStateTopic value.
+    uint8_t code = 0;  // An act's playerbots Intent value, a topic's BotStateTopic value.
     std::string name;
     std::string sentence;
     std::vector<AbilityParam> params;
@@ -157,20 +156,12 @@ struct AbilityRow
     std::size_t limit = 0;
 };
 
-// A verb of the old command form: every ChannelIntent's word, the acts' and those of the four without a row.
-struct AbilityVerb
-{
-    std::string name;
-    ChannelIntent intent = ChannelIntent::Stay;
-};
-
 struct AbilityIndex
 {
     uint64_t hash = 0;             // The catalogue text's FNV-1a 64; the wire sends it as 16 lowercase hex digits.
     uint32_t version = 0;          // The catalogue text's format.
     std::size_t maxSteps = 0;      // The most steps one order takes.
     std::vector<AbilityRow> rows;  // The acts, then the topics, in the table's order.
-    std::vector<AbilityVerb> verbs;
 };
 
 // The bytes the encoded catalogue may take (the hub's MAX_CATALOGUE_BYTES); the bridge reads it whole, its answer
@@ -178,11 +169,10 @@ struct AbilityIndex
 constexpr std::size_t ChannelMaxCatalogueBytes = 49152;
 
 // Installs the index and returns the bytes its catalogue encodes to (0 when the index is refused or its text is not
-// UTF-8). An index with a missing, duplicate or unknown verb, a duplicate row word or code, an act below 22 that is not
-// its verb, one past it named like a verb, a parameter field the channel does not fill or a topic with more than one
-// parameter is refused: the channel then holds an empty index (every verb and topic unknown, no catalogue). A catalogue
-// that is not UTF-8 or over ChannelMaxCatalogueBytes drops only the catalogue answer: the verbs and topics stand, so
-// the old wire keeps working (LC.23). World thread only, once at startup.
+// UTF-8). An index with a duplicate row word, act code or topic code, a parameter field the channel does not fill or
+// a topic with more than one parameter is refused: the channel then holds an empty index (every act and topic
+// unknown, no catalogue). A catalogue that is not UTF-8 or over ChannelMaxCatalogueBytes drops only the catalogue
+// answer: the acts and topics stand (LC.23). World thread only, once at startup.
 std::size_t SetAbilityIndex(AbilityIndex index);
 AbilityIndex const& Abilities();
 bool CatalogueInstalled();  // Whether a catalogue query has an answer.
@@ -276,7 +266,7 @@ public:
     // J5e: a rejected or failed outcome carries `reason` and `reasonText` (None words as cannot_now or failed).
     // LC3: a stepped command (steps, as submitted) also carries `steps`, one entry per step: the ones that ran (ran,
     // each but the last applied) with their outcome, the others skipped. Its outcome is applied only when every step
-    // applied, and a step that ran and ended the order gives the order its reason. The old form has no `steps`.
+    // applied, and a step that ran and ended the order gives the order its reason.
     ChannelError FinishCommand(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
                                WorldScope const& current, Clock now, std::string& body,
                                CommandRefusal refusal = CommandRefusal::None, std::span<ChannelStep const> steps = {},

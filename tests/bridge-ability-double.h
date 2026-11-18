@@ -1,6 +1,6 @@
 // LC3: a double of the ability index the game adapter installs from mod-playerbots' table (handler.cpp's
-// BridgeAbilityIndex): the old wire's 22 verbs in ChannelIntent order, three acts with every part filled and the
-// fourteen topics in StateTopic order. A standalone selftest installs it before it parses a command or a topic.
+// BridgeAbilityIndex): three acts with every part filled, each keyed by its playerbots Intent value, and the fourteen
+// topics in StateTopic order. A standalone selftest installs it before it parses a command or a topic.
 #ifndef MOD_OLLAMA_CHAT_TESTS_BRIDGE_ABILITY_DOUBLE_H
 #define MOD_OLLAMA_CHAT_TESTS_BRIDGE_ABILITY_DOUBLE_H
 
@@ -15,13 +15,6 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
     index.hash = 0x0a1b2c3d4e5f6071ULL;  // A leading zero digit: the wire keeps all sixteen.
     index.version = 1;
     index.maxSteps = 3;
-    char const* const verbs[] = {"follow",     "stay",       "flee",          "regroup",     "attack_own_target",
-                                 "pull",       "mark",       "focus_healing", "assign_role", "save_mana",
-                                 "formation",  "position",   "dungeon_clear", "go_to",       "quest",
-                                 "errands",    "set_hearth", "grind_here",    "gather_here", "meet_at",
-                                 "pause_plan", "resume_plan"};
-    for (std::size_t value = 0; value < std::size(verbs); ++value)
-        index.verbs.push_back({verbs[value], static_cast<ChannelIntent>(value)});
     std::vector<AbilityRefusal> const common = {{"battleground", "You are in a battleground, where this cannot be done."},
                                                 {"travelling", "You are in flight; this cannot be done until you land."},
                                                 {"dead", "You are dead."}};
@@ -31,7 +24,7 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
         return own;
     };
     index.rows.push_back({.topic = false,
-                          .code = static_cast<uint8_t>(ChannelIntent::Follow),
+                          .code = static_cast<uint8_t>(PlayerbotBridge::Intent::Follow),
                           .name = "follow",
                           .sentence = "Follow the person you are talking to.",
                           .params = {},
@@ -43,7 +36,7 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
                           .event = "BridgeAct",
                           .limit = 0});
     index.rows.push_back({.topic = false,
-                          .code = static_cast<uint8_t>(ChannelIntent::Mark),
+                          .code = static_cast<uint8_t>(PlayerbotBridge::Intent::Mark),
                           .name = "mark",
                           .sentence = "Put a raid icon on a unit you can see.",
                           .params = {{"target", "unit", "The unit to mark, by name.", {}, AbilityField::Target},
@@ -60,7 +53,7 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
                           .event = "BridgeAct",
                           .limit = 0});
     index.rows.push_back({.topic = false,
-                          .code = static_cast<uint8_t>(ChannelIntent::GoTo),
+                          .code = static_cast<uint8_t>(PlayerbotBridge::Intent::GoTo),
                           .name = "go_to",
                           .sentence = "Travel to a place you know.",
                           .params = {{"place", "place", "A known place's name.", {}, AbilityField::PlaceName}},
@@ -106,7 +99,7 @@ inline OllamaBridge::AbilityIndex TestStepAbilityIndex()
 {
     using namespace OllamaBridge;
     auto index = TestAbilityIndex();
-    auto const act = [](ChannelIntent intent, char const* name, std::vector<AbilityParam> params)
+    auto const act = [](PlayerbotBridge::Intent intent, char const* name, std::vector<AbilityParam> params)
     {
         return AbilityRow{.topic = false,
                           .code = static_cast<uint8_t>(intent),
@@ -121,24 +114,27 @@ inline OllamaBridge::AbilityIndex TestStepAbilityIndex()
                           .limit = 0};
     };
     AbilityRow const acts[] = {
-        act(ChannelIntent::Stay, "stay", {}),
-        act(ChannelIntent::Quest, "quest", {{"quest", "quest", "The quest, by its title.", {}, AbilityField::QuestId}}),
-        act(ChannelIntent::Position, "position", {{"place", "place", "Where to stand.", {}, AbilityField::Position}}),
-        act(ChannelIntent::Formation, "formation",
+        act(PlayerbotBridge::Intent::Stay, "stay", {}),
+        act(PlayerbotBridge::Intent::Quest, "quest",
+            {{"quest", "quest", "The quest, by its title.", {}, AbilityField::QuestId}}),
+        act(PlayerbotBridge::Intent::Position, "position",
+            {{"place", "place", "Where to stand.", {}, AbilityField::Position}}),
+        act(PlayerbotBridge::Intent::Formation, "formation",
             {{"shape", "choice", "The formation.", {"close", "spread", "line"}, AbilityField::Shape}}),
-        act(ChannelIntent::SaveMana, "save_mana", {{"enabled", "flag", "On or off.", {}, AbilityField::Enabled}}),
-        act(ChannelIntent::FocusHealing, "focus_healing",
+        act(PlayerbotBridge::Intent::SaveMana, "save_mana",
+            {{"enabled", "flag", "On or off.", {}, AbilityField::Enabled}}),
+        act(PlayerbotBridge::Intent::FocusHealing, "focus_healing",
             {{"target", "unit", "Whom to heal first.", {}, AbilityField::Target}}),
-        act(ChannelIntent::AttackOwnTarget, "attack_own_target",
+        act(PlayerbotBridge::Intent::AttackOwnTarget, "attack_own_target",
             {{"target", "unit", "What to attack.", {}, AbilityField::Target}}),
     };
     index.rows.insert(index.rows.begin() + 3, std::begin(acts), std::end(acts));
     return index;
 }
 
-// LC16c: the double with one act and one topic the old form lacks, as a row playerbots appends: cast_on (Intent value
-// 22, after go_to at row 3) takes an item, a spell, a count and a choice; deeds_of (BotStateTopic 14, the last row)
-// takes a unit by name and answers in lines. The module has no verb, enum value or switch case for either.
+// LC16c: the double with one act and one topic the module has no code for, as a row playerbots appends: cast_on
+// (code 22, after go_to at row 3) takes an item, a spell, a count and a choice; deeds_of (BotStateTopic 14, the last
+// row) takes a unit by name and answers in lines. The module has no verb, enum value or switch case for either.
 constexpr uint8_t TestOpenAct = 22;
 constexpr uint8_t TestOpenTopic = 14;
 

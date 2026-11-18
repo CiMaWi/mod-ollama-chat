@@ -53,20 +53,22 @@ bool Apply(Ledger& ledger, PlanKey const& key, int before, int applied, int64_t 
 
 void Mapping()
 {
-    Check(PlanKindFor(ChannelIntent::Follow) == PlanKind::Movement, "follow is a movement plan");
-    Check(PlanKindFor(ChannelIntent::Stay) == PlanKind::Movement, "stay shares the movement plan");
-    Check(PlanKindFor(ChannelIntent::Formation) == PlanKind::Formation, "formation plan");
-    Check(PlanKindFor(ChannelIntent::SaveMana) == PlanKind::SaveMana, "save mana plan");
-    Check(PlanKindFor(ChannelIntent::FocusHealing) == PlanKind::FocusHealing, "focus healing plan");
-    for (ChannelIntent intent :
-         {ChannelIntent::Flee, ChannelIntent::Regroup, ChannelIntent::AttackOwnTarget, ChannelIntent::Mark,
-          ChannelIntent::Pull, ChannelIntent::AssignRole, ChannelIntent::Position, ChannelIntent::DungeonClear})
+    Check(PlanKindFor(PlayerbotBridge::Intent::Follow) == PlanKind::Movement, "follow is a movement plan");
+    Check(PlanKindFor(PlayerbotBridge::Intent::Stay) == PlanKind::Movement, "stay shares the movement plan");
+    Check(PlanKindFor(PlayerbotBridge::Intent::Formation) == PlanKind::Formation, "formation plan");
+    Check(PlanKindFor(PlayerbotBridge::Intent::SaveMana) == PlanKind::SaveMana, "save mana plan");
+    Check(PlanKindFor(PlayerbotBridge::Intent::FocusHealing) == PlanKind::FocusHealing, "focus healing plan");
+    for (PlayerbotBridge::Intent intent :
+         {PlayerbotBridge::Intent::Flee, PlayerbotBridge::Intent::Regroup, PlayerbotBridge::Intent::AttackOwnTarget,
+          PlayerbotBridge::Intent::Mark, PlayerbotBridge::Intent::Pull, PlayerbotBridge::Intent::AssignRole,
+          PlayerbotBridge::Intent::Position, PlayerbotBridge::Intent::DungeonClear})
         Check(!PlanKindFor(intent), "one-shot verbs (marks included) and refused verbs have no plan");
-    for (ChannelIntent intent : {ChannelIntent::GoTo, ChannelIntent::Quest, ChannelIntent::Errands,
-                                 ChannelIntent::SetHearth, ChannelIntent::GrindHere, ChannelIntent::GatherHere,
-                                 ChannelIntent::MeetAt, ChannelIntent::PausePlan, ChannelIntent::ResumePlan})
+    for (PlayerbotBridge::Intent intent :
+         {PlayerbotBridge::Intent::GoTo, PlayerbotBridge::Intent::Quest, PlayerbotBridge::Intent::Errands,
+          PlayerbotBridge::Intent::SetHearth, PlayerbotBridge::Intent::GrindHere, PlayerbotBridge::Intent::GatherHere,
+          PlayerbotBridge::Intent::MeetAt, PlayerbotBridge::Intent::PausePlan, PlayerbotBridge::Intent::ResumePlan})
         Check(!PlanKindFor(intent), "WT18b: a goal verb has no plan (the planner carries it out)");
-    Check(!PlanKindFor(static_cast<ChannelIntent>(200)), "an unknown verb has no plan");
+    Check(!PlanKindFor(static_cast<PlayerbotBridge::Intent>(200)), "an unknown verb has no plan");
 }
 
 void Refusal()
@@ -307,14 +309,14 @@ void RepeatedApplication()
     Ledger ledger;
     ledger.Open(Generation);
     Check(ledger.Admit(Key(PlanKind::Movement), Owner(), Start) == PlanAdmission::Capture, "first follow captures");
-    Check(Apply(ledger, Key(*PlanKindFor(ChannelIntent::Follow)), 10, 11, Start), "apply follow");
+    Check(Apply(ledger, Key(*PlanKindFor(PlayerbotBridge::Intent::Follow)), 10, 11, Start), "apply follow");
     Check(ledger.Admit(Key(PlanKind::Movement), Owner(), Start + 1) == PlanAdmission::Renew, "stay renews movement");
     int last = 11;
     for (int i = 0; i < 20; ++i)
     {
         // Each repeat starts from what the bridge set last: nobody changed the bot in between.
-        Check(Apply(ledger, Key(*PlanKindFor(i % 2 ? ChannelIntent::Follow : ChannelIntent::Stay)), last, 20 + i,
-                    Start + 1 + i),
+        Check(Apply(ledger, Key(*PlanKindFor(i % 2 ? PlayerbotBridge::Intent::Follow : PlayerbotBridge::Intent::Stay)),
+                    last, 20 + i, Start + 1 + i),
               "repeat follow and stay");
         last = 20 + i;
     }

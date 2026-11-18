@@ -27,18 +27,9 @@ public:
     EffectResult Execute(EffectPhase const& phase, WorldTicket const& ticket, DispatchGuard const& guard,
                          ChannelCommand const& command, std::function<bool()> const& authorize) override
     {
-        // Release gate (open since J6b4): closed, it refuses before any game read, authorization or playerbots call.
         _refusal = CommandRefusal::None;
         _steps.clear();
-        if constexpr (!kBridgeEffectsReleased)
-        {
-            _refusal = CommandRefusal::NotSupported;
-            return EffectResult::Rejected;
-        }
-        else if (!command.steps.empty())
-            return Stepped(phase, ticket, guard, command, authorize, _refusal, _steps);
-        else
-            return Effect(phase, ticket, guard, command, authorize, _refusal);
+        return Stepped(phase, ticket, guard, command, authorize, _refusal, _steps);
     }
 
     CommandRefusal Refusal() const override { return _refusal; }
@@ -106,22 +97,6 @@ private:
         return partner && groupGuid && GroupGuid(partner) == groupGuid;
     }
 
-    static PlayerbotBridge::FormationShape Shape(std::optional<ChannelShape> shape)
-    {
-        if (!shape)
-            return PlayerbotBridge::FormationShape::None;
-        switch (*shape)
-        {
-            case ChannelShape::Close:
-                return PlayerbotBridge::FormationShape::Close;
-            case ChannelShape::Spread:
-                return PlayerbotBridge::FormationShape::Spread;
-            case ChannelShape::Line:
-                return PlayerbotBridge::FormationShape::Line;
-        }
-        return PlayerbotBridge::FormationShape::None;  // Playerbots refuses a formation without a shape.
-    }
-
     // DS.14: playerbots' reason for a Rejected order, in the bot's own words. None (no reason given) is worded
     // cannot_now by the channel.
     static CommandRefusal OrderRefusal(PlayerbotBridge::Refusal reason)
@@ -170,188 +145,8 @@ private:
         return CommandRefusal::None;
     }
 
-    // J5e: `why` receives the reason of every refusal; the channel words a Rejected without one as cannot_now.
-    static EffectResult Effect(EffectPhase const& phase, WorldTicket const& ticket, DispatchGuard const& guard,
-                               ChannelCommand const& command, std::function<bool()> const& authorize,
-                               CommandRefusal& why)
-    {
-        // No game read off the joined world thread or for a verb without an accepted effect.
-        if (!EffectSupported(command.intent) || !phase.join.Current())
-        {
-            why = EffectSupported(command.intent) ? CommandRefusal::Unavailable : CommandRefusal::NotSupported;
-            return EffectResult::Rejected;
-        }
-        // Bot and partner come from the registered scope, never from the wire; Receive matched the issuer. DS.14: the
-        // partner needs only to be online here; playerbots checks what each verb needs of it (follow: the bot's map).
-        Player* bot = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.botGuid));
-        Player* partner = ObjectAccessor::FindConnectedPlayer(ObjectGuid(ticket.scope.controllerGuid));
-        if (!bot || !bot->IsInWorld() || !partner)
-        {
-            why = CommandRefusal::Unavailable;
-            return EffectResult::Rejected;
-        }
-
-        IntentContext facts;
-        facts.controllerGuid = ticket.scope.controllerGuid;
-        facts.botGuid = ticket.scope.botGuid;
-        facts.expectedGroupGuid = guard.groupGuid;
-        facts.controllerGroupGuid = GroupGuid(partner);
-        facts.botGroupGuid = GroupGuid(bot);
-        if (command.intent == ChannelIntent::AttackOwnTarget)
-            facts.ownTargetGuid = bot->GetTarget().GetRawValue();
-        // A position becomes a fact only where playerbots finds a short complete path from the bot to a spot near it
-        // (one read-only path query; the partner plays no part). MapIntent then requires the wire position to equal it
-        // exactly, and playerbots checks it again after authorization.
-        if (auto const* candidate =
-                command.intent == ChannelIntent::Position ? std::get_if<ChannelPosition>(&command.params) : nullptr)
-        {
-            PlayerbotBridge::Order probe;
-            probe.Operation = PlayerbotBridge::Intent::Position;
-            probe.Bot = ticket.scope.botGuid;
-            probe.Controller = ticket.scope.controllerGuid;
-            probe.MapId = candidate->mapId;
-            probe.X = candidate->x;
-            probe.Y = candidate->y;
-            probe.Z = candidate->z;
-            if (PlayerbotBridge::PositionReachable(phase.join, probe))
-                facts.pathableNearbyPosition = *candidate;
-        }
-        if (uint64_t const candidate = EffectTargetGuid(command, facts.ownTargetGuid))
-        {
-            // DS.14: the bot acts on its own perception; the partner need not see the target. LCB1e: what the bot
-            // perceives is the game's one rule (playerbots checks it when the act runs), so any unit it resolves counts.
-            if (ObjectAccessor::GetUnit(*bot, ObjectGuid(candidate)))
-                facts.eligibleVisibleTargetGuid = candidate;
-        }
-        auto const effect = BuildEffectOrder(command, facts, &why);
-        if (!effect)
-            return EffectResult::Rejected;
-
-        PlayerbotBridge::Order order;
-        switch (effect->intent)
-        {
-            case ChannelIntent::AttackOwnTarget:
-                order.Operation = PlayerbotBridge::Intent::AttackOwnTarget;
-                break;
-            case ChannelIntent::Mark:
-                order.Operation = PlayerbotBridge::Intent::Mark;
-                break;
-            case ChannelIntent::Follow:
-                order.Operation = PlayerbotBridge::Intent::Follow;
-                break;
-            case ChannelIntent::Stay:
-                order.Operation = PlayerbotBridge::Intent::Stay;
-                break;
-            case ChannelIntent::Flee:  // Flees from the bot's own current target, resolved by playerbots.
-                order.Operation = PlayerbotBridge::Intent::Flee;
-                break;
-            case ChannelIntent::Position:
-                order.Operation = PlayerbotBridge::Intent::Position;
-                break;
-            case ChannelIntent::Formation:
-                order.Operation = PlayerbotBridge::Intent::Formation;
-                order.Shape = Shape(effect->shape);
-                break;
-            case ChannelIntent::SaveMana:
-                order.Operation = PlayerbotBridge::Intent::SaveMana;
-                order.Enabled = effect->enabled;
-                break;
-            case ChannelIntent::FocusHealing:
-                order.Operation = PlayerbotBridge::Intent::FocusHealing;
-                break;
-            case ChannelIntent::GoTo:  // WT18b: the goal verbs; the planner checks the place, quest or spot.
-                order.Operation = PlayerbotBridge::Intent::GoTo;
-                order.PlaceName = effect->place;
-                break;
-            case ChannelIntent::Quest:
-                order.Operation = PlayerbotBridge::Intent::Quest;
-                order.QuestId = effect->questId;
-                break;
-            case ChannelIntent::Errands:
-                order.Operation = PlayerbotBridge::Intent::Errands;
-                break;
-            case ChannelIntent::SetHearth:
-                order.Operation = PlayerbotBridge::Intent::SetHearth;
-                break;
-            case ChannelIntent::GrindHere:
-                order.Operation = PlayerbotBridge::Intent::GrindHere;
-                break;
-            case ChannelIntent::GatherHere:
-                order.Operation = PlayerbotBridge::Intent::GatherHere;
-                break;
-            case ChannelIntent::MeetAt:
-                order.Operation = PlayerbotBridge::Intent::MeetAt;
-                order.PlaceName = effect->place;
-                break;
-            case ChannelIntent::PausePlan:
-                order.Operation = PlayerbotBridge::Intent::PausePlan;
-                break;
-            case ChannelIntent::ResumePlan:
-                order.Operation = PlayerbotBridge::Intent::ResumePlan;
-                break;
-            default:
-                why = CommandRefusal::NotSupported;
-                return EffectResult::Rejected;  // An unmapped verb never reaches playerbots.
-        }
-        order.Bot = effect->botGuid;
-        order.Controller = effect->controllerGuid;
-        order.Group = effect->groupGuid;
-        order.Target = effect->targetGuid;
-        order.Icon = effect->icon;
-        order.MapId = effect->position.mapId;
-        order.X = effect->position.x;
-        order.Y = effect->position.y;
-        order.Z = effect->position.z;
-        // J12: a lasting verb needs the ledger's admission and the bot's current state of that part before every
-        // attempt, a repeat too (the ledger compares it with its last applied value to see a person's change); no
-        // admission or no capture, no mutation. One clock reading serves admission and record.
-        auto const kind = PlanKindFor(effect->intent);
-        PlanKey const key{effect->botGuid, kind.value_or(PlanKind::Count)};
-        PlanOwner const owner{effect->groupGuid, effect->controllerGuid, ticket.generation,
-                              IntentNeedsPartnerInGroup(effect->intent)};
-        int64_t const nowMs = Now().steadyMs;
-        PlayerbotBridge::Baseline before;
-        if (kind && Plans().Admit(key, owner, nowMs) == PlanAdmission::Refused)
-        {
-            why = CommandRefusal::Busy;
-            return EffectResult::Rejected;
-        }
-        if (kind && !PlayerbotBridge::Capture(phase.join, effect->botGuid,
-                                              PlayerbotBridge::LastingPart(order.Operation), before))
-        {
-            why = CommandRefusal::CannotNow;
-            return EffectResult::Rejected;
-        }
-        PlayerbotBridge::Refusal refusal = PlayerbotBridge::Refusal::None;
-        auto const outcome = PlayerbotBridge::Execute(phase.join, order, authorize, &refusal);
-        // After every attempt that may have written (Applied, or Failed after partial writes), the state now is what
-        // the bridge set; Rejected and Unavailable promise no mutation and record nothing. An attempt left unrecorded
-        // (the bot left the world inside the call, or the ledger refused; neither can happen today) has no restore,
-        // so it is counted for the watchlist line.
-        if (kind && (outcome == PlayerbotBridge::Result::Applied || outcome == PlayerbotBridge::Result::Failed))
-        {
-            PlayerbotBridge::Baseline applied;
-            if (!PlayerbotBridge::Capture(phase.join, effect->botGuid, before.Held, applied) ||
-                !Plans().Record(key, owner, before, applied, nowMs))
-                Plans().NoteUnrecorded();
-        }
-        switch (outcome)
-        {
-            case PlayerbotBridge::Result::Rejected:
-                why = OrderRefusal(refusal);
-                return EffectResult::Rejected;
-            case PlayerbotBridge::Result::Unavailable:
-                return EffectResult::Unavailable;
-            case PlayerbotBridge::Result::Applied:
-                return EffectResult::Applied;
-            case PlayerbotBridge::Result::Failed:
-                break;
-        }
-        return EffectResult::Failed;  // Failed or unknown after a possible attempt: never applied, never replayed.
-    }
-
     // LC3: a step's outcome in the words of playerbots' table (the catalogue's); a refusal without a reason, an
-    // unavailable verb and a failure in the module's (DescribeRefusal), as the old form words them.
+    // unavailable verb and a failure in the module's (DescribeRefusal).
     static ChannelStepResult StepResult(PlayerbotBridge::StepOutcome const& step)
     {
         auto const module = [](ChannelOutcome outcome, CommandRefusal refusal)
@@ -378,7 +173,7 @@ private:
 
     // LC3: a stepped command as one playerbots order of its steps: one Execute and so one authorize, with playerbots'
     // gate on every step (the group, a named or given unit or quest seen or held, the row's check; a position's path).
-    // The module's MapIntent facts are not read again here. It keeps the scope (authorize), the captured group and the
+    // The module keeps the scope (authorize), the captured group and the
     // plan ledger: every lasting step is admitted and its part captured before Execute, and each one that ran and may
     // have written is recorded after it. Two steps of one lasting part are refused before anything runs: the second's
     // baseline would be the first one's work. `ran` receives one worded entry per step that ran.
@@ -412,8 +207,7 @@ private:
         {
             ChannelStep const& step = command.steps[index];
             PlayerbotBridge::Order order;
-            // The row's playerbots Intent value (handler.cpp asserts the 22 old verbs' values are equal).
-            order.Operation = static_cast<PlayerbotBridge::Intent>(step.intent);
+            order.Operation = step.intent;  // The row's playerbots Intent value.
             order.Bot = ticket.scope.botGuid;
             order.Controller = ticket.scope.controllerGuid;
             order.Group = guard.groupGuid;

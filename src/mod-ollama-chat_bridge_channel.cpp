@@ -117,12 +117,6 @@ InstalledAbilities& Installed()
     return installed;
 }
 
-// J5e: a standing follow/stay shape (any params) is refused with its own reason, still invalid_input on the wire.
-struct StandingShape : std::runtime_error
-{
-    StandingShape() : std::runtime_error("standing") {}
-};
-
 // LC3: a choice parameter's value, one of the act's choice words, as its index.
 uint8_t Choice(Json const& value, AbilityParam const& param)
 {
@@ -156,8 +150,8 @@ ChannelPosition Spot(Json const& value)
 // LC3: the steps of a stepped command, 1..maxSteps acts of the installed catalogue. Each is {act, params} with exactly
 // the act's parameters by their catalogue names: a unit as `name` (its name) or `nameGuid`, a quest as `name` (its
 // title) or `nameId`, exactly one of the two; names and places have Place's text rules. LC16c: an item or a spell as
-// its name (Place's rules), a choice as one of its words, a count 1..ChannelMaxCount. A topic, a verb without a row
-// and an unknown word are no act; an act the old form lacks is a row like any other.
+// its name (Place's rules), a choice as one of its words, a count 1..ChannelMaxCount. A topic and an unknown word are
+// no act.
 std::vector<ChannelStep> Steps(Json const& value)
 {
     auto const& index = Installed().index;
@@ -175,7 +169,7 @@ std::vector<ChannelStep> Steps(Json const& value)
             throw std::runtime_error("invalid");
         auto const& params = entry.at("params");
         ChannelStep step;
-        step.intent = static_cast<ChannelIntent>(row->code);
+        step.intent = static_cast<PlayerbotBridge::Intent>(row->code);
         for (auto const& param : row->params)
         {
             std::string const id = param.field == AbilityField::Target    ? param.name + "Guid"
@@ -240,12 +234,10 @@ std::vector<ChannelStep> Steps(Json const& value)
 
 ChannelCommand Command(Json const& body)
 {
-    // LC3: a stepped command carries `steps` in place of `intent` and `params`; both forms at once is neither.
-    bool const stepped = body.contains("steps");
-    if (stepped ? !Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
-                                "commandId", "issuerGuid", "botGuid", "steps"})
-                : !Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
-                                "commandId", "issuerGuid", "botGuid", "intent", "params"}))
+    // LCB2: one command form, its acts as `steps`; a body with any other key (the old `intent` and `params`) is
+    // invalid.
+    if (!Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type", "commandId",
+                      "issuerGuid", "botGuid", "steps"}))
         throw std::runtime_error("invalid");
     ChannelCommand command;
     command.commandId = String(body.at("commandId"));
@@ -253,120 +245,7 @@ ChannelCommand Command(Json const& body)
     command.botGuid = Guid(body.at("botGuid"));
     if (!Identifier(command.commandId))
         throw std::runtime_error("invalid");
-    if (stepped)
-    {
-        command.steps = Steps(body.at("steps"));
-        return command;
-    }
-    auto const intent = String(body.at("intent"));
-    auto const& params = body.at("params");
-    // LC3: the verbs are playerbots' (the installed index), the acts' and the four without a row (refused later).
-    auto const& verbs = Installed().index.verbs;
-    auto const found =
-        std::find_if(verbs.begin(), verbs.end(), [&](AbilityVerb const& verb) { return intent == verb.name; });
-    if (found == verbs.end())
-        throw std::runtime_error("invalid");
-    command.intent = found->intent;
-    switch (command.intent)
-    {
-        case ChannelIntent::Follow:
-        case ChannelIntent::Stay:
-            // J5e: params with keys (a standing or timed shape) name their reason; any other shape stays invalid.
-            if (!Exact(params, {}))
-            {
-                if (params.is_object())
-                    throw StandingShape();
-                throw std::runtime_error("invalid");
-            }
-            break;
-        case ChannelIntent::Flee:
-        case ChannelIntent::Regroup:
-        case ChannelIntent::AttackOwnTarget:
-        case ChannelIntent::Errands:
-        case ChannelIntent::SetHearth:
-        case ChannelIntent::GrindHere:
-        case ChannelIntent::GatherHere:
-        case ChannelIntent::PausePlan:
-        case ChannelIntent::ResumePlan:
-            if (!Exact(params, {}))
-                throw std::runtime_error("invalid");
-            break;
-        case ChannelIntent::GoTo:  // WT18b: the planner looks the place up and refuses an unknown one.
-        case ChannelIntent::MeetAt:
-            if (!Exact(params, {"place"}))
-                throw std::runtime_error("invalid");
-            command.params = ChannelPlace{Place(params.at("place"))};
-            break;
-        case ChannelIntent::Quest:  // WT18b: a quest id; zero is refused by ValidIntentParams.
-            if (!Exact(params, {"questId"}))
-                throw std::runtime_error("invalid");
-            command.params = ChannelQuestId{static_cast<uint32_t>(Integer(params.at("questId"), UINT32_MAX))};
-            break;
-        case ChannelIntent::Pull:
-        case ChannelIntent::FocusHealing:
-            if (!Exact(params, {"targetGuid"}))
-                throw std::runtime_error("invalid");
-            command.params = ChannelTarget{Guid(params.at("targetGuid"))};
-            break;
-        case ChannelIntent::Mark:
-            if (!Exact(params, {"targetGuid", "icon"}))
-                throw std::runtime_error("invalid");
-            command.params =
-                ChannelMark{Guid(params.at("targetGuid")), static_cast<uint8_t>(Integer(params.at("icon"), 7))};
-            break;
-        case ChannelIntent::AssignRole:
-        {
-            if (!Exact(params, {"role"}))
-                throw std::runtime_error("invalid");
-            auto const role = String(params.at("role"));
-            if (role != "tank" && role != "healer" && role != "damage")
-                throw std::runtime_error("invalid");
-            command.params = role == "tank"     ? ChannelRole::Tank
-                             : role == "healer" ? ChannelRole::Healer
-                                                : ChannelRole::Damage;
-            break;
-        }
-        case ChannelIntent::SaveMana:
-            if (!Exact(params, {"enabled"}) || !params.at("enabled").is_boolean())
-                throw std::runtime_error("invalid");
-            command.params = params.at("enabled").get<bool>();
-            break;
-        case ChannelIntent::Formation:
-        {
-            if (!Exact(params, {"shape"}))
-                throw std::runtime_error("invalid");
-            auto const shape = String(params.at("shape"));
-            if (shape != "close" && shape != "spread" && shape != "line")
-                throw std::runtime_error("invalid");
-            command.params = shape == "close"    ? ChannelShape::Close
-                             : shape == "spread" ? ChannelShape::Spread
-                                                 : ChannelShape::Line;
-            break;
-        }
-        case ChannelIntent::Position:
-        {
-            if (!Exact(params, {"x", "y", "z", "mapId"}) || !params.at("x").is_number() ||
-                !params.at("y").is_number() || !params.at("z").is_number())
-                throw std::runtime_error("invalid");
-            ChannelPosition position{params.at("x").get<double>(), params.at("y").get<double>(),
-                                     params.at("z").get<double>(),
-                                     static_cast<uint32_t>(Integer(params.at("mapId"), UINT32_MAX))};
-            command.params = position;
-            break;
-        }
-        case ChannelIntent::DungeonClear:
-        {
-            if (!Exact(params, {"mode"}))
-                throw std::runtime_error("invalid");
-            auto const mode = String(params.at("mode"));
-            if (mode != "on" && mode != "off" && mode != "pause")
-                throw std::runtime_error("invalid");
-            command.params = mode == "on" ? ChannelMode::On : mode == "off" ? ChannelMode::Off : ChannelMode::Pause;
-            break;
-        }
-    }
-    if (!ValidIntentParams(command.intent, command.params))
-        throw std::runtime_error("invalid");
+    command.steps = Steps(body.at("steps"));
     return command;
 }
 
@@ -640,36 +519,23 @@ Json CatalogueJson(AbilityIndex const& index)
 
 static_assert(ChannelMaxCatalogueBytes + 4096 < MaxCatalogueResponseBytes, "the catalogue answer's envelope fits");
 
-// Every ChannelIntent one verb of its own; every row a word of its own. LC16c: an act's code is its playerbots Intent
-// value, one act each: one below the 22 is its verb (the same word), one past them no verb's word, and each parameter
+// Every row a word of its own. LC16c: an act's code is its playerbots Intent value, one act each, and each parameter
 // fills a field the channel knows. A topic's code is its BotStateTopic value, one topic each, with at most one
 // parameter (its argument).
 bool ValidIndex(AbilityIndex const& index)
 {
-    constexpr std::size_t intents = ChannelIntentCount;
-    if (!index.version || !index.maxSteps || index.rows.empty() || index.verbs.size() != intents)
+    if (!index.version || !index.maxSteps || index.rows.empty())
         return false;
-    std::set<std::string> verbs;
-    std::set<ChannelIntent> taken;
-    for (auto const& verb : index.verbs)
-        if (!Word(verb.name) || static_cast<std::size_t>(verb.intent) >= intents || !verbs.insert(verb.name).second ||
-            !taken.insert(verb.intent).second)
-            return false;
     std::set<std::string> names;
     std::set<uint8_t> acts;
     std::set<uint8_t> topics;
     for (auto const& row : index.rows)
     {
-        auto const verb = std::find_if(index.verbs.begin(), index.verbs.end(),
-                                       [&row](AbilityVerb const& entry) { return entry.name == row.name; });
-        bool const own = row.code < intents
-                             ? verb != index.verbs.end() && static_cast<uint8_t>(verb->intent) == row.code
-                             : verb == index.verbs.end();
         bool const fields = std::all_of(row.params.begin(), row.params.end(),
                                         [](AbilityParam const& param) { return param.field <= AbilityField::Count; });
         if (!Word(row.name) || !names.insert(row.name).second ||
             (row.topic ? row.params.size() > 1 || !topics.insert(row.code).second
-                       : !own || !fields || !acts.insert(row.code).second))
+                       : !fields || !acts.insert(row.code).second))
             return false;
     }
     return true;
@@ -682,7 +548,7 @@ std::size_t SetAbilityIndex(AbilityIndex index)
     installed = {};
     if (!ValidIndex(index))
         return 0;
-    // Only the catalogue query needs the encoded answer: one it cannot send leaves the verbs and topics standing.
+    // Only the catalogue query needs the encoded answer: one it cannot send leaves the acts and topics standing.
     std::size_t bytes = 0;
     Json catalogue;
     try
@@ -735,8 +601,6 @@ char const* ChannelErrorName(ChannelError error)
             return "closed";
         case ChannelError::Unknown:
             return "unknown_request";
-        case ChannelError::Standing:
-            return "invalid_input";
     }
     return "invalid_input";
 }
@@ -1084,10 +948,6 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
         message = {std::move(envelope), std::move(payload)};
         return ChannelError::None;
     }
-    catch (StandingShape const&)
-    {
-        return ChannelError::Standing;
-    }
     catch (std::exception const&)
     {
         return ChannelError::Invalid;
@@ -1270,7 +1130,7 @@ ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::
     {
         return value == ChannelOutcome::Applied ? "applied" : value == ChannelOutcome::Rejected ? "rejected" : "failed";
     };
-    // A step's reason as the executor worded it; one it left unworded reads as the old form's cannot_now or failed.
+    // A step's reason as the executor worded it; one it left unworded reads as cannot_now or failed.
     auto const reason = [](Json& json, ChannelStepResult const& step)
     {
         auto const words = DescribeRefusal(step.outcome == ChannelOutcome::Failed ? CommandRefusal::Failed
@@ -1294,7 +1154,7 @@ ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::
     if (!steps.empty())
     {
         Json list = Json::array();
-        auto const& rows = Installed().index.rows;  // LC16c: the act's row, an act the old form lacks included.
+        auto const& rows = Installed().index.rows;  // LC16c: the act's row.
         for (std::size_t index = 0; index < steps.size(); ++index)
         {
             auto const code = static_cast<uint8_t>(steps[index].intent);
