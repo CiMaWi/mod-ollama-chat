@@ -264,7 +264,29 @@ void StateChecks()
     Check(StateWire(state)["movement"] == "passive", "state: passive");
     state.passive = false;
     Check(StateWire(state)["movement"] == "none", "state: no movement strategy");
-    Check(!StateWire(state).contains("plans"), "state: no plans key (LC.36: the module keeps no plans)");
+    // LCB7b (LC.36): each lasting setting in force is named while it holds, in the hub's plan order, and is gone once
+    // the bot reverts it; follow and stay stay movement.
+    Check(!StateWire(state).contains("plans"), "state: no plans key without a lasting setting in force");
+    using Setting = bool PlayerbotBridge::BotStateFacts::*;
+    for (auto const& [setting, word] : std::initializer_list<std::pair<Setting, char const*>>{
+             {&PlayerbotBridge::BotStateFacts::formation, "formation"},
+             {&PlayerbotBridge::BotStateFacts::saveMana, "save_mana"},
+             {&PlayerbotBridge::BotStateFacts::focusHeal, "focus_healing"}})
+    {
+        state.*setting = true;
+        Check(StateWire(state)["plans"] == nlohmann::json::array({word}),
+              "state: a lasting setting named while it holds");
+        state.*setting = false;
+        Check(!StateWire(state).contains("plans"), "state: a reverted lasting setting is gone");
+    }
+    state.formation = state.saveMana = state.focusHeal = state.stay = true;
+    Check(StateWire(state)["plans"] == nlohmann::json::array({"formation", "save_mana", "focus_healing"}) &&
+              StateWire(state)["movement"] == "stay",
+          "state: every lasting setting in the plan order; stay stays movement");
+    state.saveMana = false;
+    Check(StateWire(state)["plans"] == nlohmann::json::array({"formation", "focus_healing"}),
+          "state: reverting one setting leaves the others named");
+    state.formation = state.focusHeal = state.stay = false;
     for (auto const& [type, kind] : std::initializer_list<std::pair<uint8_t, char const*>>{
              {0, "mana"}, {1, "rage"}, {2, "focus"}, {3, "energy"}, {6, "runic"}})
     {

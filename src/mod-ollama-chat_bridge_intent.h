@@ -71,7 +71,6 @@ enum class CommandRefusal : uint8_t
     NoTarget,
     TargetNotVisible,
     Unreachable,
-    Busy,
     NotFighting,  // J6e-c watch refusals.
     NotBusy,
     WaitTooShort,
@@ -123,8 +122,6 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
             return {"target_not_visible", BridgeTexts::Refusals::TARGET_NOT_VISIBLE};
         case CommandRefusal::Unreachable:
             return {"unreachable", BridgeTexts::Refusals::UNREACHABLE};
-        case CommandRefusal::Busy:
-            return {"busy", BridgeTexts::Refusals::BUSY};
         case CommandRefusal::NotFighting:
             return {"not_fighting", BridgeTexts::Refusals::NOT_FIGHTING};
         case CommandRefusal::NotBusy:

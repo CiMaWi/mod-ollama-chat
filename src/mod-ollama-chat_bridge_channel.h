@@ -149,7 +149,7 @@ struct AbilityRow
     std::string sentence;
     std::vector<AbilityParam> params;
     std::vector<AbilityRefusal> refusals;
-    std::string effect;  // The word of the lasting part the act changes.
+    std::string effect;  // PlayerbotBridge::EffectWord: the bridge keeps no part an act changes (LC.36).
     std::string done;    // The word of when it is done.
     std::string state;
     std::string event;

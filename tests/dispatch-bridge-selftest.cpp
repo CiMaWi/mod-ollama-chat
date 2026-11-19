@@ -397,7 +397,6 @@ std::vector<AbilityData> Catalogue() { return {}; }
 uint64_t CatalogueHash(std::vector<AbilityData> const&) { return 0; }
 char const* KindWord(AbilityKind) { return ""; }
 char const* KindWord(ParamKind) { return ""; }
-char const* PartWord(Part) { return ""; }
 char const* CompletionWord(Completion) { return ""; }
 PostMapJoin::PostMapJoin() : _thread(std::this_thread::get_id()) {}
 }  // namespace PlayerbotBridge

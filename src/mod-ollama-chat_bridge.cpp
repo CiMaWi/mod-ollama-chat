@@ -231,7 +231,7 @@ void PutOpenKeys(nlohmann::json& json, std::vector<PlayerbotBridge::StateKey> co
 }
 
 constexpr std::string_view AroundKeys[] = {"name", "kind", "detail", "count"};
-// "plans" is no longer written (LC.36) but stays reserved while the hub's envelope still reads it (LC.23).
+// "plans" names the lasting settings in force, read from the bot (LCB7b; the module keeps no plans, LC.36).
 constexpr std::string_view StateKeys[] = {"health",  "power",   "level",    "alive", "combat",   "activity", "where",
                                           "partner", "mounted", "swimming", "group", "movement", "plans",    "bags",
                                           "money",   "around",  "servant",  "mount", "deeds"};
@@ -385,6 +385,17 @@ nlohmann::json StateJson(PlayerbotBridge::BotStateFacts const& state)
         json["group"] = std::move(group);
     }
     json["movement"] = StateMovement(state);
+    // LC.36: a bot can revert only what it sees, so each lasting setting in force is named while it holds, in the
+    // hub's plan order (envelope.mjs PLAN_KINDS); follow and stay are the movement above.
+    nlohmann::json plans = nlohmann::json::array();
+    if (state.formation)
+        plans.push_back("formation");
+    if (state.saveMana)
+        plans.push_back("save_mana");
+    if (state.focusHeal)
+        plans.push_back("focus_healing");
+    if (!plans.empty())
+        json["plans"] = std::move(plans);
     json["bags"] = std::min<uint32_t>(state.freeBagSlots, 255);
     json["money"] = state.money;
     if (nlohmann::json around = AroundJson(state.around); !around.empty())

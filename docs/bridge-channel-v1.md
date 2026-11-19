@@ -79,7 +79,7 @@ like every query. Its result is the envelope plus `catalogue`: `hash` (FNV-1a 64
 as 16 lowercase hex digits, compared as a string, never recomputed), `version` (the catalogue format, 1),
 `abilities` (what this module takes beyond the old wire, `["catalogue", "names", "steps"]` today; not hashed), `maxSteps` and
 `rows`. Each row has kind (act or topic), name, sentence, params (name, kind, sentence, choices), refusals (word,
-sentence), effect, done, state, event and limit. The answer is built once at install and stays under 24 KB of
+sentence), effect (`none` for every row since LC.36), done, state, event and limit. The answer is built once at install and stays under 24 KB of
 the 32768-byte response limit (selftested; 15187 bytes for the 29 rows of LC3); a later step pages it when the
 rows outgrow that. Without an installed index the query fails `unavailable`; a module older than LC3 answers it
 `invalid_input`. An order that names a unit or quest the bot cannot find is refused `unknown_name` ("I do not know
@@ -100,7 +100,7 @@ group and the row's check per step (for `position` a reachable path), and the
 first step not applied ends the order. A lasting step runs like any other. The result keeps the old
 shape: `outcome` is applied only when every step applied, else the ending step's (an unavailable step is
 `rejected` with `unavailable`); `reason`/`reasonText` are the ending step's, in the catalogue's words, or the
-order's own when it was refused before any step ran (`too_soon`, `unavailable`, `busy`, `cannot_now`). It adds
+order's own when it was refused before any step ran (`too_soon`, `unavailable`, `cannot_now`). It adds
 `steps`: one entry per submitted step in order, `{"act", "outcome": applied/rejected/failed/skipped, "reason",
 "reasonText"}`, the reason only on rejected and failed; a step that did not run is `skipped`, so a fully refused
 order lists every step skipped and carries its own reason.

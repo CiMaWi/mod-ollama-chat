@@ -237,7 +237,7 @@ static OllamaBridge::AbilityIndex BridgeAbilityIndex()
                                   static_cast<OllamaBridge::AbilityField>(params[param].Field)});
         for (PlayerbotBridge::RefusalData const& refusal : data.Refusals)
             row.refusals.push_back({refusal.Word, refusal.Sentence});
-        row.effect = PlayerbotBridge::PartWord(data.Lasting);
+        row.effect = PlayerbotBridge::EffectWord;
         row.done = PlayerbotBridge::CompletionWord(data.Done);
         row.state = data.StatePhrase;
         row.event = data.Event;
