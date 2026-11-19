@@ -107,7 +107,7 @@ private:
     }
 
     // LC3: a stepped command as one playerbots order of its steps: one Execute and so one authorize, with playerbots'
-    // gate on every step (the group, a named or given unit or quest seen or held, the row's check; a position's path).
+    // gate on every step (the group, a named or given unit or quest seen or held, the row's check).
     // The module keeps the scope (authorize) and the captured group; a lasting step runs like any other (LC.36).
     // `ran` receives one worded entry per step that ran.
     static EffectResult Stepped(EffectPhase const& phase, WorldTicket const& ticket, DispatchGuard const& guard,
