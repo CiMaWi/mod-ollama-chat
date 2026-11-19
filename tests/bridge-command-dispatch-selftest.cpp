@@ -115,7 +115,7 @@ struct Fixture
     {
         channel.Configure(true);
         world.Configured(true, settings, "epoch-1");
-        Check(world.ObserveDrain(channel.Drained(), RetirementProof::NoLiveCaptures), "real selection");
+        Check(world.ObserveDrain(channel.Drained()), "real selection");
         Check(channel.Activate(), "channel opt in");
         WorldScope scope{1, "fixture", "codex", "epoch-1", 11, 22, "context", "party", "visible", "c1", "m1"};
         Check(world.ObserveScope(scope, now), "trusted observed scope");
@@ -496,8 +496,7 @@ void RetirementBeforeTick()
     f.world.Configured(true, f.settings, "epoch-2");
     Check(f.channel.Update(&phase) == 0 && f.probe.calls == 0, "epoch switch before the tick: no world work");
     f.channel.Configure(true);
-    Check(f.channel.Drained() && f.world.ObserveDrain(f.channel.Drained(), RetirementProof::NoLiveCaptures) &&
-              f.channel.Activate(),
+    Check(f.channel.Drained() && f.world.ObserveDrain(f.channel.Drained()) && f.channel.Activate(),
           "retirement disposed the queued command; new epoch selected");
     Check(f.Result(id, "retired") == "absent", "no receipt from a retired epoch");
     uint64_t again = 0;

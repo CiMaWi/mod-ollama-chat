@@ -83,8 +83,6 @@ uint64_t g_bridgeRefusedLong = 0;  // World-thread: replies refused for needing 
 uint64_t g_loggedSplit = 0;
 uint64_t g_loggedRefusedLong = 0;
 Clock::time_point g_nextCommandsLog{};
-OllamaBridge::PlanCounters g_loggedPlans;  // World-thread: the plan counters in the last watchlist line.
-Clock::time_point g_nextPlansLog{};
 OllamaBridge::WatchCounters g_loggedWatches;  // World-thread: the watch counters in the last watchlist line (J6e-c).
 Clock::time_point g_nextWatchesLog{};
 OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
@@ -512,9 +510,6 @@ void OllamaDispatch_SetBridgeObserver(OllamaBridgeObserver observer)
 static void RetireBridgeWork()
 {
     g_bridgeGeneration = 0;
-    // J12: lasting plans become restore-pending here (no game access); the next tick restores them, and no new
-    // generation is selected until the ledger is empty.
-    OllamaChat_BridgePlansRetire();
     g_bridgeChannel.Retire();
     OllamaChat_BridgeReset();
     OllamaBridge_SetActivation({});
@@ -702,19 +697,10 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
     return true;
 }
 
-// J12: generation intents and one-shot effects are synchronous; lasting plans are the only other obligation, so the
-// retirement is proven only while no plan is live or restore-pending. Unknown obligations fail closed.
-static OllamaBridge::RetirementProof BridgeRetirementProof()
-{
-    return OllamaChat_BridgePlansEmpty() ? OllamaBridge::RetirementProof::NoLiveCaptures
-                                         : OllamaBridge::RetirementProof::Unknown;
-}
-
 static void ActivateBridge()
 {
     OllamaBridge_SetActivation(g_bridgeWorld.Selected());
     g_bridgeGeneration = g_bridgeWorld.Generation();
-    OllamaChat_BridgePlansOpen(g_bridgeWorld.Generation());
 }
 
 namespace
@@ -738,22 +724,7 @@ void LogBridgeCommands(Clock::time_point now)
              stats.withheld, g_bridgeSilent, g_bridgeSplit, g_bridgeRefusedLong);
 }
 
-// Smoke-test watchlist (J12): lasting-plan counters, after a change and at most once a minute.
-void LogBridgePlans(Clock::time_point now)
-{
-    OllamaBridge::PlanCounters const plans = OllamaChat_BridgePlanCounters();
-    if (now < g_nextPlansLog || plans == g_loggedPlans)
-        return;
-    g_loggedPlans = plans;
-    g_nextPlansLog = now + std::chrono::minutes(1);
-    LOG_INFO("module.ollamachat",
-             "[Ollama Chat] Bridge plans: applied {} renewed {} expired {} regrouped {} retired {} restored {} "
-             "departed {} abandoned {} unrecorded {}",
-             plans.applied, plans.renewed, plans.expired, plans.regrouped, plans.retired, plans.restored,
-             plans.departed, plans.abandoned, plans.unrecorded);
-}
-
-// Smoke-test watchlist (J6e-c): watch counters beside the plan counters, after a change and at most once a minute.
+// Smoke-test watchlist (J6e-c): watch counters, after a change and at most once a minute.
 void LogBridgeWatches(Clock::time_point now)
 {
     OllamaBridge::WatchCounters const watches = g_bridgeChannel.Watches().Counters();
@@ -785,33 +756,28 @@ static void ScanBridgeWatches()
     }
 }
 
-// The bridge lifecycle part of the world tick, in order: restores of pending lasting plans first (J12), so a
-// retirement made by a reload or the previous call can be proven drained in this one; then the selection, which
-// waits for an empty plan ledger. With the module disabled only the restores and expiry run: the reload that
-// disabled it retired every plan, and nothing else restores them.
-static void UpdateBridgeLifecycle(OllamaBridge::EffectPhase const& phase)
+// The bridge lifecycle part of the world tick: a retirement made by a reload is proven drained once no generation,
+// slot or channel work is left; then the selection. Nothing runs with the module disabled.
+static void UpdateBridgeLifecycle()
 {
-    OllamaChat_BridgePlansUpdate(phase);
     if (!g_Enable)
         return;
     g_bridgeWorld.Expire(OllamaBridge::Now());
     OllamaChat_BridgeRefresh();
-    if (g_bridgeWorld.ObserveDrain(
-            g_bridgeInFlight.load() == 0 && OllamaBridge::DispatchSlot::Used() == 0 && g_bridgeChannel.Drained(),
-            BridgeRetirementProof()))
+    if (g_bridgeWorld.ObserveDrain(g_bridgeInFlight.load() == 0 && OllamaBridge::DispatchSlot::Used() == 0 &&
+                                   g_bridgeChannel.Drained()))
         ActivateBridge();
 }
 
 void OllamaDispatch_Update(uint32_t /*diff*/, PlayerbotBridge::PostMapJoin const& join)
 {
-    // Typed effects and plan restores get the post-map-join phase for this call only.
+    // Typed effects get the post-map-join phase for this call only.
     OllamaBridge::EffectPhase const phase(join);
-    UpdateBridgeLifecycle(phase);
-    // J5e: the plan restores above run while disabled too, so their counters line stays visible.
-    LogBridgePlans(Clock::now());
+    UpdateBridgeLifecycle();
+    // The reload that disabled the module may have dropped watches: their counters line stays visible.
     LogBridgeWatches(Clock::now());
     if (!g_Enable)
-        return;  // Disabled: the plan restores above are the only work (OnUpdate calls this tick in that state too).
+        return;  // Disabled: nothing else (OnUpdate calls this tick in that state too).
     // Bounded independent reverse lane; no HTTP, waits or generation-worker dependency.
     g_bridgeChannel.Update(&phase);
     // DS.14 (c), J6e-c: watches, post-map-join, at most every 500 ms and nothing at all while none exists.

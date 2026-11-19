@@ -234,17 +234,6 @@ void ActCodes()
           "the order keeps its issuer, bot and id");
 }
 
-// DS.14: follow, formation and save_mana need the partner in the bot's group; no other act does.
-void PartnerRules()
-{
-    for (unsigned value = 0; value <= static_cast<unsigned>(Intent::UseItem); ++value)
-    {
-        auto const intent = static_cast<Intent>(value);
-        bool const expected = intent == Intent::Follow || intent == Intent::Formation || intent == Intent::SaveMana;
-        Check(IntentNeedsPartnerInGroup(intent) == expected, "partner-in-group rule per act");
-    }
-}
-
 // J5e and DS.13: every refusal names a short code and a plain sentence the bot can say; DS.14 adds five.
 void RefusalWords()
 {
@@ -335,7 +324,6 @@ int main()
         OldFormRefused();
         WireRefusals();
         ActCodes();
-        PartnerRules();
         RefusalWords();
         StagedCommandCurrentness();
         std::cout << "PASS " << checks << " checks\n";

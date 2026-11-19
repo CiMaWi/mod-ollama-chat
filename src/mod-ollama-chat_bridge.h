@@ -76,10 +76,6 @@ struct Participant
 // numbers clamped to +-MaxOpenNumber.
 constexpr std::size_t MaxOpenKeys = 8;
 constexpr int64_t MaxOpenNumber = 1000000000;
-constexpr uint8_t StatePlanMovement = 1;  // Bits of Context::statePlans, in PlanKind order.
-constexpr uint8_t StatePlanFormation = 2;
-constexpr uint8_t StatePlanSaveMana = 4;
-constexpr uint8_t StatePlanFocusHealing = 8;
 
 // LC10 `input.facts.who`: who the bot is, from the bot's own getters; the rest of `input.facts` are playerbots' lasting
 // facts (PlayerbotBridge::BotFacts, ReadBotFacts). The whole object is dropped when a value of who or the phrase does
@@ -116,7 +112,6 @@ struct Context
     std::vector<std::string> observations;
     std::vector<Participant> party;
     std::optional<PlayerbotBridge::BotStateFacts> state;  // Per request, filled at submit; never in a capture.
-    uint8_t statePlans = 0;  // StatePlan* bits of the bot's live bridge plans, read with the state.
     // LC10: per request like state, filled at submit; never in a capture.
     std::optional<PlayerbotBridge::BotFacts> facts;
     BotWho who;  // Set with facts.

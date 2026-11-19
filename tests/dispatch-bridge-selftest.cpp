@@ -18,7 +18,6 @@
 #include <vector>
 
 #include "SharedDefines.h"
-#include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_reply_split.h"
@@ -348,12 +347,6 @@ OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
     static Closed executor;
     return executor;
 }
-void OllamaChat_BridgePlansOpen(uint64_t) {}
-void OllamaChat_BridgePlansRetire() {}
-void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const&) {}
-bool OllamaChat_BridgePlansEmpty() { return true; }
-OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters() { return {}; }
-uint8_t OllamaChat_BridgePlanKinds(uint64_t) { return 0; }
 
 // --- doubles of playerbots' readers -----------------------------------------
 namespace
@@ -470,7 +463,7 @@ void Reset()
     config = {};
     config.bridge = {"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-bearer-only"};
     g_bridgeWorld.Configured(true, config.bridge, "epoch-1");
-    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures), "selected");
+    Check(g_bridgeWorld.ObserveDrain(true), "selected");
     g_bridgeGeneration = g_bridgeWorld.Generation();
     gameGuard = {};
     gameGuard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "party", "visible", "c1", "m1"};
@@ -789,8 +782,7 @@ void DrainTest()
     config.bridge.token = "synthetic-game-link-bearer-new";
     g_bridgeWorld.Configured(true, config.bridge, "epoch-2");
     g_bridgeGeneration = 0;
-    bool const waits =
-        !g_bridgeWorld.ObserveDrain(g_bridgeInFlight == 0, OllamaBridge::RetirementProof::NoLiveCaptures);
+    bool const waits = !g_bridgeWorld.ObserveDrain(g_bridgeInFlight == 0);
     {
         std::lock_guard lock(g_queueMutex);
         g_running = false;
@@ -805,8 +797,7 @@ void DrainTest()
     Check(entered && counted && waits, "cancellation is not actual worker drain");
     Check(!g_bridgeInFlight && !OllamaBridge::DispatchSlot::Used() && g_done.empty(),
           "stale worker disposes actual payload before drain");
-    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures),
-          "actual drain permits selection");
+    Check(g_bridgeWorld.ObserveDrain(true), "actual drain permits selection");
 }
 
 void AdapterFixture()
@@ -1229,7 +1220,7 @@ void AdapterTests()
         else
         {
             g_bridgeWorld.Configured(true, config.bridge, "new-epoch");
-            Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::NoLiveCaptures), "reload selected");
+            Check(g_bridgeWorld.ObserveDrain(true), "reload selected");
             g_bridgeGeneration = g_bridgeWorld.Generation();
         }
         g_bridgeBindings[0].heartbeat.steadyMs = 1;  // LCB3c: the next capture is due.

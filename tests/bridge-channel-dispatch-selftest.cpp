@@ -44,9 +44,8 @@ struct Fixture
         channel.Configure(enable);
         world.Configured(true, settings, "epoch-1");
         Check(!channel.Activate(), "selection is not a native/producer grant");
-        Check(!world.ObserveDrain(false, RetirementProof::NoLiveCaptures), "held inference blocks activation");
-        Check(!world.ObserveDrain(true, RetirementProof::Unknown), "unknown restoration blocks activation");
-        Check(world.ObserveDrain(channel.Drained(), RetirementProof::NoLiveCaptures), "real selection");
+        Check(!world.ObserveDrain(false), "held inference blocks activation");
+        Check(world.ObserveDrain(channel.Drained()), "real selection");
         Check(channel.Activate() == enable, "channel requires explicit opt in");
         WorldScope scope{1, "fixture", "codex", "epoch-1", 11, 22, "context", "party", "visible", "c1", "m1"};
         Check(world.ObserveScope(scope, now), "trusted observed scope");
@@ -150,12 +149,11 @@ void PhysicalAndIndependent()
     f.channel.Configure(false);
     f.world.Configured(true, f.settings, "epoch-2");
     Check(f.channel.Used() == 1 && !f.channel.Drained(), "retirement disposes queues but retains actual held write");
-    Check(!f.world.ObserveDrain(f.channel.Drained(), RetirementProof::NoLiveCaptures),
-          "held retired response blocks new epoch");
+    Check(!f.world.ObserveDrain(f.channel.Drained()), "held retired response blocks new epoch");
     reply.reset();
     Check(f.channel.Drained(), "actual write disposal releases last slot");
     heldInference = {};
-    Check(f.world.ObserveDrain(f.channel.Drained(), RetirementProof::NoLiveCaptures), "drained selection");
+    Check(f.world.ObserveDrain(f.channel.Drained()), "drained selection");
     f.channel.Configure(true);
     Check(f.channel.Activate(), "reconnect binds new selected epoch");
     Check(f.channel.Take(f.settings.token, ids.front(), unauthorized) == ChannelError::Unknown,

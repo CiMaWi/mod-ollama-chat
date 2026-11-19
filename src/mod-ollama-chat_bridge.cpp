@@ -231,6 +231,7 @@ void PutOpenKeys(nlohmann::json& json, std::vector<PlayerbotBridge::StateKey> co
 }
 
 constexpr std::string_view AroundKeys[] = {"name", "kind", "detail", "count"};
+// "plans" is no longer written (LC.36) but stays reserved while the hub's envelope still reads it (LC.23).
 constexpr std::string_view StateKeys[] = {"health",  "power",   "level",    "alive", "combat",   "activity", "where",
                                           "partner", "mounted", "swimming", "group", "movement", "plans",    "bags",
                                           "money",   "around",  "servant",  "mount", "deeds"};
@@ -324,7 +325,7 @@ char const* StateMovement(PlayerbotBridge::BotStateFacts const& state)
 
 // DS.14/J5f `input.state`: what the bot itself knows about its condition, place and doings; LCB4: playerbots' open
 // rows last.
-nlohmann::json StateJson(PlayerbotBridge::BotStateFacts const& state, uint8_t statePlans)
+nlohmann::json StateJson(PlayerbotBridge::BotStateFacts const& state)
 {
     nlohmann::json json = nlohmann::json::object();
     json["health"] = StatePercent(state.healthPct);
@@ -384,13 +385,6 @@ nlohmann::json StateJson(PlayerbotBridge::BotStateFacts const& state, uint8_t st
         json["group"] = std::move(group);
     }
     json["movement"] = StateMovement(state);
-    static char const* const planNames[] = {"movement", "formation", "save_mana", "focus_healing"};
-    nlohmann::json plans = nlohmann::json::array();
-    for (std::size_t kind = 0; kind < std::size(planNames); ++kind)
-        if (statePlans & (1u << kind))
-            plans.push_back(planNames[kind]);
-    if (!plans.empty())
-        json["plans"] = std::move(plans);
     json["bags"] = std::min<uint32_t>(state.freeBagSlots, 255);
     json["money"] = state.money;
     if (nlohmann::json around = AroundJson(state.around); !around.empty())
@@ -542,7 +536,7 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
         if (!traits.empty())
             envelope["input"]["traits"] = std::move(traits);
         if (input.state)
-            envelope["input"]["state"] = StateJson(*input.state, input.statePlans);
+            envelope["input"]["state"] = StateJson(*input.state);
         if (!input.wakeCondition.empty())  // J6e-c: a wake turn (never addressed); the watch that opened it.
             envelope["input"]["wake"] = {{"condition", input.wakeCondition}, {"watchId", input.wakeWatchId}};
         std::string encoded = envelope.dump();

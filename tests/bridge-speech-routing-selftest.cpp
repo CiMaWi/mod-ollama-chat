@@ -20,7 +20,6 @@
 
 #include "ChatCommandLine.h"
 #include "SharedDefines.h"
-#include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_reply_split.h"
@@ -249,11 +248,6 @@ OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
 }
 bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&) { return false; }
 void OllamaChat_BridgeInstallAbilities() {}
-void OllamaChat_BridgePlansOpen(uint64_t) {}
-void OllamaChat_BridgePlansRetire() {}
-void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const&) {}
-bool OllamaChat_BridgePlansEmpty() { return true; }
-OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters() { return {}; }
 void OllamaChat_BridgeRefresh() {}
 void OllamaChat_BridgeReset() {}
 bool OllamaChat_BridgeWake(OllamaBridge::Watch const&) { return false; }
@@ -374,7 +368,7 @@ void Reset()
     config = {};
     config.bridge = {"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-bearer-only"};
     g_bridgeWorld.Configured(true, config.bridge, "epoch-1");
-    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures), "selected");
+    Check(g_bridgeWorld.ObserveDrain(true), "selected");
     g_bridgeGeneration = g_bridgeWorld.Generation();
     gameGuard = {};
     gameGuard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "party", "visible", "c1", "m1"};

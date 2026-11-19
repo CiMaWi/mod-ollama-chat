@@ -47,17 +47,11 @@ syntax is built. A staged proposal reserves its effect id before any possible la
 target observation/eligibility, map/phase/pathability, and the world thread rate and activation/deadline, at the
 actual execution seam. Proposed text
 must not enter order parsing. Acts: attack_own_target, mark, flee and position are one-time moves;
-follow, stay, formation, save_mana and focus_healing are lasting plans (J12): the bot's state of that part is captured
-before every attempt, and the world tick restores it on expiry (10 minutes after the latest repeat), a group change,
-loss of the controller's authority (master, or leader of a masterless bot), or bridge retirement (a reload or
-switch, also one that sets `OllamaChat.Enable = 0`: the disabled tick still runs these restores). Any later change of
-that part wins and is left alone, whoever makes it: another person, the controller's own playerbots command, or
-playerbots itself; a change that leaves the part as the bridge set it (the same stay again) does not count. A
-logged-out bot's plan is dropped unrestored, and playerbots' own logout save can keep the bridge-set state in its
-database for the next login, as it does for its own commands. An attempt that may have changed the bot but left no
-plan (unreachable today) is counted as `unrecorded` in the "Bridge plans:" log line. The goal acts (WT18b) hand the
-bot's planner a goal through playerbots' plausibility gate; they need no group, have no lasting part (no capture, no
-plan, no restore) and are refused with not_planner, goal_held, unknown_place, no_route, no_such_quest, nothing_here or
+follow, stay, formation, save_mana and focus_healing are lasting actions the bot takes itself (LC.36): one holds
+until the bot changes or reverts it, or playerbots' own group and master resets end it, exactly as the matching
+playerbots command would. The module keeps no record of them, restores nothing and holds no step back; a later
+action of the same part simply replaces the earlier one. The goal acts (WT18b) hand the
+bot's planner a goal through playerbots' plausibility gate; they need no group and are refused with not_planner, goal_held, unknown_place, no_route, no_such_quest, nothing_here or
 already_there. A bot_state query names one topic; route, and only route, also names its place (WT18b), which the
 world thread hands to playerbots' topic reader as a value. The planner topics (plan, options, route, quest_plan, bags,
 places) share one entry shape: row, name, value and extra, and text when the game sends a sentence for the row.
@@ -67,7 +61,7 @@ bridge decides what each word shows. A topic's result holds at most its catalogu
 `limit` of the catalogue answer) within the 8 KB bound; the module keeps no word or limit table of its own.
 The record topics (LC7: history, lately, known) add text, one in-world sentence of 1..200 bytes
 (`ChannelMaxTopicText`, cut on a character boundary); an entry without one is dropped.
-Retirement selects no new epoch until every retired plan is restored or dropped.
+Retirement selects no new epoch until the old work has drained.
 
 LC3: the acts and the topic words are playerbots' (its catalogue rows and `TopicRows`).
 The game adapter hands them to the channel once, on the world thread at startup (`OllamaDispatch_Start` calls
@@ -103,9 +97,7 @@ are `invalid_input`. The issuer, bot and group are the scope's for every step. T
 one rate slot and one authorization: the module builds one playerbots order per step and calls the span
 `Execute` once; playerbots' gate resolves each name among what the bot perceives or knows, checks visibility,
 group and the row's check per step (for `position` a reachable path), and the
-first step not applied ends the order. Before it runs, every lasting step is admitted to the plan ledger and its
-part captured (`busy` when a plan refuses it, `cannot_now` for two steps of one lasting part, both before any step
-runs); each lasting step that ran and applied or failed is recorded after the order. The result keeps the old
+first step not applied ends the order. A lasting step runs like any other. The result keeps the old
 shape: `outcome` is applied only when every step applied, else the ending step's (an unavailable step is
 `rejected` with `unavailable`); `reason`/`reasonText` are the ending step's, in the catalogue's words, or the
 order's own when it was refused before any step ran (`too_soon`, `unavailable`, `busy`, `cannot_now`). It adds
@@ -114,7 +106,7 @@ order's own when it was refused before any step ran (`too_soon`, `unavailable`, 
 order lists every step skipped and carries its own reason.
 
 The single world owner calls `Bind` only AFTER the existing activation owner has selected a fresh epoch and proved
-actual old-work drain and strategy restoration. Bind itself proves neither. Every bind retires the prior helper
+actual old-work drain. Bind itself does not prove it. Every bind retires the prior helper
 state immediately; invalid binding stays inactive. Reconnect requires a fresh epoch and fresh registered scope/work;
 it cannot revive terminal/failed work. Only the previous binding's epoch is refused (LC.35: no longer history is
 kept); this is not an RNG: the activation owner supplies 128-bit cryptographically fresh epochs on process restart.

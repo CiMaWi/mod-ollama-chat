@@ -87,17 +87,12 @@ static std::string FormatPlayerRace(uint8_t raceId)
     }
 }
 
-// DS.14/J5f: the bot's own state for one request, read by playerbots on world (the chat hook, map threads idle), with
-// the bot's live bridge plans beside it; the envelope filters and bounds it.
+// DS.14/J5f: the bot's own state for one request, read by playerbots on world (the chat hook, map threads idle); the
+// envelope filters and bounds it.
 void BridgeBotStateFacts(Player* bot, Player* partner, OllamaBridge::Context& input)
 {
-    input.statePlans = 0;
     if (!PlayerbotBridge::ReadBotState(bot->GetGUID(), partner->GetGUID(), input.state.emplace()))
-    {
         input.state.reset();
-        return;
-    }
-    input.statePlans = OllamaChat_BridgePlanKinds(bot->GetGUID().GetRawValue());
 }
 
 static_assert(OllamaBridge::MaxStateDeedBytes == RecordWords::MAX_SENTENCE,

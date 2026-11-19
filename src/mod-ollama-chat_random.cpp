@@ -13,9 +13,8 @@ void OllamaBotRandomChatter::OnUpdate(uint32 diff)
     // World::Update has joined MapMgr::Update's map workers before
     // ScriptMgr::OnWorldUpdate calls this hook, so this frame is the
     // post-map-join phase typed bridge effects need. Only this stack
-    // holds the token. It runs even with the module disabled: the reload
-    // that disabled it retired the bridge, and only this tick restores the
-    // bots' retired lasting plans (J12); the dispatcher does nothing else then.
+    // holds the token. With the module disabled the dispatcher only logs
+    // its watch counters and returns.
     PlayerbotBridge::PostMapJoin const join;
     OllamaDispatch_Update(diff, join);
 

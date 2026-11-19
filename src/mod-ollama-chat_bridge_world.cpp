@@ -520,9 +520,9 @@ void WorldPolicy::Configured(bool enabled, Settings settings, std::string epoch)
 
 void WorldPolicy::Shutdown() { Configured(false, {}, {}); }
 
-bool WorldPolicy::ObserveDrain(bool drained, RetirementProof proof)
+bool WorldPolicy::ObserveDrain(bool drained)
 {
-    if (!_retiring || !drained || proof != RetirementProof::NoLiveCaptures)
+    if (!_retiring || !drained)
         return false;
     _retiring = false;
     if (_enabled)

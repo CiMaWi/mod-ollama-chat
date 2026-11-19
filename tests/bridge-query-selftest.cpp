@@ -127,7 +127,7 @@ struct Fixture
     Fixture()
     {
         world.Configured(true, settings, "epoch-1");
-        Check(world.ObserveDrain(true, RetirementProof::NoLiveCaptures), "select world epoch");
+        Check(world.ObserveDrain(true), "select world epoch");
         channel.Configure(true);
         Check(channel.Activate(), "activate real channel");
         auto& guard = source.guard;

@@ -158,14 +158,6 @@ inline CommandRefusalWords DescribeRefusal(CommandRefusal refusal)
     }
     return {"cannot_now", BridgeTexts::Refusals::CANNOT_NOW};
 }
-
-// DS.14: follow, formation and save_mana need the partner in the bot's group, so their plan also ends when the
-// partner leaves it (playerbots checks each act's group rule when it runs).
-inline bool IntentNeedsPartnerInGroup(PlayerbotBridge::Intent intent)
-{
-    return intent == PlayerbotBridge::Intent::Follow || intent == PlayerbotBridge::Intent::Formation ||
-           intent == PlayerbotBridge::Intent::SaveMana;
-}
 }  // namespace OllamaBridge
 
 #endif

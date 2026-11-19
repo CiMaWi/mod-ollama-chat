@@ -102,15 +102,6 @@
             "success": "\\d+ checks passed"
         },
         {
-            "file": "bridge-plan-selftest.cpp",
-            "includes": [
-                "src",
-                "../mod-playerbots/src/Bot",
-                "deps"
-            ],
-            "success": "PASS \\d+ checks"
-        },
-        {
             "file": "bridge-query-dispatch-selftest.cpp",
             "includes": [
                 "tests/doubles",

@@ -67,8 +67,6 @@ PlayerbotBridge::AroundEntry Around(std::string name, AroundKind kind, std::stri
     return entry;
 }
 
-constexpr uint8_t FullPlans = OllamaBridge::StatePlanMovement | OllamaBridge::StatePlanFocusHealing;
-
 PlayerbotBridge::BotStateFacts FullState()
 {
     PlayerbotBridge::BotStateFacts state;
@@ -112,11 +110,10 @@ PlayerbotBridge::BotStateFacts FullState()
 }
 
 // The encoded `input.state`, or null when the envelope has none.
-nlohmann::json StateWire(std::optional<PlayerbotBridge::BotStateFacts> const& state, uint8_t plans = FullPlans)
+nlohmann::json StateWire(std::optional<PlayerbotBridge::BotStateFacts> const& state)
 {
     auto request = Request();
     request.input.state = state;
-    request.input.statePlans = plans;
     std::string body;
     Check(OllamaBridge::Build(Settings(), request, {1000000, 10000}, body), "state: build");
     auto const wire = nlohmann::json::parse(body);
@@ -139,7 +136,7 @@ void StateChecks()
         "alive":"alive","combat":{"target":{"name":"Defias Pillager","level":41,"health":35}},
         "activity":{"kind":"fighting"},"where":{"zone":"Westfall","area":"Moonbrook","mapId":0,"x":-11018,"y":1514,
         "z":43},"partner":{"zone":"Westfall","yards":19,"x":-11001,"y":1520,"z":44},"mounted":true,"swimming":true,
-        "group":{"size":2,"leads":false,"follows":"Aldric"},"movement":"follow","plans":["movement","focus_healing"],
+        "group":{"size":2,"leads":false,"follows":"Aldric"},"movement":"follow",
         "bags":14,"money":1234567})"),
           "state: every field encoded with its key");
 
@@ -267,12 +264,7 @@ void StateChecks()
     Check(StateWire(state)["movement"] == "passive", "state: passive");
     state.passive = false;
     Check(StateWire(state)["movement"] == "none", "state: no movement strategy");
-    Check(
-        StateWire(state, StatePlanMovement | StatePlanFormation | StatePlanSaveMana | StatePlanFocusHealing)["plans"] ==
-            nlohmann::json({"movement", "formation", "save_mana", "focus_healing"}),
-        "state: plan bits in PlanKind order");
-    Check(StateWire(state, StatePlanSaveMana)["plans"] == nlohmann::json({"save_mana"}), "state: one plan");
-    Check(!StateWire(state, 0).contains("plans"), "state: no plans, no key");
+    Check(!StateWire(state).contains("plans"), "state: no plans key (LC.36: the module keeps no plans)");
     for (auto const& [type, kind] : std::initializer_list<std::pair<uint8_t, char const*>>{
              {0, "mana"}, {1, "rage"}, {2, "focus"}, {3, "energy"}, {6, "runic"}})
     {
@@ -303,11 +295,11 @@ void StateChecks()
     state.partnerInGroup = state.partnerVisible = false;
     state.groupSize = 0;
     state.follow = false;
-    sizes.push_back(StateWire(state, 0).dump().size());  // Solo, partner unknown.
+    sizes.push_back(StateWire(state).dump().size());  // Solo, partner unknown.
     state.travelling = false;
     state.questTitle.clear();
     state.area = state.zone;
-    sizes.push_back(StateWire(state, 0).dump().size());  // Solo, idle.
+    sizes.push_back(StateWire(state).dump().size());  // Solo, idle.
     state = FullState();
     state.inCombat = false;
     state.resting = true;
@@ -318,7 +310,7 @@ void StateChecks()
     state.victimName = state.questTitle = state.zone = state.area = state.partnerZone = state.masterName =
         std::string(80, 'w');
     state.money = 4294967295u;
-    std::size_t const worst = StateWire(state, 15).dump().size();
+    std::size_t const worst = StateWire(state).dump().size();
     std::sort(sizes.begin(), sizes.end());
     std::cout << "bridge-state-selftest: input.state bytes p50 " << sizes[sizes.size() / 2] << ", max " << sizes.back()
               << " over " << sizes.size() << " fixtures; worst case (all strings at the cap) " << worst << '\n';

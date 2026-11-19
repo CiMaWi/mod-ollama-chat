@@ -252,12 +252,6 @@ OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
     static Closed executor;
     return executor;
 }
-void OllamaChat_BridgePlansOpen(uint64_t) {}
-void OllamaChat_BridgePlansRetire() {}
-void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const&) {}
-bool OllamaChat_BridgePlansEmpty() { return true; }
-OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters() { return {}; }
-uint8_t OllamaChat_BridgePlanKinds(uint64_t) { return 0; }
 
 // --- doubles of playerbots' readers: the state, facts and traits are fixed; topics are not part of these checks --
 namespace PlayerbotBridge
@@ -325,7 +319,7 @@ struct Fixture
         enemy.name = "Visible enemy";
         ai.master = &players[1];
         g_bridgeWorld.Configured(true, settings, "epoch-" + std::to_string(++fixtureSerial));
-        Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::NoLiveCaptures), "select epoch");
+        Check(g_bridgeWorld.ObserveDrain(true), "select epoch");
         g_bridgeChannel.Configure(true);
         Check(g_bridgeChannel.Activate(), "activate production dispatcher mailbox");
         BindingCapture view;

@@ -218,7 +218,6 @@ void LoadOllamaChatConfig()
     // buffers under a worker mid-request.
     OllamaConfig_Publish();
     // Explicit world-thread load/reload notification also retires work when the module is disabled.
-    // In that state the world tick still restores the retired lasting plans and does nothing else.
     bool const channelEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ChannelEnabled", false);
     OllamaDispatch_BridgeConfigured(channelEnabled);
     // J5d: the mailbox's 127.0.0.1 transport; a reload restarts it only when the port or the token changed.

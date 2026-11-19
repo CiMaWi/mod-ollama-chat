@@ -42,14 +42,6 @@ enum class WorldOutcome : uint8_t
     Cancelled
 };
 
-enum class RetirementProof : uint8_t
-{
-    Unknown,
-    // Generation intents and one-shot effects are synchronous; lasting plans (J12) are the only other obligation,
-    // so the dispatcher passes this only while the plan ledger holds no live and no restore-pending plan.
-    NoLiveCaptures
-};
-
 enum class DispatchSource : uint8_t
 {
     Unsupported,
@@ -139,7 +131,9 @@ public:
     std::vector<WorldScope> Scopes(Clock now) const;
     void Configured(bool enabled, Settings settings, std::string epoch);
     void Shutdown();
-    bool ObserveDrain(bool drained, RetirementProof proof);
+    // Generation intents and effects are synchronous and nothing outlives them (LC.36), so a drained retirement is
+    // the whole proof.
+    bool ObserveDrain(bool drained);
     bool ObserveScope(WorldScope scope, Clock now);
     void InvalidateScope(uint64_t botGuid, std::string const& contextId);
     void Expire(Clock now);
