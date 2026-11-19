@@ -139,13 +139,6 @@ private:
             order.QuestId = step.questId;
             order.QuestName = step.questName;
             order.PlaceName = step.place;
-            if (step.position)
-            {
-                order.MapId = step.position->mapId;
-                order.X = step.position->x;
-                order.Y = step.position->y;
-                order.Z = step.position->z;
-            }
             order.Icon = step.icon.value_or(0);
             // OrderField::Shape: the index of the choice plus one (None without a shape).
             order.Shape = step.shape ? static_cast<PlayerbotBridge::FormationShape>(*step.shape + 1)

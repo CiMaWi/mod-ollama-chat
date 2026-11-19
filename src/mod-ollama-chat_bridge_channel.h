@@ -115,7 +115,6 @@ enum class AbilityField : uint8_t  // PlayerbotBridge::OrderField: the order fie
     Target,
     Icon,
     PlaceName,
-    Position,
     QuestId,
     Shape,
     Enabled,

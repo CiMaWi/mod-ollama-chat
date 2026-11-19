@@ -93,7 +93,7 @@ inline OllamaBridge::AbilityIndex TestAbilityIndex()
 }
 
 // LC3b: the double with the acts a stepped command needs for every parameter form, inserted after go_to (rows 3-9;
-// the topics follow from row 10): stay, quest, position, formation, save_mana, focus_healing, attack_own_target.
+// the topics follow from row 10): stay, quest, meet_at, formation, save_mana, focus_healing, attack_own_target.
 // TestAbilityIndex stays as it is: the selftests pin its seventeen rows by position.
 inline OllamaBridge::AbilityIndex TestStepAbilityIndex()
 {
@@ -117,8 +117,8 @@ inline OllamaBridge::AbilityIndex TestStepAbilityIndex()
         act(PlayerbotBridge::Intent::Stay, "stay", {}),
         act(PlayerbotBridge::Intent::Quest, "quest",
             {{"quest", "quest", "The quest, by its title.", {}, AbilityField::QuestId}}),
-        act(PlayerbotBridge::Intent::Position, "position",
-            {{"place", "place", "Where to stand.", {}, AbilityField::Position}}),
+        act(PlayerbotBridge::Intent::MeetAt, "meet_at",
+            {{"place", "place", "Where to meet.", {}, AbilityField::PlaceName}}),
         act(PlayerbotBridge::Intent::Formation, "formation",
             {{"shape", "choice", "The formation.", {"close", "spread", "line"}, AbilityField::Shape}}),
         act(PlayerbotBridge::Intent::SaveMana, "save_mana",

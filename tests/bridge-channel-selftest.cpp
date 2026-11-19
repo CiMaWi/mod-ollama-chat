@@ -1107,14 +1107,13 @@ void Stepped()
     Check(SetAbilityIndex(TestStepAbilityIndex()) > 0 && Abilities().rows.size() == 24, "the stepped double installs");
     auto const three =
         Decoded(Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
-                             Step("go_to", {{"place", "Goldshire"}}), Step("position", {{"place", "1.5,-2.25,30,0"}})}),
+                             Step("go_to", {{"place", "Goldshire"}}), Step("meet_at", {{"place", "you"}})}),
                 "three steps decode");
     Check(three.size() == 3 && three[0].intent == PlayerbotBridge::Intent::Mark && three[0].targetName == "Hogger" &&
               !three[0].targetGuid && three[0].icon == 7 && three[1].intent == PlayerbotBridge::Intent::GoTo &&
-              three[1].place == "Goldshire" && three[2].intent == PlayerbotBridge::Intent::Position &&
-              three[2].position && three[2].position->x == 1.5 && three[2].position->y == -2.25 &&
-              three[2].position->z == 30 && three[2].position->mapId == 0 && three[2].place.empty(),
-          "each step's act and parameters, in order; a name as given, a choice as its index, a spot parsed");
+              three[1].place == "Goldshire" && three[2].intent == PlayerbotBridge::Intent::MeetAt &&
+              three[2].place == "you",
+          "each step's act and parameters, in order; a name and a place as given, a choice as its index");
     auto const ids =
         Decoded(Json::array({Step("focus_healing", {{"targetGuid", "44"}}), Step("quest", {{"questId", 42}}),
                              Step("mark", {{"targetGuid", "45"}, {"icon", "star"}})}),
@@ -1185,17 +1184,7 @@ void Stepped()
         {Json::array({Step("go_to", {{"place", 7}})}), "a place is text"},
         {Json::array({Step("save_mana", {{"enabled", "yes"}})}), "a flag is a boolean"},
         {Json::array({Step("save_mana", {{"enabled", 1}})}), "a flag is no number"},
-        {Json::array({Step("position", {{"place", "1,2,3"}})}), "a spot needs its map"},
-        {Json::array({Step("position", {{"place", "1,2,3,-1"}})}), "a negative map"},
-        {Json::array({Step("position", {{"place", "1,2,3,0.5"}})}), "a fractional map"},
-        {Json::array({Step("position", {{"place", "1,2,3,4294967296"}})}), "a map past 32 bits"},
-        {Json::array({Step("position", {{"place", "inf,1,1,0"}})}), "an infinite coordinate"},
-        {Json::array({Step("position", {{"place", "nan,1,1,0"}})}), "a coordinate that is no number"},
-        {Json::array({Step("position", {{"place", " 1,2,3,0"}})}), "a spot with a space"},
-        {Json::array({Step("position", {{"place", "1,2,3,0,"}})}), "a spot with a trailing comma"},
-        {Json::array({Step("position", {{"place", "1,,3,0"}})}), "an empty coordinate"},
-        {Json::array({Step("position", {{"place", Json::array({1, 2, 3, 0})}})}), "a spot is text"},
-        {Json::array({Step("position", {{"place", "Goldshire"}})}), "a position takes a spot, not a name"},
+        {Json::array({Step("position", {{"place", "1,2,3,0"}})}), "position is no act (LC17e)"},
         {Json::array({Step("stay"), Step("chase")}), "one bad step refuses the order"},
     };
     for (std::size_t at = 0; at < std::size(bad); ++at)
@@ -1379,10 +1368,9 @@ void OpenRows()
         Decoded(Json::array({cast, Step("mark", {{"target", "Hogger"}, {"icon", "skull"}})}), "an open act decodes");
     Check(open.size() == 2 && static_cast<uint8_t>(open[0].intent) == TestOpenAct &&
               open[0].itemName == "Hearthstone" && open[0].spellName == "Frost Nova" && open[0].count == 1000 &&
-              open[0].choice == 1 && !open[0].icon && !open[0].shape && !open[0].enabled && !open[0].position &&
-              open[0].place.empty() && !open[0].targetGuid && open[0].targetName.empty() &&
-              open[1].intent == PlayerbotBridge::Intent::Mark && open[1].icon == 7 && !open[1].choice &&
-              !open[1].count && open[1].itemName.empty(),
+              open[0].choice == 1 && !open[0].icon && !open[0].shape && !open[0].enabled && open[0].place.empty() &&
+              !open[0].targetGuid && open[0].targetName.empty() && open[1].intent == PlayerbotBridge::Intent::Mark &&
+              open[1].icon == 7 && !open[1].choice && !open[1].count && open[1].itemName.empty(),
           "an item and a spell as named, a count as given, a choice as its index; the act beside it unchanged");
     auto const least = Decoded(Json::array({Step("cast_on", {{"item", std::string(ChannelMaxPlaceName, 'i')},
                                                              {"spell", "Blink"},

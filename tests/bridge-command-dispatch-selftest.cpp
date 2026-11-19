@@ -315,12 +315,12 @@ void StepVerbs()
         Check(f.Result(receipt, act) == "applied", "one-shot receipt");
     }
     f.Advance(CommandRate::IntervalMs);
-    receipt = f.Send(f.Command("position-1", "position", {{"place", "1.5,-2.25,3,1"}}));
+    receipt = f.Send(f.Command("meet-1", "meet_at", {{"place", "you"}}));
     step = &f.probe.order->steps.front();
-    Check(f.probe.calls == 5 && f.probe.grants == 5 && f.probe.mutations == 5 && step->intent == Intent::Position &&
-              step->position == ChannelPosition{1.5, -2.25, 3.0, 1},
-          "one authorized position order with the exact coordinates");
-    Check(f.Result(receipt, "position-1") == "applied", "position receipt");
+    Check(f.probe.calls == 5 && f.probe.grants == 5 && f.probe.mutations == 5 && step->intent == Intent::MeetAt &&
+              step->place == "you",
+          "one authorized meet_at order with the place as given");
+    Check(f.Result(receipt, "meet-1") == "applied", "meet_at receipt");
     auto const& stats = f.channel.Commands();
     Check(stats.proposed == 5 && stats.attempts == 5 && stats.applied == 5 && !stats.refused && !stats.failed &&
               !stats.withheld && !stats.duplicates && f.channel.Drained(),
@@ -370,7 +370,7 @@ void FixedRefusals()
               !closed.channel.Commands().attempts,
           "null executor keeps today's refusal");
     std::pair<char const*, Json> const oneShots[] = {
-        {"follow", Json::object()}, {"stay", Json::object()}, {"position", Json{{"place", "1,2,3,1"}}}};
+        {"follow", Json::object()}, {"stay", Json::object()}, {"meet_at", Json{{"place", "you"}}}};
     for (auto const& [intent, params] : oneShots)
     {
         Fixture none({.executor = false});
@@ -407,7 +407,7 @@ void ActMatrix()
                                               {"go_to", {{"place", "Goldshire"}}},
                                               {"stay", Json::object()},
                                               {"quest", {{"questId", 42}}},
-                                              {"position", {{"place", "1.5,-2.25,3,1"}}},
+                                              {"meet_at", {{"place", "you"}}},
                                               {"formation", {{"shape", "close"}}},
                                               {"save_mana", {{"enabled", true}}},
                                               {"focus_healing", {{"targetGuid", "44"}}},

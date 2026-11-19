@@ -1,7 +1,6 @@
 #include "mod-ollama-chat_bridge_channel.h"
 
 #include <algorithm>
-#include <charconv>
 #include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -127,26 +126,6 @@ uint8_t Choice(Json const& value, AbilityParam const& param)
     return static_cast<uint8_t>(found - param.choices.begin());
 }
 
-// LC3: a position's spot "x,y,z,map": three finite decimal numbers and a map id, comma-separated, nothing else.
-ChannelPosition Spot(Json const& value)
-{
-    auto const text = Place(value);
-    ChannelPosition spot;
-    char const* at = text.data();
-    char const* const end = text.data() + text.size();
-    for (double* coordinate : {&spot.x, &spot.y, &spot.z})
-    {
-        auto const [next, error] = std::from_chars(at, end, *coordinate);
-        if (error != std::errc() || next == end || *next != ',' || !std::isfinite(*coordinate))
-            throw std::runtime_error("invalid");
-        at = next + 1;
-    }
-    auto const [next, error] = std::from_chars(at, end, spot.mapId);
-    if (error != std::errc() || next != end)
-        throw std::runtime_error("invalid");
-    return spot;
-}
-
 // LC3: the steps of a stepped command, 1..maxSteps acts of the installed catalogue. Each is {act, params} with exactly
 // the act's parameters by their catalogue names: a unit as `name` (its name) or `nameGuid`, a quest as `name` (its
 // title) or `nameId`, exactly one of the two; names and places have Place's text rules. LC16c: an item or a spell as
@@ -195,9 +174,6 @@ std::vector<ChannelStep> Steps(Json const& value)
                     break;
                 case AbilityField::PlaceName:
                     step.place = Place(given);
-                    break;
-                case AbilityField::Position:
-                    step.position = Spot(given);
                     break;
                 case AbilityField::Icon:
                     step.icon = Choice(given, param);

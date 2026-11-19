@@ -255,8 +255,6 @@ struct Env
     }
 };
 
-ChannelPosition Pos() { return ChannelPosition{100.5, 200.25, 300.125, 1}; }
-
 using PlayerbotBridge::Intent;
 
 ChannelStep Step(Intent intent)
@@ -295,9 +293,6 @@ ChannelCommand ValidCmd(Intent intent)
         case Intent::Formation:
             step.shape = 0;
             break;
-        case Intent::Position:
-            step.position = Pos();
-            break;
         case Intent::GoTo:
         case Intent::MeetAt:
             step.place = "Goldshire";
@@ -313,10 +308,10 @@ ChannelCommand ValidCmd(Intent intent)
 
 // The acts of the old one-order path, each sent as a one-step order.
 Intent const kActs[] = {
-    Intent::AttackOwnTarget, Intent::Mark,      Intent::Follow,    Intent::Stay,         Intent::Flee,
-    Intent::Position,        Intent::Formation, Intent::SaveMana,  Intent::FocusHealing, Intent::GoTo,
-    Intent::Quest,           Intent::Errands,   Intent::SetHearth, Intent::GrindHere,    Intent::GatherHere,
-    Intent::MeetAt,          Intent::PausePlan, Intent::ResumePlan};
+    Intent::AttackOwnTarget, Intent::Mark,      Intent::Follow,       Intent::Stay,       Intent::Flee,
+    Intent::Formation,       Intent::SaveMana,  Intent::FocusHealing, Intent::GoTo,       Intent::Quest,
+    Intent::Errands,         Intent::SetHearth, Intent::GrindHere,    Intent::GatherHere, Intent::MeetAt,
+    Intent::PausePlan,       Intent::ResumePlan};
 
 // Nothing reached playerbots and no game read happened.
 bool Untouched()
@@ -497,14 +492,14 @@ void SteppedOrders()
     mark.icon = 7;
     auto go = Step(Intent::GoTo);
     go.place = "Goldshire";
-    auto spot = Step(Intent::Position);
-    spot.position = Pos();
+    auto meet = Step(Intent::MeetAt);
+    meet.place = "you";
     auto close = Step(Intent::Formation);
     close.shape = 0;
     {
-        // One order of all steps: one span Execute, one authorize; names and spots go to playerbots' gate as given.
+        // One order of all steps: one span Execute, one authorize; names and places go to playerbots' gate as given.
         Env env;
-        Check(env.Run(Steps({mark, go, spot})) == EffectResult::Applied && env.why == CommandRefusal::None &&
+        Check(env.Run(Steps({mark, go, meet})) == EffectResult::Applied && env.why == CommandRefusal::None &&
                   AllApplied(env.ran, 3),
               "a stepped order applied, each step applied");
         Check(pb.spanExecutes == 1 && pb.executes == 0 && env.authorizeCalls == 1 && pb.authorizeCalled == 1 &&
@@ -512,9 +507,8 @@ void SteppedOrders()
               "one span Execute in the world phase, one authorize, no one-order Execute");
         Check(pb.steps.size() == 3 && pb.steps[0].Operation == Intent::Mark && pb.steps[0].TargetName == "Hogger" &&
                   pb.steps[0].Target == 0 && pb.steps[0].Icon == 7 && pb.steps[1].Operation == Intent::GoTo &&
-                  pb.steps[1].PlaceName == "Goldshire" && pb.steps[2].Operation == Intent::Position &&
-                  pb.steps[2].MapId == 1 && pb.steps[2].X == 100.5 && pb.steps[2].Y == 200.25 &&
-                  pb.steps[2].Z == 300.125,
+                  pb.steps[1].PlaceName == "Goldshire" && pb.steps[2].Operation == Intent::MeetAt &&
+                  pb.steps[2].PlaceName == "you",
               "each step's act and fields as given: playerbots resolves the name");
         Check(std::all_of(pb.steps.begin(), pb.steps.end(),
                           [](PlayerbotBridge::Order const& order)
@@ -522,7 +516,7 @@ void SteppedOrders()
                               return order.Bot == kBot && order.Controller == kController && order.Group == kGroup;
                           }),
               "every step carries the scope's bot, partner and captured group");
-        Check(pb.reaches == 0, "no module pre-check of the spot");
+        Check(pb.reaches == 0, "no module pre-check of the place");
     }
     {
         Env env;

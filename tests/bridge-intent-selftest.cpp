@@ -172,9 +172,7 @@ void WireRefusals()
     for (Json const& quest : {Json(0), Json(-1), Json(4294967296ULL), Json(12.0), Json("12")})
         invalid(Json::array({Step("quest", {{"questId", quest}})}));
     invalid(Json::array({Step("quest", {{"place", "Goldshire"}})}));
-    for (Json const& spot : {Json("1,2,3"), Json("1,2,3,571,0"), Json("1,2,3,-1"), Json("1,2,nan,571"),
-                             Json("1,2,3,4294967296"), Json("x,2,3,571"), Json(571)})
-        invalid(Json::array({Step("position", {{"place", spot}})}));
+    invalid(Json::array({Step("position", {{"place", "1,2,3,571"}})}));  // LC17e: position is no act.
     auto extra = fixture.Wire(Json::array({Step("stay")}));
     extra["text"] = "do flee";
     Check(fixture.Receive(extra) == ChannelError::Invalid, "an extra key is invalid");
@@ -201,7 +199,7 @@ void ActCodes()
         {"go_to", {Intent::GoTo, {{"place", "Goldshire"}}}},
         {"stay", {Intent::Stay, Json::object()}},
         {"quest", {Intent::Quest, {{"questId", 12}}}},
-        {"position", {Intent::Position, {{"place", "17.25,-36.5,7,571"}}}},
+        {"meet_at", {Intent::MeetAt, {{"place", "you"}}}},
         {"formation", {Intent::Formation, {{"shape", "line"}}}},
         {"save_mana", {Intent::SaveMana, {{"enabled", false}}}},
         {"focus_healing", {Intent::FocusHealing, {{"targetGuid", "12"}}}},

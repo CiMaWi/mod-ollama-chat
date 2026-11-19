@@ -12,21 +12,12 @@
 
 namespace OllamaBridge
 {
-struct ChannelPosition
-{
-    double x = 0;
-    double y = 0;
-    double z = 0;
-    uint32_t mapId = 0;
-
-    bool operator==(ChannelPosition const&) const = default;
-};
 // WT18b: a place the planner knows by name (go_to, meet_at); the channel checked it is text, not blank.
 constexpr std::size_t ChannelMaxPlaceName = 64;
 
 // LC3: one step of a stepped command, its parameters by the catalogue's names. The act is a row of the installed
 // catalogue; a unit and a quest come as an id or a name (exactly one when the act takes it), a place as given, a
-// position as the spot "x,y,z,map" names, a choice as its index among the act's choices. playerbots checks the rest.
+// choice as its index among the act's choices. playerbots checks the rest.
 // LCB2: intent is the act's playerbots Intent value, its row's code in the installed index.
 struct ChannelStep
 {
@@ -35,15 +26,14 @@ struct ChannelStep
     std::string targetName;
     uint32_t questId = 0;
     std::string questName;
-    std::string place;                        // go_to, meet_at: a place's name or "x,y,z,map", as given
-    std::optional<ChannelPosition> position;  // position
-    std::optional<uint8_t> icon;              // mark
-    std::optional<uint8_t> shape;             // formation
-    std::optional<bool> enabled;              // save_mana
-    std::string itemName;                     // LC16c: an item, by name
-    std::string spellName;                    // a spell, by name
-    std::optional<uint8_t> choice;            // a choice other than an icon or a shape, as its index
-    uint32_t count = 0;                       // 1..ChannelMaxCount; 0 = the act takes none
+    std::string place;              // go_to, meet_at: a place's name, "x,y,z,map" or "you", as given
+    std::optional<uint8_t> icon;    // mark
+    std::optional<uint8_t> shape;   // formation
+    std::optional<bool> enabled;    // save_mana
+    std::string itemName;           // LC16c: an item, by name
+    std::string spellName;          // a spell, by name
+    std::optional<uint8_t> choice;  // a choice other than an icon or a shape, as its index
+    uint32_t count = 0;             // 1..ChannelMaxCount; 0 = the act takes none
 };
 constexpr uint32_t ChannelMaxCount = 1000;  // playerbots' and the hub's MAX_COUNT.
 

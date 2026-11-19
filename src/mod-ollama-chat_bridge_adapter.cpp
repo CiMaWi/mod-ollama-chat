@@ -165,7 +165,6 @@ constexpr std::pair<PlayerbotBridge::OrderField, OllamaBridge::AbilityField> Bri
     {PlayerbotBridge::OrderField::Target, OllamaBridge::AbilityField::Target},
     {PlayerbotBridge::OrderField::Icon, OllamaBridge::AbilityField::Icon},
     {PlayerbotBridge::OrderField::PlaceName, OllamaBridge::AbilityField::PlaceName},
-    {PlayerbotBridge::OrderField::Position, OllamaBridge::AbilityField::Position},
     {PlayerbotBridge::OrderField::QuestId, OllamaBridge::AbilityField::QuestId},
     {PlayerbotBridge::OrderField::Shape, OllamaBridge::AbilityField::Shape},
     {PlayerbotBridge::OrderField::Enabled, OllamaBridge::AbilityField::Enabled},
