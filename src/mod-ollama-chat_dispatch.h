@@ -1,9 +1,7 @@
 #ifndef MOD_OLLAMA_CHAT_DISPATCH_H
 #define MOD_OLLAMA_CHAT_DISPATCH_H
 
-#include "mod-ollama-chat_capability.h"
 #include "mod-ollama-chat_handler.h"
-#include "mod-ollama-chat_bridge_plan.h"
 #include "mod-ollama-chat_bridge_world.h"
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_api.h"
@@ -38,17 +36,6 @@ class PostMapJoin;
 // only place delivery happens.
 // --------------------------------------------------------------------------
 
-// Resolve the zone-scoped instance of a numbered channel (General, Trade, ...)
-// for this bot.
-//
-// ChannelMgr keys channels by their FULL name, and zone channels are named
-// "General - Elwynn Forest", not "General" -- so GetChannel("General") always
-// returns nullptr. Matching is by channel id plus zone-name containment, the
-// same way PlayerbotAI::SayToChannel does it.
-//
-// World thread only.
-Channel* OllamaResolveZoneChannel(Player* bot, uint32_t chatChannelId);
-
 // Is this guid a member of this exact channel instance?
 //
 // The playerbots fork dropped Player::IsInChannel, and the core keeps
@@ -60,7 +47,7 @@ bool OllamaIsOnChannel(Channel const* channel, ObjectGuid guid);
 
 struct OllamaChatRequest
 {
-    // Set only by SubmitBridge. Ordinary Submit rejects Bridge tags and unbound Bridge providers.
+    // Set by SubmitBridge, the only way in.
     uint64_t bridgeGeneration = 0;
     OllamaEndpointSettings bridgeSettings;
     OllamaBridge::WorldTicket bridgeTicket;
@@ -74,9 +61,7 @@ struct OllamaChatRequest
     std::string            channelName;
     uint32_t               channelId = 0;
 
-    // Loop control. Human-originated messages start at depth 0; each bot reply
-    // to a bot increments it.
-    uint8_t     chainDepth = 0;
+    // The governor's pacing scope.
     std::string scopeKey;
 
     // This line was aimed at this bot in particular -- whispered, named, or
@@ -86,24 +71,10 @@ struct OllamaChatRequest
     // Direct address skips the pacing cooldowns and repetition suppression.
     bool directAddress = false;
 
-    // Generation.
-    std::string       prompt;
-    OllamaRequestKind kind = OllamaRequestKind::ChatReply;
-
     // Resolved on the world thread before submission so the worker never has
     // to touch a Player to know these.
     std::string botName;
-    std::string originMessage;    // the message being replied to, if any
-
-    // Post-delivery behaviour.
-    bool triggerBotReplies = true;   // let other bots hear this line
-    bool recordHistory     = false;  // append to conversation history
-    bool updateSentiment   = false;  // run sentiment analysis on originMessage
 };
-
-// Submit a request. Returns false when the queue is at MaxQueueDepth, in which
-// case the caller should simply skip this bot rather than pile up backlog.
-bool OllamaDispatch_Submit(OllamaChatRequest request);
 
 // World-only adapter. Null by default: b2a cannot produce effects until b2b supplies real game validation.
 // Called afresh before cleanup and each effect; must not cache game pointers or accept wire-authored authority.
@@ -119,17 +90,6 @@ OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource();
 void OllamaChat_BridgeInstallAbilities();
 // World-only typed effect adapter (bridge_effect.cpp).
 OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor();
-// J12 lasting plans of that executor, world thread only: Open after each activation with its generation; Retire
-// makes every live plan restore-pending and closes admission (no game access, so RetireBridgeWork may call it);
-// Update (post-map-join) expires, checks group, controller and logout, and restores; Empty is the retirement proof's
-// half: no live and no restore-pending plan.
-void OllamaChat_BridgePlansOpen(uint64_t generation);
-void OllamaChat_BridgePlansRetire();
-void OllamaChat_BridgePlansUpdate(OllamaBridge::EffectPhase const& phase);
-bool OllamaChat_BridgePlansEmpty();
-OllamaBridge::PlanCounters OllamaChat_BridgePlanCounters();
-// DS.14/J5f: OllamaBridge::BotState::plans bits (PlanKind order) of the bot's live bridge plans; world thread.
-uint8_t OllamaChat_BridgePlanKinds(uint64_t botGuid);
 void OllamaChat_BridgeRefresh();
 void OllamaChat_BridgeReset();
 void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const& ticket, std::string const& reply);
@@ -165,38 +125,17 @@ void OllamaDispatch_Stop();
 
 // Explicit world-thread lifecycle notifications. Never called by native/CLI selection or queued callbacks.
 // Every publication retires old Bridge work, including bearer-only reloads. Legacy queues are untouched.
-void OllamaDispatch_BridgeConfigured(bool channelEnabled = false);
-// J5d, world thread on every config load: starts, keeps or stops the 127.0.0.1 channel listener. It runs only while
-// the channel is enabled for valid selected Bridge settings, and restarts only when the port or the token changed.
-void OllamaDispatch_BridgeListen(bool channelEnabled, uint32_t port);
+void OllamaDispatch_BridgeConfigured();
+// J5d, world thread on every config load: starts, keeps or stops the 127.0.0.1 channel listener. It runs whenever the
+// Bridge settings are valid (LCB6b: no ChannelEnabled), and restarts only when the port or the token changed.
+void OllamaDispatch_BridgeListen(uint32_t port);
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld();
 
-// Shared native-adapter boundary; every I/O operation authenticates the local game-link bearer.
-// route is an existing game-issued generation request id, never a wire-authored world scope.
-OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer, std::string_view route,
-                                                         std::string_view body, uint64_t& receipt);
-OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, uint64_t receipt,
-                                                      std::unique_ptr<OllamaBridge::ChannelPacket>& packet);
-
-// Fire-and-forget sentiment analysis. Runs entirely on a worker: the sentiment
-// store is mutex-guarded in-memory state plus async DB writes, so it never
-// needs the world thread -- and it must never run on it, because the analysis
-// is a blocking HTTP call.
-void OllamaDispatch_SubmitSentiment(uint64_t botGuid, uint64_t playerGuid,
-                                    const std::string& message);
-
-// Distil a bot's accumulated history into lasting memories, then clear it.
-// Fire-and-forget; runs entirely on a worker.
-void OllamaDispatch_SubmitCondensation(uint64_t botGuid, const std::string& prompt);
-
-// Write or revise how a bot feels about someone.
-void OllamaDispatch_SubmitRelationship(uint64_t botGuid, uint64_t otherGuid,
-                                       const std::string& otherName,
-                                       const std::string& prompt);
-
-// A player emoted at a bot and the bot decided to answer in words.
-// World thread only.
-void OllamaChat_DispatchEmoteReaction(Player* bot, Player* player, uint32_t textEmote);
+// Shared native-adapter boundary; the listener checked the local game-link bearer before it calls this (LCB6a).
+// route is an existing game-issued generation request id, never a wire-authored world scope. None: the world thread
+// answers the packet through answer (LCB6b).
+OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view route, std::string_view body,
+                                                         std::shared_ptr<OllamaBridge::ChannelAnswer> const& answer);
 
 struct OllamaDispatchStats
 {

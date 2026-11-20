@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 
 #include "bridge-ability-double.h"
 #include "mod-ollama-chat_bridge_channel.h"
@@ -13,7 +14,6 @@ using namespace OllamaBridge;
 using Json = nlohmann::json;
 unsigned checks = 0;
 Clock const now{100000, 200000};
-std::string const bearer = "synthetic-local-game-link-bearer";
 Deadline const deadline{101000, 201000};
 
 void Check(bool value, char const* label)
@@ -27,13 +27,11 @@ struct Fixture
 {
     ChannelPolicy policy;
     WorldScope scope{
-        1,       "fixture",       "codex",     "epoch-1",   9007199254740994ULL, 9007199254740993ULL, "conversation",
-        "party", "visible-party", "context-1", "members-1", "persona-1"};
-    explicit Fixture(std::size_t ids = ChannelMaxRouteIds, std::size_t pending = ChannelMaxPending)
-        : policy(ids, pending)
+        1,       "fixture",       "codex",     "epoch-1",  9007199254740994ULL, 9007199254740993ULL, "conversation",
+        "party", "visible-party", "context-1", "members-1"};
+    explicit Fixture(std::size_t ids = ChannelMaxRouteIds) : policy(ids)
     {
-        Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}, bearer), "trusted selected epoch binding");
-        Check(policy.ObserveScope(scope, now), "trusted scope registration");
+        Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}), "trusted selected epoch binding");
     }
     void Open(std::string const& id = "work")
     {
@@ -63,8 +61,7 @@ struct Fixture
         json["commandId"] = std::move(id);
         json["issuerGuid"] = std::to_string(scope.controllerGuid);
         json["botGuid"] = std::to_string(scope.botGuid);
-        json["intent"] = "stay";
-        json["params"] = Json::object();
+        json["steps"] = Json::array({{{"act", "follow"}, {"params", Json::object()}}});
         return json;
     }
     ChannelError Receive(Json const& json, Clock clock = now)
@@ -74,7 +71,7 @@ struct Fixture
         bool const query = json.contains("type") && json.at("type") == "query";
         std::string const route =
             !query && json.at("requestId").is_string() ? json.at("requestId").get<std::string>() : "work";
-        return policy.Receive(bearer, json.dump(), scope, clock, result, route);
+        return policy.Receive(json.dump(), scope, clock, result, route);
     }
 };
 
@@ -83,11 +80,12 @@ void IdentityAndTerminal()
     Fixture f;
     f.Open();
     ChannelMessage result;
-    Check(f.policy.Receive("wrong", "{", f.scope, now, result, "work") == ChannelError::Unauthorized,
-          "auth precedes parse");
-    Check(f.policy.Receive("wrong", std::string(MaxRequestBytes + 1, 'x'), f.scope, now, result, "work") ==
-              ChannelError::Unauthorized,
-          "auth precedes body size error");
+    // LCB6a: the listener's BearerMatches is the one bearer check; an unbound policy refuses before it parses.
+    ChannelPolicy unbound;
+    Check(unbound.Receive("{", f.scope, now, result, "work") == ChannelError::Inactive &&
+              unbound.Receive(std::string(MaxRequestBytes + 1, 'x'), f.scope, now, result, "work") ==
+                  ChannelError::Inactive,
+          "an unbound channel parses nothing");
     Check(f.Receive(f.Wire("hello")) == ChannelError::Invalid, "hello cannot register work");
     auto command = f.Command();
     for (auto const* field : {"instance", "provider", "epoch"})
@@ -99,15 +97,18 @@ void IdentityAndTerminal()
     Check(f.Receive(f.Command("other", "unknown")) == ChannelError::Unknown, "unregistered request cannot command");
     Check(f.Receive(command) == ChannelError::None, "typed proposal stages");
     Check(f.Receive(command) == ChannelError::Duplicate, "effect replay blocked");
-    auto terminal = f.Wire("generation.result");
-    terminal["text"] = "I shall wait here.";
-    Check(f.Receive(terminal) == ChannelError::None, "one terminal result");
-    // LC.35: the terminal drops the route with its ids; whatever follows finds no route.
-    Check(f.Receive(terminal) == ChannelError::Unknown, "duplicate terminal blocked");
+    // LCB6a: a generation result or failure is no inbound channel type; refusing one closes nothing.
+    for (auto const* type : {"generation.result", "failure"})
+    {
+        auto stray = f.Wire(type);
+        stray["text"] = "I shall wait here.";
+        stray["code"] = "unavailable";
+        Check(f.Receive(stray) == ChannelError::Invalid, "an inbound generation result or failure is invalid");
+    }
+    Check(f.Receive(f.Command("after-stray")) == ChannelError::None, "a stray post closes nothing");
+    // LC.35: the game ends the route with its ids; whatever follows finds no route.
+    f.policy.Drop("work");
     Check(f.Receive(f.Command("late")) == ChannelError::Unknown, "command cannot follow terminal");
-    auto failure = f.Wire("failure");
-    failure["code"] = "unavailable";
-    Check(f.Receive(failure) == ChannelError::Unknown, "failure cannot replace terminal");
     std::string body;
     ChannelEnvelope envelope{"fixture", "codex", "epoch-1", "work", deadline.unixMs};
     // WorldChannel finishes every command in the tick it arrives, so nothing is left to report after the terminal.
@@ -121,25 +122,21 @@ void IdentityAndTerminal()
 
     Fixture failed;
     failed.Open();
-    failure = failed.Wire("failure");
-    failure["code"] = "timeout";
-    Check(failed.Receive(failure) == ChannelError::None, "failure terminal accepted");
-    Check(failed.Receive(failed.Command()) == ChannelError::Unknown, "failure cannot authorize effects");
-    Check(failed.policy.Bind({"fixture", "codex", "", "epoch-2"}, bearer + "-new"), "reconnect uses new epoch");
-    Check(!failed.policy.ObserveScope(failed.scope, now), "reconnect rejects old scope");
-    Check(failed.Receive(failure) == ChannelError::Unauthorized, "old bearer retired");
+    failed.policy.Drop("work");
+    auto const old = failed.Command("old");
+    Check(failed.Receive(old) == ChannelError::Unknown, "a closed route cannot authorize effects");
+    Check(failed.policy.Bind({"fixture", "codex", "", "epoch-2"}), "reconnect uses new epoch");
+    Check(failed.Receive(old) == ChannelError::Stale, "the old epoch is retired");
     failed.scope.epoch = "epoch-2";
-    Check(failed.policy.ObserveScope(failed.scope, now), "fresh epoch scope");
-    Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result, "work") ==
-              ChannelError::Stale,
-          "old terminal cannot cross reconnect");
-    failure["epoch"] = "epoch-2";
-    Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result, "work") ==
-              ChannelError::Unknown,
+    Check(failed.policy.Receive(old.dump(), failed.scope, now, result, "work") == ChannelError::Stale,
+          "an old command cannot cross reconnect");
+    auto renewed = old;
+    renewed["epoch"] = "epoch-2";
+    Check(failed.policy.Receive(renewed.dump(), failed.scope, now, result, "work") == ChannelError::Unknown,
           "reconnect cannot reopen old work");
     // LC.35: only the previous binding's epoch is remembered (epochs are 128-bit random, never reissued).
-    Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-2"}, bearer), "retired epoch reuse fails closed");
-    Check(!failed.policy.ObserveScope(failed.scope, now), "bad activation leaves inactive");
+    Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-2"}), "retired epoch reuse fails closed");
+    Check(failed.Receive(renewed) == ChannelError::Inactive, "bad activation leaves inactive");
 }
 
 void ExpiryAndScope()
@@ -163,36 +160,38 @@ void ExpiryAndScope()
     changedDeadline["deadlineUnixMs"] = deadline.unixMs - 1;
     Check(f.Receive(changedDeadline) == ChannelError::Stale, "must preserve exact deadline");
     Check(f.Receive(f.Command(), {100999, 200999}) == ChannelError::None, "last live millisecond accepted");
-    f.policy.RemoveScope(f.scope.botGuid, f.scope.contextId);
-    Check(f.Receive(f.Command("removed")) == ChannelError::Stale, "removed context rejected");
-    Check(f.policy.ObserveScope(f.scope, now), "same scope can be observed again");
-    Check(f.Receive(f.Command("revive")) == ChannelError::Stale, "reobservation cannot revive old request");
-    for (auto const* field : {"controller", "context", "membership", "persona", "perception", "channel"})
+    // LCB6b: the ledger refuses a route of another bot, controller or context; whether the conversation is still
+    // current (a revision, a lapse) is WorldPolicy's question, which the channel asks (bridge-world-selftest).
+    for (auto const* field : {"bot", "controller", "context id", "context", "membership", "perception", "channel"})
     {
         Fixture revision;
         revision.Open();
+        std::string const name = field;
+        if (name == "bot")
+            revision.scope.botGuid += 1;
+        if (name == "context id")
+            revision.scope.contextId = "context-2";
         if (std::string(field) == "controller")
             revision.scope.controllerGuid += 1;
         if (std::string(field) == "context")
             revision.scope.contextRevision += "-new";
         if (std::string(field) == "membership")
             revision.scope.membershipRevision += "-new";
-        if (std::string(field) == "persona")
-            revision.scope.personaRevision += "-new";
         if (std::string(field) == "perception")
             revision.scope.perceptionScope += "-new";
         if (std::string(field) == "channel")
             revision.scope.channel = "direct";
-        Check(revision.policy.ObserveScope(revision.scope, now), "trusted scope revision");
-        Check(revision.Receive(revision.Command()) == ChannelError::Stale, "revision invalidates old work");
+        bool const owner = name == "bot" || name == "controller" || name == "context id";
+        Check(revision.Receive(revision.Command()) == (owner ? ChannelError::Stale : ChannelError::None),
+              "another route owner is stale; a scope revision is WorldPolicy's");
     }
     Fixture lapsed;
     Deadline const longDeadline{110000, 210000};
     Check(lapsed.policy.OpenGeneration(lapsed.scope, "work", longDeadline, now) == ChannelError::None, "long work");
-    Check(lapsed.policy.ObserveScope(lapsed.scope, {105000, 205000}), "refresh after scope expiry");
     auto late = lapsed.Command();
     late["deadlineUnixMs"] = longDeadline.unixMs;
-    Check(lapsed.Receive(late, {105000, 205000}) == ChannelError::Stale, "scope expiry cannot revive by refresh");
+    Check(lapsed.Receive(late, {105000, 205000}) == ChannelError::None,
+          "the ledger keeps a route to its own deadline; the conversation's liveness is WorldPolicy's");
     Check(lapsed.policy.OpenGeneration(lapsed.scope, "too-long", {225001, 325001}, {105000, 205000}) ==
               ChannelError::Invalid,
           "120 second maximum");
@@ -203,23 +202,21 @@ void Schemas()
     Fixture f;
     f.Open();
     ChannelMessage result;
-    Check(f.policy.Receive(bearer, "{", f.scope, now, result, "work") == ChannelError::Invalid, "malformed JSON");
-    Check(f.policy.Receive(bearer, std::string(MaxRequestBytes + 1, ' '), f.scope, now, result, "work") ==
-              ChannelError::TooLarge,
-          "bounded body before parse");
-    Check(f.policy.Receive(bearer, std::string(MaxRequestBytes, ' '), f.scope, now, result, "work") ==
-              ChannelError::Invalid,
+    Check(f.policy.Receive("{", f.scope, now, result, "work") == ChannelError::Invalid, "malformed JSON");
+    Check(
+        f.policy.Receive(std::string(MaxRequestBytes + 1, ' '), f.scope, now, result, "work") == ChannelError::TooLarge,
+        "bounded body before parse");
+    Check(f.policy.Receive(std::string(MaxRequestBytes, ' '), f.scope, now, result, "work") == ChannelError::Invalid,
           "exact body maximum reaches parser");
     auto duplicate = f.Command().dump();
     duplicate.insert(1, "\"version\":1,");
-    Check(f.policy.Receive(bearer, duplicate, f.scope, now, result, "work") == ChannelError::Invalid,
+    Check(f.policy.Receive(duplicate, f.scope, now, result, "work") == ChannelError::Invalid,
           "duplicate key before DOM overwrite");
     duplicate = f.Command().dump();
     auto const position = duplicate.find("\"params\":{}");
     duplicate.replace(position, 11, "\"params\":{\"x\":1,\"x\":2}");
-    Check(f.policy.Receive(bearer, duplicate, f.scope, now, result, "work") == ChannelError::Invalid,
-          "nested duplicate key");
-    Check(f.policy.Receive(bearer, std::string(20, '[') + "0" + std::string(20, ']'), f.scope, now, result, "work") ==
+    Check(f.policy.Receive(duplicate, f.scope, now, result, "work") == ChannelError::Invalid, "nested duplicate key");
+    Check(f.policy.Receive(std::string(20, '[') + "0" + std::string(20, ']'), f.scope, now, result, "work") ==
               ChannelError::Invalid,
           "parser nesting bound");
     for (auto const& pair : std::vector<std::pair<std::string, Json>>{{"version", 1.0},
@@ -232,86 +229,44 @@ void Schemas()
                                                                       {"issuerGuid", "18446744073709551616"},
                                                                       {"issuerGuid", "0"},
                                                                       {"commandId", std::string(129, 'a')},
-                                                                      {"intent", "stay;delete"},
-                                                                      {"params", Json::array()},
+                                                                      {"steps", "follow"},
+                                                                      {"steps", Json::array()},
+                                                                      {"intent", "follow"},
+                                                                      {"params", Json::object()},
                                                                       {"extra", "private"}})
     {
         auto bad = f.Command();
         bad[pair.first] = pair.second;
         Check(f.Receive(bad) == ChannelError::Invalid, "strict exact envelope or payload field");
     }
+    // LCB2: one form; a follow or stay with any keyed params (the old standing shape) is invalid like any other.
     for (auto const& pair :
-         std::vector<std::pair<std::string, Json>>{{"pull", {{"targetGuid", "01"}}},
-                                                   {"mark", {{"targetGuid", "1"}, {"icon", 8}}},
-                                                   {"mark", {{"targetGuid", "1"}, {"icon", 1.0}}},
-                                                   {"assign_role", {{"role", "leader"}}},
-                                                   {"save_mana", {{"enabled", 1}}},
-                                                   {"formation", {{"shape", "circle"}}},
-                                                   {"dungeon_clear", {{"mode", "restart"}}},
+         std::vector<std::pair<std::string, Json>>{{"mark", {{"targetGuid", "01"}, {"icon", "star"}}},
+                                                   {"mark", {{"target", "Hogger"}, {"icon", 7}}},
+                                                   {"mark", {{"target", "Hogger"}, {"icon", "Skull"}}},
                                                    {"go_to", {{"place", ""}}},
-                                                   {"meet_at", {{"questId", 1}}},
-                                                   {"quest", {{"questId", 0}}},
-                                                   {"quest", {{"place", "Goldshire"}}},
-                                                   {"errands", {{"place", "Goldshire"}}},
-                                                   {"position", {{"x", 1}, {"y", 2}, {"z", 3}, {"mapId", -1}}},
-                                                   {"position", {{"x", "1"}, {"y", 2}, {"z", 3}, {"mapId", 0}}}})
+                                                   {"go_to", {{"questId", 1}}},
+                                                   {"follow", {{"targetGuid", "1"}}},
+                                                   {"follow", {{"standing", true}}},
+                                                   {"follow", {{"durationMs", 30000}}}})
     {
         auto bad = f.Command();
-        bad["intent"] = pair.first;
-        bad["params"] = pair.second;
-        Check(f.Receive(bad) == ChannelError::Invalid, "strict intent parameters");
-    }
-    // J5e: follow or stay with any keyed params is a standing shape: still 400 invalid_input, but with its reason.
-    for (auto const& pair : std::vector<std::pair<std::string, Json>>{
-             {"stay", {{"targetGuid", "1"}}}, {"follow", {{"standing", true}}}, {"stay", {{"durationMs", 30000}}}})
-    {
-        auto bad = f.Command();
-        bad["intent"] = pair.first;
-        bad["params"] = pair.second;
-        Check(f.Receive(bad) == ChannelError::Standing, "J5e: follow or stay with params is a standing shape");
+        bad["steps"] = Json::array({{{"act", pair.first}, {"params", pair.second}}});
+        Check(f.Receive(bad) == ChannelError::Invalid, "strict act parameters");
     }
     Check(f.policy.CommandReservations() == 0, "malformed payloads reserve no effect ids");
     unsigned sequence = 0;
-    for (auto const& pair :
-         std::vector<std::pair<std::string, Json>>{{"follow", Json::object()},
-                                                   {"stay", Json::object()},
-                                                   {"flee", Json::object()},
-                                                   {"regroup", Json::object()},
-                                                   {"attack_own_target", Json::object()},
-                                                   {"pull", {{"targetGuid", "18446744073709551615"}}},
-                                                   {"mark", {{"targetGuid", "1"}, {"icon", 7}}},
-                                                   {"focus_healing", {{"targetGuid", "2"}}},
-                                                   {"assign_role", {{"role", "healer"}}},
-                                                   {"save_mana", {{"enabled", false}}},
-                                                   {"formation", {{"shape", "spread"}}},
-                                                   {"position", {{"x", 1.5}, {"y", -2}, {"z", 3}, {"mapId", 0}}},
-                                                   {"dungeon_clear", {{"mode", "pause"}}},
-                                                   {"go_to", {{"place", "Goldshire"}}},
-                                                   {"quest", {{"questId", 4294967295ULL}}},
-                                                   {"errands", Json::object()},
-                                                   {"set_hearth", Json::object()},
-                                                   {"grind_here", Json::object()},
-                                                   {"gather_here", Json::object()},
-                                                   {"meet_at", {{"place", std::string(64, 'm')}}},
-                                                   {"pause_plan", Json::object()},
-                                                   {"resume_plan", Json::object()}})
+    for (auto const& [act, params, intent] : std::vector<std::tuple<std::string, Json, PlayerbotBridge::Intent>>{
+             {"follow", Json::object(), PlayerbotBridge::Intent::Follow},
+             {"mark", {{"targetGuid", "18446744073709551615"}, {"icon", "skull"}}, PlayerbotBridge::Intent::Mark},
+             {"go_to", {{"place", std::string(64, 'm')}}, PlayerbotBridge::Intent::GoTo}})
     {
         auto good = f.Command("effect-" + std::to_string(++sequence));
-        good["intent"] = pair.first;
-        good["params"] = pair.second;
-        Check(f.policy.Receive(bearer, good.dump(), f.scope, now, result, "work") == ChannelError::None,
-              "whitelist decodes into typed values");
-        Check(static_cast<unsigned>(std::get<ChannelCommand>(result.payload).intent) == sequence - 1,
-              "typed intent preserved");
+        good["steps"] = Json::array({{{"act", act}, {"params", params}}});
+        Check(f.policy.Receive(good.dump(), f.scope, now, result, "work") == ChannelError::None,
+              "the catalogue's acts decode into typed steps");
+        Check(std::get<ChannelCommand>(result.payload).steps.front().intent == intent, "the act's code preserved");
     }
-    auto terminal = f.Wire("generation.result");
-    for (std::string text : {std::string(4097, 'x'), std::string("\0", 1), std::string("  \n")})
-    {
-        terminal["text"] = text;
-        Check(f.Receive(terminal) == ChannelError::Invalid, "bounded usable text");
-    }
-    terminal["text"] = std::string(4096, 'x');
-    Check(f.Receive(terminal) == ChannelError::None, "exact text byte maximum");
 }
 
 void QueriesAndCapacity()
@@ -319,7 +274,7 @@ void QueriesAndCapacity()
     Fixture f;
     f.Open();  // LC.35: queries open under a live generation route.
     ChannelMessage query;
-    Check(f.policy.Receive(bearer, f.Query().dump(), f.scope, now, query, "work") == ChannelError::None,
+    Check(f.policy.Receive(f.Query().dump(), f.scope, now, query, "work") == ChannelError::None,
           "authenticated reverse query");
     Check(f.Receive(f.Query()) == ChannelError::Duplicate, "query id replay reserved separately from effects");
     Check(f.Receive(f.Command("effect", "query")) == ChannelError::Invalid, "query ids never authorize commands");
@@ -333,8 +288,7 @@ void QueriesAndCapacity()
     Check(f.policy.FinishQuery(query.envelope, f.scope, units, now, body) == ChannelError::Stale,
           "query terminal once");
     Check(body.empty(), "no stale query output after refusal");
-    Check(f.policy.Receive(bearer, f.Query("q2").dump(), f.scope, now, query, "work") == ChannelError::None,
-          "second query");
+    Check(f.policy.Receive(f.Query("q2").dump(), f.scope, now, query, "work") == ChannelError::None, "second query");
     units.front().healthPercent = 101;
     Check(f.policy.FinishQuery(query.envelope, f.scope, units, now, body) == ChannelError::Invalid, "invalid UI field");
     units.front().healthPercent = 80;
@@ -344,7 +298,7 @@ void QueriesAndCapacity()
           "observed optional fields retained");
     parsed = Json::parse(body);
     Check(parsed.at("units").at(0).size() == 5, "exact declared unit fields");
-    Check(f.policy.Receive(bearer, f.Query("q3").dump(), f.scope, now, query, "work") == ChannelError::None,
+    Check(f.policy.Receive(f.Query("q3").dump(), f.scope, now, query, "work") == ChannelError::None,
           "query for local failure");
     Check(f.policy.FinishQuery(query.envelope, f.scope, std::vector<Participant>(41, units.front()), now, body) ==
               ChannelError::TooLarge,
@@ -363,12 +317,10 @@ void QueriesAndCapacity()
     Check(f.policy.FinishFailure(query.envelope, ChannelFailure::Cancelled, f.scope, now, body) == ChannelError::Stale,
           "local failure terminal once");
     Check(f.Receive(f.Command("query-after-failure", "q3")) == ChannelError::Closed, "failed query remains closed");
-    Fixture slots(4, 1);
+    Fixture slots(4);
     slots.Open();
-    Check(slots.Receive(slots.Query()) == ChannelError::Capacity, "pending work fails closed");
-    auto failure = slots.Wire("failure");
-    failure["code"] = "cancelled";
-    Check(slots.Receive(failure) == ChannelError::None, "terminal releases only logical pending work");
+    Check(slots.Receive(slots.Query()) == ChannelError::None, "LC.38: no ledger-wide pending count refuses a query");
+    slots.policy.Drop("work");
     Check(slots.Receive(slots.Query()) == ChannelError::Unknown, "a closed route opens no query");
     slots.Open("work-2");
     Check(slots.policy.RequestReservations() == 1, "a closed route keeps no replay reservation");
@@ -390,52 +342,37 @@ void QueriesAndCapacity()
         for (std::size_t k = 0; k < 3; ++k)
         {
             ChannelMessage asked;
-            Check(full.policy.Receive(bearer, full.Query("q-" + std::to_string(i) + "-" + std::to_string(k)).dump(),
-                                      full.scope, now, asked, id) == ChannelError::None,
+            Check(full.policy.Receive(full.Query("q-" + std::to_string(i) + "-" + std::to_string(k)).dump(), full.scope,
+                                      now, asked, id) == ChannelError::None,
                   "5000: every query admitted");
         }
         Check(full.Receive(full.Command("c-" + std::to_string(i), id)) == ChannelError::None,
               "5000: every command admitted");
-        auto close = full.Wire(i % 2 ? "generation.result" : "failure", id);
-        if (i % 2)
-            close["text"] = "Done.";
-        else
-            close["code"] = "unavailable";
-        Check(full.Receive(close) == ChannelError::None, "5000: every route closes");
+        full.policy.Drop(id);
     }
     Check(
         full.policy.RequestReservations() == 0 && full.policy.CommandReservations() == 0 && full.policy.Pending() == 0,
         "closed routes leave an empty ledger");
-    auto lateFailure = full.Wire("failure", "work-0");
-    lateFailure["code"] = "unavailable";
-    auto lateText = full.Wire("generation.result", "work-1");
-    lateText["text"] = "Again.";
     ChannelMessage late;
-    Check(full.Receive(lateFailure) == ChannelError::Unknown && full.Receive(lateText) == ChannelError::Unknown &&
-              full.Receive(full.Command("c-0", "work-0")) == ChannelError::Unknown &&
-              full.policy.Receive(bearer, full.Query("q-0-0").dump(), full.scope, now, late, "work-0") ==
-                  ChannelError::Unknown,
-          "a late replay of a closed route's failure, text, command or query is unknown_request");
+    Check(full.Receive(full.Command("c-0", "work-0")) == ChannelError::Unknown &&
+              full.policy.Receive(full.Query("q-0-0").dump(), full.scope, now, late, "work-0") == ChannelError::Unknown,
+          "a late replay of a closed route's command or query is unknown_request");
     Fixture pair;
     pair.Open("route-a");
     pair.Open("route-b");
     ChannelMessage asked;
-    Check(
-        pair.policy.Receive(bearer, pair.Query("qa").dump(), pair.scope, now, asked, "route-a") == ChannelError::None &&
-            pair.policy.Receive(bearer, pair.Query("qb").dump(), pair.scope, now, asked, "route-b") ==
-                ChannelError::None &&
-            pair.Receive(pair.Command("ca", "route-a")) == ChannelError::None &&
-            pair.Receive(pair.Command("cb", "route-b")) == ChannelError::None,
-        "two routes, each with a query and a command");
-    auto closeA = pair.Wire("generation.result", "route-a");
-    closeA["text"] = "Done.";
-    Check(pair.Receive(closeA) == ChannelError::None, "route a closes");
+    Check(pair.policy.Receive(pair.Query("qa").dump(), pair.scope, now, asked, "route-a") == ChannelError::None &&
+              pair.policy.Receive(pair.Query("qb").dump(), pair.scope, now, asked, "route-b") == ChannelError::None &&
+              pair.Receive(pair.Command("ca", "route-a")) == ChannelError::None &&
+              pair.Receive(pair.Command("cb", "route-b")) == ChannelError::None,
+          "two routes, each with a query and a command");
+    pair.policy.Drop("route-a");
     Check(pair.policy.RequestReservations() == 2 && pair.policy.CommandReservations() == 1,
           "only the closed route's ids leave the ledger");
-    Check(pair.Receive(pair.Command("cb", "route-b")) == ChannelError::Duplicate &&
-              pair.policy.Receive(bearer, pair.Query("qb").dump(), pair.scope, now, asked, "route-b") ==
-                  ChannelError::Duplicate,
-          "the open route's ids stay refused as duplicates");
+    Check(
+        pair.Receive(pair.Command("cb", "route-b")) == ChannelError::Duplicate &&
+            pair.policy.Receive(pair.Query("qb").dump(), pair.scope, now, asked, "route-b") == ChannelError::Duplicate,
+        "the open route's ids stay refused as duplicates");
     Check(pair.Receive(pair.Command("ca", "route-a")) == ChannelError::Unknown,
           "a closed route's command id never lands on that route");
     // A dropped route's ids are answered nowhere: not under their own envelope and not under the open route's.
@@ -458,25 +395,19 @@ void QueriesAndCapacity()
           "the open route's command still reports once, on its own route");
     Fixture aging;
     aging.Open("old");
-    Check(aging.policy.Receive(bearer, aging.Query("old-q").dump(), aging.scope, now, asked, "old") ==
-                  ChannelError::None &&
+    Check(aging.policy.Receive(aging.Query("old-q").dump(), aging.scope, now, asked, "old") == ChannelError::None &&
               aging.Receive(aging.Command("old-c", "old")) == ChannelError::None,
           "expiry: a route with a query and a command");
     Clock const after{deadline.unixMs, deadline.steadyMs};
     aging.policy.Expire(after);
     Check(aging.policy.RequestReservations() == 0 && aging.policy.CommandReservations() == 0,
           "expiry: a route at its deadline leaves the ledger with its ids");
-    auto lateTimeout = aging.Wire("failure", "old");
-    lateTimeout["code"] = "timeout";
-    Check(aging.Receive(lateTimeout, after) == ChannelError::Unknown &&
-              aging.Receive(aging.Command("old-c", "old"), after) == ChannelError::Unknown,
+    Check(aging.Receive(aging.Command("old-c", "old"), after) == ChannelError::Unknown,
           "expiry: a late replay finds no route");
     ChannelPolicy invalid(0);
-    Check(!invalid.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "zero capacity fails closed");
+    Check(!invalid.Bind({"fixture", "codex", "", "invalid-limits"}), "zero capacity fails closed");
     ChannelPolicy tooMany(ChannelMaxRouteIds + 1);
-    Check(!tooMany.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "cannot expand id bound");
-    ChannelPolicy tooPending(1, ChannelMaxPending + 1);
-    Check(!tooPending.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "cannot expand pending bound");
+    Check(!tooMany.Bind({"fixture", "codex", "", "invalid-limits"}), "cannot expand id bound");
 
     Fixture effects;
     effects.Open();
@@ -486,29 +417,28 @@ void QueriesAndCapacity()
     Check(effects.policy.CommandReservations() == ChannelMaxRouteIds, "exact route id maximum");
     Check(effects.Receive(effects.Command("overflow")) == ChannelError::Capacity, "a full route refuses another id");
     Check(effects.Receive(effects.Command("effect-0")) == ChannelError::Duplicate, "first effect never evicted");
-    Check(effects.policy.Receive(bearer, effects.Query("q-over").dump(), effects.scope, now, asked, "work") ==
+    Check(effects.policy.Receive(effects.Query("q-over").dump(), effects.scope, now, asked, "work") ==
               ChannelError::Capacity,
           "queries share the route's id bound");
-    Fixture scopes;
-    for (unsigned i = 1; i < ChannelMaxScopes; ++i)
+    // LC.38: the ledger keeps no scope table and no count of bots in talk: routes of 200 bots open.
+    Fixture bots;
+    for (unsigned i = 1; i <= 200; ++i)
     {
-        auto scope = scopes.scope;
+        auto scope = bots.scope;
+        scope.botGuid += i;
         scope.contextId = "context-" + std::to_string(i);
-        Check(scopes.policy.ObserveScope(scope, now), "scope reservation up to maximum");
+        Check(bots.policy.OpenGeneration(scope, "bot-" + std::to_string(i), deadline, now) == ChannelError::None,
+              "LC.38: a route per bot, no fixed count");
     }
-    auto extra = scopes.scope;
-    extra.contextId = "overflow";
-    Check(!scopes.policy.ObserveScope(extra, now), "scope capacity fails closed");
-    scopes.policy.RemoveScope(scopes.scope.botGuid, scopes.scope.contextId);
-    Check(scopes.policy.ObserveScope(extra, now), "removed scope frees bounded scope slot");
+    Check(bots.policy.RequestReservations() == 200, "200 bots' routes held");
     // LC.35: no epoch history bound; only the previous binding's epoch is refused (epochs are 128-bit random).
     ChannelPolicy epochs;
     for (unsigned i = 0; i < 5000; ++i)
-        Check(epochs.Bind({"fixture", "codex", "", "epoch-" + std::to_string(i)}, bearer),
+        Check(epochs.Bind({"fixture", "codex", "", "epoch-" + std::to_string(i)}),
               "fresh epochs bind without a history bound");
-    Check(!epochs.Bind({"fixture", "codex", "", "epoch-4999"}, bearer), "the previous binding's epoch is refused");
+    Check(!epochs.Bind({"fixture", "codex", "", "epoch-4999"}), "the previous binding's epoch is refused");
     ChannelMessage output;
-    Check(epochs.Receive(bearer, f.Query().dump(), f.scope, now, output, "work") == ChannelError::Unauthorized,
+    Check(epochs.Receive(f.Query().dump(), f.scope, now, output, "work") == ChannelError::Inactive,
           "a refused rebind leaves inactive");
 }
 }  // namespace
@@ -530,7 +460,7 @@ Json Topic(Fixture& f, std::string const& id, StateTopic topic, std::vector<Stat
     auto wire = StateQuery(f, id, StateTopicName(topic));
     if (topic == StateTopic::Route)
         wire["place"] = "Goldshire";  // WT18b: route names its place.
-    Check(f.policy.Receive(bearer, wire.dump(), f.scope, now, message, "work") == ChannelError::None,
+    Check(f.policy.Receive(wire.dump(), f.scope, now, message, "work") == ChannelError::None,
           "bot_state query admitted");
     auto const& query = std::get<ChannelQuery>(message.payload);
     Check(query.kind == QueryKind::BotState && query.topic == topic &&
@@ -610,7 +540,7 @@ void Topics()
     auto longest = StateQuery(f, "route-64", "route");
     longest["place"] = widest;
     ChannelMessage routed;
-    Check(f.policy.Receive(bearer, longest.dump(), f.scope, now, routed, "work") == ChannelError::None &&
+    Check(f.policy.Receive(longest.dump(), f.scope, now, routed, "work") == ChannelError::None &&
               std::get<ChannelQuery>(routed.payload).place == widest,
           "a place of 64 bytes is carried as given");
     longest = StateQuery(f, "route-66", "route");
@@ -792,8 +722,7 @@ void Topics()
 
     // Terminal once, unknown topic value refused, wrong work refused.
     ChannelMessage message;
-    Check(f.policy.Receive(bearer, StateQuery(f, "once", "spells").dump(), f.scope, now, message, "work") ==
-              ChannelError::None,
+    Check(f.policy.Receive(StateQuery(f, "once", "spells").dump(), f.scope, now, message, "work") == ChannelError::None,
           "query for terminal check");
     std::string body;
     Check(f.policy.FinishTopic(message.envelope, f.scope, static_cast<StateTopic>(StateTopicCount), {}, now, body) ==
@@ -835,29 +764,21 @@ Json CatalogueQuery(Fixture const& f, std::string const& id)
 void Catalogue()
 {
     auto const bytes = SetAbilityIndex(TestAbilityIndex());
-    Check(bytes > 0 && bytes <= ChannelMaxCatalogueBytes && Abilities().rows.size() == 17 &&
-              Abilities().verbs.size() == 22 && CatalogueInstalled(),
+    Check(bytes > 0 && bytes <= ChannelMaxCatalogueBytes && Abilities().rows.size() == 17 && CatalogueInstalled(),
           "the double installs");
     Check(ChannelMaxCatalogueBytes == 49152 && ChannelMaxCatalogueBytes + 4096 < MaxCatalogueResponseBytes &&
               MaxResponseBytes == 32768,
           "the catalogue's budget leaves its answer headroom; the other bodies keep 32 KB");
 
-    // A refused index leaves the channel none: no verb, no topic, no catalogue.
+    // A refused index leaves the channel none: no act, no topic, no catalogue.
     using Change = void (*)(AbilityIndex&);
     Change const refused[] = {
-        [](AbilityIndex& index) { index.verbs.pop_back(); },
-        [](AbilityIndex& index) { index.verbs[1].name = index.verbs[0].name; },
-        [](AbilityIndex& index) { index.verbs[1].intent = ChannelIntent::Follow; },
-        [](AbilityIndex& index) { index.verbs[0].name = "Follow"; },
-        [](AbilityIndex& index) { index.verbs[0].intent = static_cast<ChannelIntent>(22); },
-        [](AbilityIndex& index) { index.verbs[3].name = "Regroup"; },
-        [](AbilityIndex& index) { index.verbs[3].intent = static_cast<ChannelIntent>(22); },
-        [](AbilityIndex& index) { index.rows[0].name = "chase"; },
-        [](AbilityIndex& index) { index.rows[1].code = static_cast<uint8_t>(ChannelIntent::Stay); },
+        [](AbilityIndex& index) { index.rows[0].name = "Follow"; },
+        [](AbilityIndex& index) { index.rows[1].name = index.rows[0].name; },
+        [](AbilityIndex& index) { index.rows[1].code = index.rows[0].code; },
         [](AbilityIndex& index) { index.rows[4].name = index.rows[3].name; },
         [](AbilityIndex& index) { index.rows[4].code = index.rows[3].code; },
         [](AbilityIndex& index) { index.rows[10].params.push_back(index.rows[10].params.front()); },
-        [](AbilityIndex& index) { index.rows[1].code = static_cast<uint8_t>(ChannelIntentCount); },
         [](AbilityIndex& index) { index.rows[3].name = "inventory items"; },
         [](AbilityIndex& index) { index.rows.clear(); },
         [](AbilityIndex& index) { index.version = 0; },
@@ -870,19 +791,18 @@ void Catalogue()
         Check(SetAbilityIndex(std::move(index)) == 0, "a malformed index is refused before it is encoded");
         Fixture f;
         f.Open();
-        Check(Abilities().rows.empty() && Abilities().verbs.empty() && !CatalogueInstalled() &&
-                  f.Receive(f.Command()) == ChannelError::Invalid &&
+        Check(Abilities().rows.empty() && !CatalogueInstalled() && f.Receive(f.Command()) == ChannelError::Invalid &&
                   f.Receive(StateQuery(f, "refused-topic", "quests")) == ChannelError::Invalid &&
                   !*StateTopicName(StateTopic::Quests) && f.policy.CommandReservations() == 0,
-              "a refused index leaves no verb, no topic and no topic name");
+              "a refused index leaves no act, no topic and no topic name");
     }
     // LC3b (LC3a review 1): a catalogue the query cannot send, over its budget or not UTF-8, drops only the
-    // catalogue: the verbs and topics stand.
+    // catalogue: the acts and topics stand.
     auto const standing = [](char const* label)
     {
         Fixture f;
         f.Open();
-        Check(Abilities().rows.size() == 17 && Abilities().verbs.size() == 22 && !CatalogueInstalled() &&
+        Check(Abilities().rows.size() == 17 && !CatalogueInstalled() &&
                   f.Receive(f.Command("standing")) == ChannelError::None &&
                   f.Receive(StateQuery(f, "standing-topic", "quests")) == ChannelError::None &&
                   std::string(StateTopicName(StateTopic::Quests)) == "quests",
@@ -897,22 +817,22 @@ void Catalogue()
     Check(SetAbilityIndex(std::move(broken)) == 0, "a catalogue that is not UTF-8 has no size");
     standing("a catalogue that is not UTF-8 drops only the catalogue");
 
-    // The words are the index's: a renamed verb or topic is taken under its new word only.
+    // The words are the index's: a renamed act or topic is taken under its new word only.
     auto renamed = TestAbilityIndex();
-    renamed.verbs[1].name = "hold";
+    renamed.rows[0].name = "chase";
     renamed.rows[8].name = "plans";
     renamed.rows.erase(renamed.rows.begin() + 4);
     Check(SetAbilityIndex(std::move(renamed)) > 0, "a renamed double installs");
     {
         Fixture f;
         f.Open();
-        auto stay = f.Command("renamed");
-        Check(f.Receive(stay) == ChannelError::Invalid, "the old word is no verb once the index renames it");
-        stay["intent"] = "hold";
+        auto chase = f.Command("renamed");
+        Check(f.Receive(chase) == ChannelError::Invalid, "the old word is no act once the index renames it");
+        chase["steps"][0]["act"] = "chase";
         ChannelMessage result;
-        Check(f.policy.Receive(bearer, stay.dump(), f.scope, now, result, "work") == ChannelError::None &&
-                  std::get<ChannelCommand>(result.payload).intent == ChannelIntent::Stay,
-              "the index's word decodes to its intent");
+        Check(f.policy.Receive(chase.dump(), f.scope, now, result, "work") == ChannelError::None &&
+                  std::get<ChannelCommand>(result.payload).steps.front().intent == PlayerbotBridge::Intent::Follow,
+              "the index's word decodes to its row's code");
         Check(f.Receive(StateQuery(f, "old-topic", "plan")) == ChannelError::Invalid &&
                   f.Receive(StateQuery(f, "gone-topic", "quests")) == ChannelError::Invalid &&
                   f.Receive(StateQuery(f, "kept-topic", "inventory")) == ChannelError::None,
@@ -926,9 +846,9 @@ void Catalogue()
         Fixture f;
         f.Open();
         Check(f.Receive(StateQuery(f, "act-topic", "follow")) == ChannelError::Invalid, "an act is no bot_state topic");
-        auto verb = f.Command("topic-verb");
-        verb["intent"] = "inventory";
-        Check(f.Receive(verb) == ChannelError::Invalid, "a topic is no verb");
+        auto act = f.Command("topic-act");
+        act["steps"][0]["act"] = "inventory";
+        Check(f.Receive(act) == ChannelError::Invalid, "a topic is no act");
     }
 
     // The query: observable_group's keys, the route's own bot, an id of its own.
@@ -947,8 +867,7 @@ void Catalogue()
     upper["query"] = "Catalogue";
     Check(f.Receive(upper) == ChannelError::Invalid, "an unknown query stays invalid");
     ChannelMessage message;
-    Check(f.policy.Receive(bearer, CatalogueQuery(f, "cat").dump(), f.scope, now, message, "work") ==
-                  ChannelError::None &&
+    Check(f.policy.Receive(CatalogueQuery(f, "cat").dump(), f.scope, now, message, "work") == ChannelError::None &&
               std::get<ChannelQuery>(message.payload).kind == QueryKind::Catalogue,
           "a catalogue query admitted, typed");
     Check(f.Receive(CatalogueQuery(f, "cat")) == ChannelError::Duplicate, "catalogue id replay refused");
@@ -1002,7 +921,7 @@ void Catalogue()
     none.Open();
     ChannelMessage asked;
     std::string empty;
-    Check(none.policy.Receive(bearer, CatalogueQuery(none, "cat-none").dump(), none.scope, now, asked, "work") ==
+    Check(none.policy.Receive(CatalogueQuery(none, "cat-none").dump(), none.scope, now, asked, "work") ==
                   ChannelError::None &&
               none.policy.FinishCatalogue(asked.envelope, none.scope, now, empty) == ChannelError::Invalid &&
               empty.empty(),
@@ -1022,8 +941,7 @@ void Watches()
     {
         ChannelMessage message;
         std::string const id = std::string("w-") + name;
-        Check(f.policy.Receive(bearer, WatchWire(f, id, name).dump(), f.scope, now, message, "work") ==
-                  ChannelError::None,
+        Check(f.policy.Receive(WatchWire(f, id, name).dump(), f.scope, now, message, "work") == ChannelError::None,
               "watch: each condition admitted");
         auto const* watch = std::get_if<ChannelWatch>(&message.payload);
         Check(watch && watch->commandId == id && watch->botGuid == f.scope.botGuid && watch->condition == condition &&
@@ -1065,7 +983,7 @@ void Watches()
               f.Receive(f.Command("w-shared")) == ChannelError::Duplicate,
           "watch: a watch id cannot be reused by a command");
     ChannelMessage query;
-    Check(f.policy.Receive(bearer, f.Query("q-watch").dump(), f.scope, now, query, "work") == ChannelError::None,
+    Check(f.policy.Receive(f.Query("q-watch").dump(), f.scope, now, query, "work") == ChannelError::None,
           "watch: a query route");
     Check(f.Receive(WatchWire(f, "on-query", "time", 160000, "q-watch")) == ChannelError::Invalid,
           "watch: never on a query route");
@@ -1118,18 +1036,14 @@ void Watches()
                   (w.text ? json.at("reasonText") == w.text : !json.at("reasonText").get<std::string>().empty()),
               "watch: rejected carries reason and in-world reasonText");
     }
-    auto terminal = f.Wire("generation.result");
-    terminal["text"] = "I will come once this is done.";
-    Check(f.Receive(terminal) == ChannelError::None && f.Receive(WatchWire(f, "late")) == ChannelError::Unknown,
-          "watch: none after the terminal result");
+    f.policy.Drop("work");
+    Check(f.Receive(WatchWire(f, "late")) == ChannelError::Unknown, "watch: none after the route closed");
 }
 
 // LC3b: a stepped command, 1..maxSteps acts of the installed catalogue, each with exactly its parameters.
 Json StepWire(Fixture const& f, std::string const& id, Json steps)
 {
     auto json = f.Command(id);
-    json.erase("intent");
-    json.erase("params");
     json["steps"] = std::move(steps);
     return json;
 }
@@ -1142,7 +1056,7 @@ std::vector<ChannelStep> Decoded(Json steps, char const* label)
     Fixture f;
     f.Open();
     ChannelMessage message;
-    Check(f.policy.Receive(bearer, StepWire(f, "stepped", std::move(steps)).dump(), f.scope, now, message, "work") ==
+    Check(f.policy.Receive(StepWire(f, "stepped", std::move(steps)).dump(), f.scope, now, message, "work") ==
                   ChannelError::None &&
               f.policy.CommandReservations() == 1,
           label);
@@ -1154,33 +1068,33 @@ void Stepped()
     Check(SetAbilityIndex(TestStepAbilityIndex()) > 0 && Abilities().rows.size() == 24, "the stepped double installs");
     auto const three =
         Decoded(Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
-                             Step("go_to", {{"place", "Goldshire"}}), Step("position", {{"place", "1.5,-2.25,30,0"}})}),
+                             Step("go_to", {{"place", "Goldshire"}}), Step("meet_at", {{"place", "you"}})}),
                 "three steps decode");
-    Check(three.size() == 3 && three[0].intent == ChannelIntent::Mark && three[0].targetName == "Hogger" &&
-              !three[0].targetGuid && three[0].icon == 7 && three[1].intent == ChannelIntent::GoTo &&
-              three[1].place == "Goldshire" && three[2].intent == ChannelIntent::Position && three[2].position &&
-              three[2].position->x == 1.5 && three[2].position->y == -2.25 && three[2].position->z == 30 &&
-              three[2].position->mapId == 0 && three[2].place.empty(),
-          "each step's act and parameters, in order; a name as given, a choice as its index, a spot parsed");
+    Check(three.size() == 3 && three[0].intent == PlayerbotBridge::Intent::Mark && three[0].targetName == "Hogger" &&
+              !three[0].targetGuid && three[0].icon == 7 && three[1].intent == PlayerbotBridge::Intent::GoTo &&
+              three[1].place == "Goldshire" && three[2].intent == PlayerbotBridge::Intent::MeetAt &&
+              three[2].place == "you",
+          "each step's act and parameters, in order; a name and a place as given, a choice as its index");
     auto const ids =
         Decoded(Json::array({Step("focus_healing", {{"targetGuid", "44"}}), Step("quest", {{"questId", 42}}),
                              Step("mark", {{"targetGuid", "45"}, {"icon", "star"}})}),
                 "ids decode");
-    Check(ids[0].intent == ChannelIntent::FocusHealing && ids[0].targetGuid == 44 && ids[0].targetName.empty() &&
-              ids[1].intent == ChannelIntent::Quest && ids[1].questId == 42 && ids[1].questName.empty() &&
-              ids[2].targetGuid == 45 && ids[2].icon == 0,
+    Check(ids[0].intent == PlayerbotBridge::Intent::FocusHealing && ids[0].targetGuid == 44 &&
+              ids[0].targetName.empty() && ids[1].intent == PlayerbotBridge::Intent::Quest && ids[1].questId == 42 &&
+              ids[1].questName.empty() && ids[2].targetGuid == 45 && ids[2].icon == 0,
           "a unit and a quest by id");
     auto const named =
         Decoded(Json::array({Step("quest", {{"quest", "The Collector"}}),
                              Step("attack_own_target", {{"target", std::string(ChannelMaxPlaceName, 'a')}})}),
                 "names decode");
     Check(named[0].questName == "The Collector" && !named[0].questId &&
-              named[1].intent == ChannelIntent::AttackOwnTarget && named[1].targetName.size() == ChannelMaxPlaceName,
+              named[1].intent == PlayerbotBridge::Intent::AttackOwnTarget &&
+              named[1].targetName.size() == ChannelMaxPlaceName,
           "a quest by title, a unit by a name of the longest length");
     auto const choices = Decoded(
         Json::array({Step("formation", {{"shape", "line"}}), Step("save_mana", {{"enabled", false}}), Step("stay")}),
         "choices and flags decode");
-    Check(choices[0].shape == 2 && choices[1].enabled == false && choices[2].intent == ChannelIntent::Stay &&
+    Check(choices[0].shape == 2 && choices[1].enabled == false && choices[2].intent == PlayerbotBridge::Intent::Stay &&
               !choices[2].icon && !choices[2].shape && !choices[2].enabled,
           "a shape as its choice's index, a flag as given, an act without parameters");
     {
@@ -1231,17 +1145,7 @@ void Stepped()
         {Json::array({Step("go_to", {{"place", 7}})}), "a place is text"},
         {Json::array({Step("save_mana", {{"enabled", "yes"}})}), "a flag is a boolean"},
         {Json::array({Step("save_mana", {{"enabled", 1}})}), "a flag is no number"},
-        {Json::array({Step("position", {{"place", "1,2,3"}})}), "a spot needs its map"},
-        {Json::array({Step("position", {{"place", "1,2,3,-1"}})}), "a negative map"},
-        {Json::array({Step("position", {{"place", "1,2,3,0.5"}})}), "a fractional map"},
-        {Json::array({Step("position", {{"place", "1,2,3,4294967296"}})}), "a map past 32 bits"},
-        {Json::array({Step("position", {{"place", "inf,1,1,0"}})}), "an infinite coordinate"},
-        {Json::array({Step("position", {{"place", "nan,1,1,0"}})}), "a coordinate that is no number"},
-        {Json::array({Step("position", {{"place", " 1,2,3,0"}})}), "a spot with a space"},
-        {Json::array({Step("position", {{"place", "1,2,3,0,"}})}), "a spot with a trailing comma"},
-        {Json::array({Step("position", {{"place", "1,,3,0"}})}), "an empty coordinate"},
-        {Json::array({Step("position", {{"place", Json::array({1, 2, 3, 0})}})}), "a spot is text"},
-        {Json::array({Step("position", {{"place", "Goldshire"}})}), "a position takes a spot, not a name"},
+        {Json::array({Step("position", {{"place", "1,2,3,0"}})}), "position is no act (LC17e)"},
         {Json::array({Step("stay"), Step("chase")}), "one bad step refuses the order"},
     };
     for (std::size_t at = 0; at < std::size(bad); ++at)
@@ -1262,12 +1166,13 @@ void Stepped()
         auto noBot = StepWire(f, "no-bot", Json::array({Step("stay")}));
         noBot.erase("botGuid");
         auto oldNamed = f.Command("old-named");
+        oldNamed.erase("steps");
         oldNamed["intent"] = "mark";
         oldNamed["params"] = {{"target", "Hogger"}, {"icon", 3}};
         Check(f.Receive(both) == ChannelError::Invalid && f.Receive(withParams) == ChannelError::Invalid &&
                   f.Receive(noBot) == ChannelError::Invalid && f.Receive(oldNamed) == ChannelError::Invalid &&
                   f.policy.CommandReservations() == 0,
-              "steps beside intent or params, without the scope's keys, or a name in the old form: invalid");
+              "steps beside intent or params, without the scope's keys, or a body of the old form: invalid");
     }
     auto two = TestStepAbilityIndex();
     two.maxSteps = 2;
@@ -1297,17 +1202,15 @@ struct Finished
     Json json;
 };
 
-// Admits the command (old form when steps is null) on a fresh route and finishes it once, then checks a second
-// finish is refused.
+// Admits the command on a fresh route and finishes it once, then checks a second finish is refused.
 Finished Finish(Json const& steps, ChannelOutcome outcome, std::vector<ChannelStepResult> const& ran,
                 CommandRefusal refusal)
 {
     Fixture f;
     f.Open();
     ChannelMessage message;
-    auto const wire = steps.is_null() ? f.Command("done") : StepWire(f, "done", steps);
-    Check(f.policy.Receive(bearer, wire.dump(), f.scope, now, message, "work") == ChannelError::None,
-          "the command admitted");
+    auto const wire = StepWire(f, "done", steps);
+    Check(f.policy.Receive(wire.dump(), f.scope, now, message, "work") == ChannelError::None, "the command admitted");
     auto const& command = std::get<ChannelCommand>(message.payload);
     std::string body;
     auto const error =
@@ -1329,10 +1232,6 @@ void SteppedResults()
     ChannelStepResult const place{ChannelOutcome::Rejected, "unknown_place", "You do not know that place."};
     Json const three = Json::array({Step("mark", {{"target", "Hogger"}, {"icon", "skull"}}),
                                     Step("go_to", {{"place", "Goldshire"}}), Step("stay")});
-    auto const old = Finish(Json(), ChannelOutcome::Applied, {}, CommandRefusal::None);
-    Check(old.error == ChannelError::None && old.json.at("outcome") == "applied" && !old.json.contains("steps") &&
-              !old.json.contains("reason"),
-          "the old form's result has no steps");
     auto const applied = Finish(three, ChannelOutcome::Applied, {ok, ok, ok}, CommandRefusal::None);
     Check(applied.error == ChannelError::None && applied.json.at("outcome") == "applied" &&
               !applied.json.contains("reason") && applied.json.size() == 10 &&
@@ -1355,7 +1254,7 @@ void SteppedResults()
                                                     {"reason", failedWords.code},
                                                     {"reasonText", failedWords.text}} &&
               failed.json.at("steps").at(1) == Json{{"act", "go_to"}, {"outcome", "skipped"}},
-          "an unworded failure reads as the old form's failed");
+          "an unworded failure reads failed");
     auto const cannot = DescribeRefusal(CommandRefusal::CannotNow);
     auto const unworded =
         Finish(three, ChannelOutcome::Rejected, {ok, {ChannelOutcome::Rejected, "", ""}}, CommandRefusal::None);
@@ -1391,12 +1290,11 @@ void SteppedResults()
 // ---- LC16c: a row the module has never heard of ---------------------------------------------------------------------
 void OpenRows()
 {
-    // Malformed rows first: an open act or topic never loosens the old verbs' authority.
+    // Malformed rows first: an open act or topic keeps every row rule.
     using Change = void (*)(AbilityIndex&);
     Change const refused[] = {
-        [](AbilityIndex& index) { index.rows[3].name = "regroup"; },
-        [](AbilityIndex& index) { index.rows[3].name = "stay"; },
-        [](AbilityIndex& index) { index.rows[3].code = static_cast<uint8_t>(ChannelIntent::Stay); },
+        [](AbilityIndex& index) { index.rows[3].name = "mark"; },
+        [](AbilityIndex& index) { index.rows[3].code = index.rows[1].code; },
         [](AbilityIndex& index) { index.rows[3].params[3].field = static_cast<AbilityField>(11); },
         [](AbilityIndex& index)
         {
@@ -1413,16 +1311,15 @@ void OpenRows()
         auto index = TestOpenAbilityIndex();
         change(index);
         Check(SetAbilityIndex(std::move(index)) == 0 && Abilities().rows.empty(),
-              "an open row named like a verb, below 22 as another verb, with an unknown field, a twin code, a "
-              "duplicate topic, two topic parameters or a bad word refuses the index");
+              "an open row named or coded like another act, with an unknown field, a twin code, a duplicate topic, "
+              "two topic parameters or a bad word refuses the index");
     }
     auto high = TestOpenAbilityIndex();
     high.rows[3].code = 255;
     high.rows.back().code = 200;
-    Check(SetAbilityIndex(std::move(high)) > 0, "any act or topic value past the old ones");
-    Check(SetAbilityIndex(TestOpenAbilityIndex()) > 0 && Abilities().rows.size() == 19 && CatalogueInstalled() &&
-              Abilities().verbs.size() == 22,
-          "the open double installs: an act past the 22 verbs, a topic past the 14");
+    Check(SetAbilityIndex(std::move(high)) > 0, "any act or topic value");
+    Check(SetAbilityIndex(TestOpenAbilityIndex()) > 0 && Abilities().rows.size() == 19 && CatalogueInstalled(),
+          "the open double installs: an act and a topic the module has no code for");
 
     // A stepped order: the act's value from the index, the four new fields by kind.
     Json const cast =
@@ -1431,11 +1328,10 @@ void OpenRows()
         Decoded(Json::array({cast, Step("mark", {{"target", "Hogger"}, {"icon", "skull"}})}), "an open act decodes");
     Check(open.size() == 2 && static_cast<uint8_t>(open[0].intent) == TestOpenAct &&
               open[0].itemName == "Hearthstone" && open[0].spellName == "Frost Nova" && open[0].count == 1000 &&
-              open[0].choice == 1 && !open[0].icon && !open[0].shape && !open[0].enabled && !open[0].position &&
-              open[0].place.empty() && !open[0].targetGuid && open[0].targetName.empty() &&
-              open[1].intent == ChannelIntent::Mark && open[1].icon == 7 && !open[1].choice && !open[1].count &&
-              open[1].itemName.empty(),
-          "an item and a spell as named, a count as given, a choice as its index; the old act beside it unchanged");
+              open[0].choice == 1 && !open[0].icon && !open[0].shape && !open[0].enabled && open[0].place.empty() &&
+              !open[0].targetGuid && open[0].targetName.empty() && open[1].intent == PlayerbotBridge::Intent::Mark &&
+              open[1].icon == 7 && !open[1].choice && !open[1].count && open[1].itemName.empty(),
+          "an item and a spell as named, a count as given, a choice as its index; the act beside it unchanged");
     auto const least = Decoded(Json::array({Step("cast_on", {{"item", std::string(ChannelMaxPlaceName, 'i')},
                                                              {"spell", "Blink"},
                                                              {"times", 1},
@@ -1497,17 +1393,20 @@ void OpenRows()
         Fixture f;
         f.Open();
         auto old = f.Command("old-open");
+        old.erase("steps");
         old["intent"] = "cast_on";
         old["params"] = cast.at("params");
         auto bare = f.Command("old-open-bare");
+        bare.erase("steps");
         bare["intent"] = "cast_on";
         bare["params"] = Json::object();
         auto topic = f.Command("old-open-topic");
+        topic.erase("steps");
         topic["intent"] = "deeds_of";
         topic["params"] = Json::object();
         Check(f.Receive(old) == ChannelError::Invalid && f.Receive(bare) == ChannelError::Invalid &&
                   f.Receive(topic) == ChannelError::Invalid && f.policy.CommandReservations() == 0,
-              "the old form refuses an act it lacks: its verbs stay the 22");
+              "LCB2: a body of the old form is invalid for an open act or topic too");
         Check(f.Receive(StepWire(f, "open-once", Json::array({cast}))) == ChannelError::None &&
                   f.policy.CommandReservations() == 1,
               "one reservation for an open act's order");
@@ -1547,7 +1446,7 @@ void OpenRows()
                   f.Receive(routeNamed) == ChannelError::Invalid,
               "an open topic takes exactly its argument, under its own name and Place's rules");
         ChannelMessage message;
-        Check(f.policy.Receive(bearer, asking("deeds", "name", "Hogger").dump(), f.scope, now, message, "work") ==
+        Check(f.policy.Receive(asking("deeds", "name", "Hogger").dump(), f.scope, now, message, "work") ==
                   ChannelError::None,
               "an open topic's query admitted");
         auto const& query = std::get<ChannelQuery>(message.payload);
@@ -1564,6 +1463,8 @@ void OpenRows()
         };
         for (int line = 0; line < 9; ++line)
             entries.push_back({"Hogger", "deed", line, 0, "Line " + std::to_string(line)});
+        entries[5].side = "alliance";  // LC18g: Line 0 carries a place's side, Line 1 a word that is none
+        entries[6].side = "Bogus";
         std::string body;
         Check(f.policy.FinishTopic(message.envelope, f.scope, query.topic, entries, now, body) == ChannelError::None,
               "an open topic answered");
@@ -1577,12 +1478,14 @@ void OpenRows()
                                      {"extra", 4}} &&
                   list.at(2).at("text") == "Line 0" && list.at(5).at("text") == "Line 3",
               "the lines form, unusable entries dropped, cut at the row's limit");
+        Check(list.at(2).at("side") == "alliance" && !list.at(3).contains("side") && !list.at(0).contains("side"),
+              "LC18g: a place's side passes when it is one of the three words; none or another word sends no key");
         Check(list.at(1).at("row") == "deed" &&
                   list.at(1).at("text").get<std::string>().size() == ChannelMaxTopicText &&
                   list.at(1).at("value") == 0 && list.at(1).at("extra") == UINT32_MAX,
               "any wire word as the row; the text cut to 200 bytes, value and extra clamped");
         ChannelMessage other;
-        Check(f.policy.Receive(bearer, asking("deeds-other", "name", "Hogger").dump(), f.scope, now, other, "work") ==
+        Check(f.policy.Receive(asking("deeds-other", "name", "Hogger").dump(), f.scope, now, other, "work") ==
                       ChannelError::None &&
                   f.policy.FinishTopic(other.envelope, f.scope, static_cast<StateTopic>(TestOpenTopic + 1), entries,
                                        now, body) == ChannelError::Invalid,
@@ -1599,7 +1502,7 @@ void OpenRows()
         ChannelMessage message;
         std::string body;
         Check(size > MaxResponseBytes && size <= ChannelMaxCatalogueBytes &&
-                  f.policy.Receive(bearer, CatalogueQuery(f, "cat-big").dump(), f.scope, now, message, "work") ==
+                  f.policy.Receive(CatalogueQuery(f, "cat-big").dump(), f.scope, now, message, "work") ==
                       ChannelError::None &&
                   f.policy.FinishCatalogue(message.envelope, f.scope, now, body) == ChannelError::None &&
                   body.size() > MaxResponseBytes && body.size() <= MaxCatalogueResponseBytes,
@@ -1610,7 +1513,7 @@ void OpenRows()
 
 int main()
 {
-    if (!InstallTestAbilities())  // LC3: the verbs and topics are the installed index's.
+    if (!InstallTestAbilities())  // LC3: the acts and topics are the installed index's.
     {
         std::cerr << "FAIL: the ability double was refused\n";
         return 1;

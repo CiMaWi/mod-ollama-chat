@@ -19,42 +19,39 @@ namespace OllamaBridge
 // This header and its source include no game headers, so the offline test links the real listener standalone.
 constexpr char const* ListenerHost = "127.0.0.1";       // Literal loopback only (C9); never configurable.
 constexpr uint32_t DefaultListenerPort = 18732;         // The Claude bridge listens on 18731.
-constexpr int64_t ListenerWaitCapMs = WorldLivenessMs;  // A received packet is stale after this anyway.
-constexpr int64_t ListenerPollMs = 5;
+// LCB6b: the world answers every packet it took, at the latest as stale once it is this old; the cap bounds only a
+// world tick that never comes.
+constexpr int64_t ListenerWaitCapMs = WorldLivenessMs;
 
 struct ListenerStats
 {
     uint64_t accepted = 0;      // Requests handed to Receive and accepted by the mailbox.
     uint64_t unauthorized = 0;  // Requests refused by the bearer check before the body was read.
     uint64_t timeouts = 0;      // Accepted requests with no world answer by the wait deadline.
+    uint64_t overloads = 0;     // Requests answered overload (packet slots or route ids; LC.38), logged.
 };
 
 // Pure rules, exposed for the offline test.
 bool ListenerPortValid(uint32_t port);
 bool ListenerTokenValid(std::string_view token);
 bool ListenerPeerAllowed(std::string_view remoteAddr);
-// Exactly "Bearer " + token, compared in constant time over a fixed 256 bytes like WorldChannel::Authenticated.
-bool ListenerBearerMatches(std::string_view authorization, std::string_view token);
 bool ListenerRouteValid(std::string_view route);
 // A cheap shape gate (one JSON object) so plain junk never takes a mailbox slot; the mailbox decodes strictly.
 bool ListenerBodyShape(std::string_view body);
-// min(envelope deadlineUnixMs - now, cap); the cap when the field is missing or unreadable. Untrusted input:
-// it only bounds this listener's own wait, the mailbox validates the envelope.
-int64_t ListenerWaitMs(std::string_view body, int64_t nowUnixMs);
 // The one ChannelError -> HTTP status table; the response body is {"error":ChannelErrorName}.
 int ListenerStatus(ChannelError error);
 
 class ChannelListener
 {
 public:
-    using Receive = std::function<ChannelError(std::string_view bearer, std::string_view route, std::string_view body,
-                                               uint64_t& receipt)>;
-    using Take =
-        std::function<ChannelError(std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)>;
-    // Lines hold fixed text and the port only: no token, header, route or body ever reaches the log.
+    // Called only after BearerMatches passed (LCB6a: the one bearer check). LCB6b: None means the world answers the
+    // packet through answer, which the handler waits on; any other value is the answer.
+    using Receive = std::function<ChannelError(std::string_view route, std::string_view body,
+                                               std::shared_ptr<ChannelAnswer> const& answer)>;
+    // Lines hold fixed text, the port and a count only: no token, header, route or body ever reaches the log.
     using Log = std::function<void(bool warning, std::string const& line)>;
 
-    ChannelListener(Receive receive, Take take, Log log = {});
+    explicit ChannelListener(Receive receive, Log log = {});
     ~ChannelListener();
     ChannelListener(ChannelListener const&) = delete;
     ChannelListener& operator=(ChannelListener const&) = delete;
@@ -62,7 +59,7 @@ public:
     // World thread, on every config load: starts, keeps (same port and token) or stops the listener.
     // Returns whether it runs afterwards.
     bool Configure(bool enabled, uint32_t port, std::string token);
-    // Bounded: waiting handlers leave within one poll, then every listener thread is joined.
+    // Bounded: waiting handlers are answered inactive at once, then every listener thread is joined.
     void Stop();
     bool Running() const;
     uint32_t Port() const;
@@ -74,9 +71,9 @@ private:
     bool StartLocked(uint32_t port, std::string token);
     void StopLocked(bool log);
     void Write(bool warning, std::string const& line) const;
+    void Overload();
 
     Receive const _receive;
-    Take const _take;
     Log const _log;
     mutable std::mutex _mutex;  // Lifecycle only; request threads never take it.
     std::unique_ptr<Run> _run;
@@ -84,6 +81,7 @@ private:
     std::atomic<uint64_t> _accepted{0};
     std::atomic<uint64_t> _unauthorized{0};
     std::atomic<uint64_t> _timeouts{0};
+    std::atomic<uint64_t> _overloads{0};
 };
 }  // namespace OllamaBridge
 

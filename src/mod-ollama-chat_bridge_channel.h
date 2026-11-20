@@ -11,11 +11,9 @@
 
 namespace OllamaBridge
 {
-// LC.35: the query and command ids one route may open. A route lives at most 120 s and the 64 packet slots bound
-// the rest; the ledger holds live routes only.
+// LC.35: the query and command ids one route may open; one more is refused as overload (LC.38). A route lives at most
+// 120 s and the ledger holds live routes only, so it holds no more routes than the world has tickets.
 constexpr std::size_t ChannelMaxRouteIds = 64;
-constexpr std::size_t ChannelMaxPending = 64;
-constexpr std::size_t ChannelMaxScopes = 64;
 constexpr std::size_t ChannelMaxUnits = 40;
 constexpr std::size_t ChannelMaxTopicBytes = 8192;  // DS.14 (d): one bot_state topic's entries, encoded.
 constexpr std::size_t ChannelMaxTopicName = 64;     // Bytes of one entry's name, cut on a character boundary.
@@ -32,8 +30,7 @@ enum class ChannelError : uint8_t
     Duplicate,
     Capacity,
     Closed,
-    Unknown,
-    Standing  // J5e: named invalid_input on the wire, with reason standing_not_supported.
+    Unknown
 };
 
 char const* ChannelErrorName(ChannelError error);
@@ -53,6 +50,7 @@ struct ChannelEnvelope
     int64_t deadlineUnixMs = 0;
 };
 
+// The game's own failure answer (FinishFailure); the channel takes no failure inbound (LCB6a).
 enum class ChannelFailure : uint8_t
 {
     Unavailable,
@@ -109,14 +107,13 @@ char const* StateTopicName(StateTopic topic);
 
 // LC3: the ability catalogue as plain data, mod-playerbots' one table of acts and topics (PlayerbotBridge::Catalogue)
 // with its hash. The game adapter installs it once on the world thread before the channel takes requests; a selftest
-// installs a double. Commands and bot_state queries read their verbs and topic names from it and query: catalogue
+// installs a double. Commands and bot_state queries read their acts and topic names from it and query: catalogue
 // answers with it, so the channel keeps no word list of its own.
 enum class AbilityField : uint8_t  // PlayerbotBridge::OrderField: the order field an act's parameter fills.
 {
     Target,
     Icon,
     PlaceName,
-    Position,
     QuestId,
     Shape,
     Enabled,
@@ -145,23 +142,16 @@ struct AbilityRefusal
 struct AbilityRow
 {
     bool topic = false;
-    uint8_t code = 0;  // An act's playerbots Intent value (a ChannelIntent below 22), a topic's BotStateTopic value.
+    uint8_t code = 0;  // An act's playerbots Intent value, a topic's BotStateTopic value.
     std::string name;
     std::string sentence;
     std::vector<AbilityParam> params;
     std::vector<AbilityRefusal> refusals;
-    std::string effect;  // The word of the lasting part the act changes.
+    std::string effect;  // PlayerbotBridge::EffectWord: the bridge keeps no part an act changes (LC.36).
     std::string done;    // The word of when it is done.
     std::string state;
     std::string event;
     std::size_t limit = 0;
-};
-
-// A verb of the old command form: every ChannelIntent's word, the acts' and those of the four without a row.
-struct AbilityVerb
-{
-    std::string name;
-    ChannelIntent intent = ChannelIntent::Stay;
 };
 
 struct AbilityIndex
@@ -170,7 +160,6 @@ struct AbilityIndex
     uint32_t version = 0;          // The catalogue text's format.
     std::size_t maxSteps = 0;      // The most steps one order takes.
     std::vector<AbilityRow> rows;  // The acts, then the topics, in the table's order.
-    std::vector<AbilityVerb> verbs;
 };
 
 // The bytes the encoded catalogue may take (the hub's MAX_CATALOGUE_BYTES); the bridge reads it whole, its answer
@@ -178,11 +167,10 @@ struct AbilityIndex
 constexpr std::size_t ChannelMaxCatalogueBytes = 49152;
 
 // Installs the index and returns the bytes its catalogue encodes to (0 when the index is refused or its text is not
-// UTF-8). An index with a missing, duplicate or unknown verb, a duplicate row word or code, an act below 22 that is not
-// its verb, one past it named like a verb, a parameter field the channel does not fill or a topic with more than one
-// parameter is refused: the channel then holds an empty index (every verb and topic unknown, no catalogue). A catalogue
-// that is not UTF-8 or over ChannelMaxCatalogueBytes drops only the catalogue answer: the verbs and topics stand, so
-// the old wire keeps working (LC.23). World thread only, once at startup.
+// UTF-8). An index with a duplicate row word, act code or topic code, a parameter field the channel does not fill or
+// a topic with more than one parameter is refused: the channel then holds an empty index (every act and topic
+// unknown, no catalogue). A catalogue that is not UTF-8 or over ChannelMaxCatalogueBytes drops only the catalogue
+// answer: the acts and topics stand (LC.23). World thread only, once at startup.
 std::size_t SetAbilityIndex(AbilityIndex index);
 AbilityIndex const& Abilities();
 bool CatalogueInstalled();  // Whether a catalogue query has an answer.
@@ -205,6 +193,7 @@ struct StateEntry
     int64_t first = 0;
     int64_t second = 0;
     std::string text = {};  // A default, so older brace inits stay complete.
+    std::string side = {};  // LC18g: a place row's side (alliance, horde, neutral); sent only when one of them.
 };
 
 struct ChannelQuery
@@ -215,10 +204,6 @@ struct ChannelQuery
     StateTopic topic = StateTopic::Inventory;  // Only for QueryKind::BotState.
     std::string place;                         // WT18b: route only, the place the route goes to.
 };
-struct ChannelText
-{
-    std::string text;
-};
 // J6e-c: arm, replace or clear the route bot's watch; its id shares the command replay namespace.
 struct ChannelWatch
 {
@@ -227,7 +212,8 @@ struct ChannelWatch
     WatchCondition condition = WatchCondition::None;
     int64_t untilUnixMs = 0;
 };
-using ChannelPayload = std::variant<ChannelQuery, ChannelCommand, ChannelText, ChannelFailure, ChannelWatch>;
+// LCB6a: the channel's only inbound types; a generation's reply returns in its HTTP response.
+using ChannelPayload = std::variant<ChannelQuery, ChannelCommand, ChannelWatch>;
 
 // Owned values only. Successful decode is staging, never an effect-execution grant.
 struct ChannelMessage
@@ -237,31 +223,31 @@ struct ChannelMessage
 };
 
 // World-thread owner; no mutex, game objects, transport, queue or activation acknowledgement.
-// J5b must bind only the actual selected/drained game epoch, authenticate EVERY transport operation,
-// own physical payload slots through disposal and revalidate live world authority before publication.
+// LCB6b: the replay ledger only (route ids, their query, command and watch ids, deadlines, terminals). Whether a
+// conversation is current is WorldPolicy's, which WorldChannel asks; the ledger keeps no scope table.
 class ChannelPolicy
 {
 public:
-    explicit ChannelPolicy(std::size_t maxRouteIds = ChannelMaxRouteIds, std::size_t maxPending = ChannelMaxPending);
+    explicit ChannelPolicy(std::size_t maxRouteIds = ChannelMaxRouteIds);
     ChannelPolicy(ChannelPolicy const&) = delete;
     ChannelPolicy& operator=(ChannelPolicy const&) = delete;
 
-    bool Bind(Identity identity, std::string localBearer);
+    bool Bind(Identity identity);
     void Retire();
-    bool ObserveScope(WorldScope scope, Clock now);
-    void RemoveScope(uint64_t botGuid, std::string const& contextId);
     void Expire(Clock now);
     ChannelError OpenGeneration(WorldScope const& scope, std::string requestId, Deadline deadline, Clock now);
     // LC.35: forgets a route, its own id and the query and command ids opened under it; a late message of any of them
     // then finds no route (Unknown). A generation's terminal, its expiry and WorldChannel::Close drop it.
     void Drop(std::string const& route);
 
-    // Authentication is checked before size/JSON parsing and before any replay/state mutation.
+    // Unbound, it parses nothing (Inactive); the listener checked the bearer before the body was read (LCB6a).
     // current and expectedRequestId come from the trusted game route, NEVER from this body.
     // Non-query ids must match that route before state changes; queries carry independent ids, opened under the
-    // route (an unknown route refuses them as Unknown) and dropped with it.
-    ChannelError Receive(std::string const& localBearer, std::string const& body, WorldScope const& current, Clock now,
-                         ChannelMessage& message, std::string const& expectedRequestId);
+    // route (an unknown route refuses them as Unknown) and dropped with it. Current checks the ledger entry (open,
+    // identity, deadline) and that it is the same bot, controller and context; it never says whether that
+    // conversation is still current (WorldPolicy does).
+    ChannelError Receive(std::string const& body, WorldScope const& current, Clock now, ChannelMessage& message,
+                         std::string const& expectedRequestId);
     bool Current(ChannelEnvelope const& envelope, WorldScope const& current, Clock now, bool requireOpen = true) const;
     ChannelError FinishQuery(ChannelEnvelope const& envelope, WorldScope const& current,
                              std::vector<Participant> const& observedUnits, Clock now, std::string& body);
@@ -276,7 +262,7 @@ public:
     // J5e: a rejected or failed outcome carries `reason` and `reasonText` (None words as cannot_now or failed).
     // LC3: a stepped command (steps, as submitted) also carries `steps`, one entry per step: the ones that ran (ran,
     // each but the last applied) with their outcome, the others skipped. Its outcome is applied only when every step
-    // applied, and a step that ran and ended the order gives the order its reason. The old form has no `steps`.
+    // applied, and a step that ran and ended the order gives the order its reason.
     ChannelError FinishCommand(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
                                WorldScope const& current, Clock now, std::string& body,
                                CommandRefusal refusal = CommandRefusal::None, std::span<ChannelStep const> steps = {},
@@ -290,11 +276,6 @@ public:
     std::size_t Pending() const;
 
 private:
-    struct ScopeEntry
-    {
-        WorldScope scope;
-        Deadline until;
-    };
     struct RequestEntry
     {
         ChannelEnvelope envelope;
@@ -311,20 +292,15 @@ private:
         std::string requestId;
         bool terminal = false;
     };
-    bool Authenticated(std::string const& bearer) const;
-    bool ScopeCurrent(WorldScope const& scope, Clock now) const;
     ChannelError Open(WorldScope const& scope, std::string requestId, Deadline deadline, ChannelWork work, Clock now,
                       std::string const& route = {});
     bool const _validLimits;
     std::size_t const _maxRouteIds;
-    std::size_t const _maxPending;
     Identity _identity;
     Clock _observed;  // Trusted clock high-water marks: heartbeat expiry cannot be undone by clock rollback.
-    std::string _bearer;
     // The previous binding's epoch: a reconnect with it is refused. Epochs are fresh 128-bit random values, so no
     // longer history is kept (LC.35).
     std::string _previous;
-    std::vector<ScopeEntry> _scopes;
     std::unordered_map<std::string, RequestEntry> _requests;  // Live routes and their queries only.
     std::unordered_map<std::string, CommandEntry> _commands;  // The live routes' command and watch ids.
 };

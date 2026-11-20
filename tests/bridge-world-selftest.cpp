@@ -1,5 +1,8 @@
 // Offline production value-policy checks. No server, game objects, native observer or delivery proof.
+#include <algorithm>
+#include <functional>
 #include <iostream>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 
 #include "mod-ollama-chat_bridge_world.h"
@@ -22,8 +25,8 @@ Settings Config() { return {"fixture", "codex", "http://127.0.0.1:47800", "synth
 WorldScope Scope(WorldPolicy const& policy)
 {
     auto const selected = policy.Selected();
-    return {1,       selected.instance, selected.provider, selected.epoch, 11,         22, "conversation",
-            "party", "visible-party",   "context-1",       "membership-1", "persona-1"};
+    return {1,       selected.instance, selected.provider, selected.epoch, 11, 22, "conversation",
+            "party", "visible-party",   "context-1",       "membership-1"};
 }
 
 Context Input()
@@ -39,17 +42,16 @@ void Select(WorldPolicy& policy, std::string epoch)
 {
     policy.Configured(true, Config(), std::move(epoch));
     Check(policy.Selected().epoch.empty(), "publication does not select before drain");
-    Check(policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "select after drain");
+    Check(policy.ObserveDrain(true), "select after drain");
 }
 
 void Lifecycle()
 {
     WorldPolicy policy;
     policy.Configured(true, Config(), "world-epoch-1");
-    Check(!policy.ObserveDrain(false, RetirementProof::NoLiveCaptures), "old worker still draining");
-    Check(!policy.ObserveDrain(true, RetirementProof::Unknown), "unknown restoration fails closed");
+    Check(!policy.ObserveDrain(false), "old worker still draining");
     Check(policy.Selected().epoch.empty(), "no provisional activation");
-    Check(policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "drain selects module circuit");
+    Check(policy.ObserveDrain(true), "drain selects module circuit");
     auto scope = Scope(policy);
     Check(policy.ObserveScope(scope, now), "complete trusted scope accepted");
     auto old = policy.Reserve(scope, Input(), now, 1000);
@@ -61,8 +63,8 @@ void Lifecycle()
     Check(policy.Generation() == generation + 1, "token-only reload advances generation");
     Check(policy.Pending() == 0 && policy.Selected().epoch.empty(), "retire clears reservations and selection");
     Check(!policy.Complete(old, WorldOutcome::Success, now), "late outcome cannot cross reload");
-    Check(!policy.ObserveDrain(false, RetirementProof::NoLiveCaptures), "reload waits asynchronously");
-    Check(policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "real drain permits new selection");
+    Check(!policy.ObserveDrain(false), "reload waits asynchronously");
+    Check(policy.ObserveDrain(true), "real drain permits new selection");
     Check(policy.Snapshot().token == changed.token, "owned new token snapshot");
     Check(!policy.ObserveScope(scope, now), "old epoch scope rejected");
     scope = Scope(policy);
@@ -71,7 +73,7 @@ void Lifecycle()
     Check(fresh.request.requestId != old.request.requestId, "ids differ across reload");
     policy.Configured(false, changed, "unused");
     Check(policy.Selected().epoch.empty() && !policy.Current(fresh, now), "disable invalidates without update");
-    Check(!policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "disabled stays unselected");
+    Check(!policy.ObserveDrain(true), "disabled stays unselected");
     Select(policy, "world-epoch-restart");
     Check(policy.ObserveScope(Scope(policy), now), "restart fresh scope");
     auto restarted = policy.Reserve(Scope(policy), Input(), now, 1000);
@@ -81,7 +83,7 @@ void Lifecycle()
     auto invalid = Config();
     invalid.token.clear();
     policy.Configured(true, invalid, "world-epoch-invalid");
-    Check(!policy.ObserveDrain(true, RetirementProof::NoLiveCaptures), "invalid config fails closed");
+    Check(!policy.ObserveDrain(true), "invalid config fails closed");
 }
 
 void OutcomesAndScopes()
@@ -90,7 +92,7 @@ void OutcomesAndScopes()
     Select(policy, "world-epoch-scope");
     auto scope = Scope(policy);
     auto invalid = scope;
-    invalid.personaRevision.clear();
+    invalid.membershipRevision.clear();
     Check(!policy.ObserveScope(invalid, now), "partial scope rejected");
     Check(policy.ObserveScope(scope, now), "scope observed");
     auto first = policy.Reserve(scope, Input(), now, 1000);
@@ -136,11 +138,14 @@ void Capacity()
     Select(policy, "world-epoch-capacity");
     auto const scope = Scope(policy);
     Check(policy.ObserveScope(scope, now), "capacity scope");
+    // LC.38: no fixed count of tickets; each lives at most its lifetime.
     std::vector<WorldTicket> pending;
-    for (std::size_t i = 0; i < MaxWorldPending; ++i)
+    for (std::size_t i = 0; i < 200; ++i)
         pending.push_back(policy.Reserve(scope, Input(), now, 1000));
-    Check(pending.back().generation != 0 && policy.Pending() == MaxWorldPending, "pending capacity reached");
-    Check(policy.Reserve(scope, Input(), now, 1000).generation == 0, "pending capacity rejects without eviction");
+    Check(
+        std::all_of(pending.begin(), pending.end(), [](WorldTicket const& ticket) { return ticket.generation != 0; }) &&
+            policy.Pending() == 200,
+        "LC.38: 200 tickets taken, no pending cap");
     for (auto const& ticket : pending)
         policy.Cancel(ticket);
     // LC.35: no epoch cap: 5,000 reservations one after another all succeed.
@@ -158,18 +163,141 @@ void Capacity()
     Check(policy.ObserveScope(Scope(policy), now), "new epoch capacity scope");
     auto const next = policy.Reserve(Scope(policy), Input(), now, 1000);
     Check(next.generation && next.request.requestId != last.request.requestId, "a fresh epoch issues fresh ids");
-    for (std::size_t i = 1; i < MaxWorldScopes; ++i)
+    // LC.38: the scope table is keyed by bot, one entry per conversation, with no fixed count: 200 conversations of
+    // 50 bots (four each) are observed and reserved, and each stays its own.
+    std::vector<WorldTicket> talks;
+    for (std::size_t i = 0; i < 200; ++i)
     {
         auto another = Scope(policy);
+        another.botGuid += i % 50;
         another.contextId = "conversation-" + std::to_string(i);
         if (!policy.ObserveScope(another, now))
-            throw std::runtime_error("premature scope capacity");
+            throw std::runtime_error("LC.38: a scope refused below 200");
+        talks.push_back(policy.Reserve(another, Input(), now, 1000));
+        if (!talks.back().generation)
+            throw std::runtime_error("LC.38: a reservation refused below 200");
     }
-    auto excess = Scope(policy);
-    excess.contextId = "excess";
-    Check(!policy.ObserveScope(excess, now), "scope capacity rejects without eviction");
+    Check(
+        std::all_of(talks.begin(), talks.end(), [&](WorldTicket const& ticket) { return policy.Current(ticket, now); }),
+        "LC.38: 200 conversations current, no scope cap");
+    policy.InvalidateScope(talks[0].scope.botGuid, talks[0].scope.contextId);
+    Check(!policy.Current(talks[0], now) && policy.Current(talks[50], now) &&
+              talks[50].scope.botGuid == talks[0].scope.botGuid,
+          "one conversation's end leaves the same bot's other conversations current");
+    auto revised = talks[100].scope;
+    revised.membershipRevision = "membership-2";
+    Check(policy.ObserveScope(revised, now) && !policy.Current(talks[100], now) && policy.Current(talks[150], now),
+          "a revision ends only that conversation's tickets");
 }
 }  // namespace
+
+// LCB3b: the module has no persona card. A generation input carries no system prompt, persona or card, and a
+// result with a ninth key (an older bridge's card proposal) is malformed.
+void NoCardOnTheWire()
+{
+    WorldPolicy policy;
+    Select(policy, "world-epoch-card");
+    auto const scope = Scope(policy);
+    Check(policy.ObserveScope(scope, now), "card: scope observed");
+    auto const ticket = policy.Reserve(scope, Input(), now, 1000);
+    std::string body;
+    Check(Build(Config(), ticket.request, now, body), "card: generation built");
+    auto const input = nlohmann::json::parse(body)["input"];
+    Check(!input.contains("systemPrompt") && !input.contains("persona") && !input.contains("personaCard"),
+          "card: no system prompt, persona or card on the wire");
+    nlohmann::json reply = {{"version", 1},
+                            {"instance", "fixture"},
+                            {"provider", "codex"},
+                            {"epoch", ticket.request.epoch},
+                            {"requestId", ticket.request.requestId},
+                            {"deadlineUnixMs", ticket.request.deadline.unixMs},
+                            {"type", "generation.result"},
+                            {"text", "Onward."}};
+    Check(Parse(Config(), ticket.request, reply.dump(), now).ok, "card: an eight-key result parses");
+    reply["personaProposal"] = {{"revision", "0"}, {"body", "A careful hunter."}};
+    Check(!Parse(Config(), ticket.request, reply.dump(), now).ok, "card: a result with a card proposal is malformed");
+}
+
+// LCB3c: a binding is its scope and audience. Over 100 ticks the facts, traits and state, the names, the place and
+// phase, the master and (for a whisper) the group change on every tick while the scope and audience stay: the binding
+// is kept on every tick. Another listener, another partner, a new epoch or (for a party line) another group ends it,
+// and a binding that takes the new capture ends exactly once.
+void BindingRule()
+{
+    auto const capture = [](DispatchSource source)
+    {
+        BindingCapture made;
+        made.guard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "direct", "", "", ""};
+        made.guard.source = source;
+        made.guard.speakerGuid = 22;
+        made.guard.groupGuid = 99;
+        made.guard.audience = {11, 22};
+        if (source == DispatchSource::Party)
+        {
+            made.guard.scope.channel = "party";
+            made.guard.audience = {11, 22, 33};
+        }
+        made.context.speakerGuid = 22;
+        made.context.channel = made.guard.scope.channel;
+        return made;
+    };
+    for (auto const source : {DispatchSource::Whisper, DispatchSource::Party})
+    {
+        BindingCapture const bound = capture(source);
+        unsigned kept = 0;
+        for (unsigned tick = 1; tick <= 100; ++tick)
+        {
+            BindingCapture current = capture(source);
+            current.context.traits.words = {"trait-" + std::to_string(tick)};
+            current.context.facts.emplace().phrase = "fact-" + std::to_string(tick);
+            current.context.state.emplace().healthPct = static_cast<float>(tick % 100);
+            current.context.observations = {"Your name is Bot" + std::to_string(tick) + "."};
+            current.context.speakerControlsBot = tick % 2 == 0;
+            current.guard.mapId = tick;
+            current.guard.instanceId = tick * 3;
+            current.guard.phaseMask = 1u << (tick % 8);
+            current.guard.nonRaid = tick % 2 == 0;
+            if (source != DispatchSource::Party)
+            {
+                current.guard.groupGuid = tick % 3 ? 99 + tick : 0;
+                current.context.groupScope = std::to_string(current.guard.groupGuid);
+            }
+            kept += SameScopeAndAudience(bound, current);
+        }
+        Check(kept == 100, "binding: facts, traits, state, place, master and group shape keep it for 100 ticks");
+    }
+    std::vector<std::function<void(BindingCapture&)>> const ends = {
+        [](BindingCapture& c) { c.guard.audience = {11, 22, 33, 44}; },
+        [](BindingCapture& c) { c.guard.audience = {11, 33}; },
+        [](BindingCapture& c) { c.guard.groupGuid = 98; },
+        [](BindingCapture& c) { c.guard.speakerGuid = c.guard.scope.controllerGuid = 33; },
+        [](BindingCapture& c) { c.guard.scope.contextId = "another"; },
+        [](BindingCapture& c) { c.guard.scope.epoch = "epoch-2"; },
+        [](BindingCapture& c) { c.guard.scope.provider = "other"; },
+        [](BindingCapture& c) { c.guard.scope.botGuid = 12; }};
+    for (auto const& end : ends)
+    {
+        BindingCapture bound = capture(DispatchSource::Party);
+        unsigned erased = 0;
+        for (unsigned tick = 1; tick <= 100; ++tick)
+        {
+            BindingCapture current = capture(DispatchSource::Party);
+            current.context.traits.words = {"trait-" + std::to_string(tick)};
+            if (tick >= 50)
+                end(current);
+            if (!SameScopeAndAudience(bound, current))
+            {
+                ++erased;
+                bound = current;
+            }
+        }
+        Check(erased == 1, "binding: a scope or audience change ends the binding exactly once");
+    }
+    BindingCapture const whisper = capture(DispatchSource::Whisper);
+    BindingCapture changed = whisper;
+    changed.guard.source = DispatchSource::Say;
+    Check(!SameScopeAndAudience(whisper, changed), "binding: another channel of the same partner is another binding");
+}
 
 int main()
 {
@@ -178,6 +306,8 @@ int main()
         Lifecycle();
         OutcomesAndScopes();
         Capacity();
+        NoCardOnTheWire();
+        BindingRule();
         std::cout << "PASS " << checks << " production world-policy checks\n";
     }
     catch (std::exception const& error)

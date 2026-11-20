@@ -2,7 +2,7 @@
 #define MOD_OLLAMA_CHAT_TRAIT_WORDS_H
 
 // Travel plan WT11b: formats a bot's personality words (from mod-playerbots, already in-world words, strongest first)
-// for `{bot_personality}` and the bridge card's `traits` fact. Pure string code: no game headers, no numbers.
+// for `{bot_personality}`. Pure string code: no game headers, no numbers.
 
 #include <cstddef>
 #include <string>
@@ -10,9 +10,6 @@
 
 namespace OllamaTraitWords
 {
-constexpr std::size_t CardTraitBytes = 64;  // OllamaBridge::MaxCardFactBytes
-constexpr std::size_t CardTraitWords = 3;
-
 // Control characters dropped, runs of spaces made one, ends trimmed.
 inline std::string Clean(std::string const& text)
 {
@@ -28,20 +25,6 @@ inline std::string Clean(std::string const& text)
     while (!out.empty() && out.back() == ' ')
         out.pop_back();
     return out;
-}
-
-// "fiercely loyal" -> "loyal", "a loner" -> "loner": the word without its adverb or article. Playerbots' trait words
-// are three words of their own per pole, none with a qualifier in front, so only the adverbs inside such words go.
-inline std::string StripAdverb(std::string const& word)
-{
-    static char const* const prefixes[] = {"fiercely ", "deeply ", "a ", "an "};
-    for (char const* prefix : prefixes)
-    {
-        std::string const p = prefix;
-        if (word.compare(0, p.size(), p) == 0)
-            return word.substr(p.size());
-    }
-    return word;
 }
 
 // "wary, devout; fond of fishing and inns and ale"
@@ -76,27 +59,6 @@ inline std::string FormatPersonalityPrompt(std::vector<std::string> const& words
         text += (text.empty() ? "fond of " : "; fond of ") + joined;
     }
 
-    return text;
-}
-
-// "careful, devout, bookish": the three strongest words without adverb, cut at a word to the card fact bound
-inline std::string FormatCardTraits(std::vector<std::string> const& words)
-{
-    std::string text;
-    std::size_t taken = 0;
-    for (std::string const& word : words)
-    {
-        if (taken == CardTraitWords)
-            break;
-        std::string const clean = Clean(StripAdverb(Clean(word)));
-        if (clean.empty())
-            continue;
-        std::string const next = text.empty() ? clean : text + ", " + clean;
-        if (next.size() > CardTraitBytes)
-            break;
-        text = next;
-        ++taken;
-    }
     return text;
 }
 }  // namespace OllamaTraitWords

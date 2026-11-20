@@ -9,6 +9,7 @@
 #include <thread>
 
 #include "./httplib.h"
+#include "mod-ollama-chat_bridge_json.h"
 
 namespace OllamaBridge
 {
@@ -21,7 +22,6 @@ static_assert(std::string_view{CPPHTTPLIB_VERSION} == "0.23.1",
 
 constexpr std::string_view RoutePrefix = "/v1/channel/";
 constexpr std::size_t MaxRouteBytes = 128;
-constexpr std::size_t MaxBearerBytes = 256;  // WorldChannel::Authenticated never accepts a longer bearer.
 constexpr time_t IoTimeoutSec = 2;
 // One handler per mailbox slot: a handler blocks while the world answers, so fewer would cap the world's TickBudget.
 constexpr std::size_t Workers = WorldChannel::MaxPackets;
@@ -35,7 +35,7 @@ struct StatusEntry
     int status;
 };
 
-constexpr std::array<StatusEntry, 11> StatusTable{{
+constexpr std::array<StatusEntry, 10> StatusTable{{
     {ChannelError::None, 200},
     {ChannelError::Unauthorized, 401},
     {ChannelError::Inactive, 503},
@@ -45,19 +45,12 @@ constexpr std::array<StatusEntry, 11> StatusTable{{
     {ChannelError::Duplicate, 409},
     {ChannelError::Capacity, 429},
     {ChannelError::Closed, 410},
-    {ChannelError::Unknown, 400},  // A packet type with no reverse adapter (e.g. a generation result) is bad input.
-    {ChannelError::Standing, 400},
+    {ChannelError::Unknown, 400},  // A route or receipt the mailbox does not know is bad input.
 }};
 
 bool JsonSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
 
 bool Digit(char c) { return c >= '0' && c <= '9'; }
-
-int64_t UnixMs()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
 
 void Reply(httplib::Response& res, int status, std::string_view name)
 {
@@ -70,16 +63,6 @@ void Reply(httplib::Response& res, int status, std::string_view name)
 
 void Reply(httplib::Response& res, ChannelError error)
 {
-    if (error == ChannelError::Standing)
-    {
-        // J5e: the fixed words need no escaping.
-        auto const words = DescribeRefusal(CommandRefusal::StandingNotSupported);
-        std::string body = "{\"error\":\"invalid_input\",\"reason\":\"";
-        body.append(words.code).append("\",\"reasonText\":\"").append(words.text).append("\"}");
-        res.status = ListenerStatus(error);
-        res.set_content(body, "application/json");
-        return;
-    }
     Reply(res, ListenerStatus(error), ChannelErrorName(error == ChannelError::Unknown ? ChannelError::Invalid : error));
 }
 
@@ -98,37 +81,29 @@ bool JsonContentType(std::string const& value)
     }
     return value.size() == type.size() || value[type.size()] == ';' || value[type.size()] == ' ';
 }
+
+template <typename F>
+struct AtExit
+{
+    F run;
+    ~AtExit() { run(); }
+};
 }  // namespace
 
 bool ListenerPortValid(uint32_t port) { return port >= 1024 && port <= 65535; }
 
 bool ListenerTokenValid(std::string_view token)
 {
-    // ValidSettings' minimum; Authenticated's maximum (a longer token could never be presented successfully).
+    // ValidSettings' minimum; BearerMatches' maximum (a longer token could never be presented successfully).
     return token.size() >= 22 && token.size() <= MaxBearerBytes;
 }
 
 bool ListenerPeerAllowed(std::string_view remoteAddr) { return remoteAddr == ListenerHost; }
 
-bool ListenerBearerMatches(std::string_view authorization, std::string_view token)
-{
-    constexpr std::string_view scheme = "Bearer ";
-    // The scheme and the length bound are public; only the secret bytes are compared in constant time.
-    if (token.empty() || token.size() > MaxBearerBytes || authorization.size() < scheme.size() ||
-        authorization.size() > scheme.size() + MaxBearerBytes || authorization.substr(0, scheme.size()) != scheme)
-        return false;
-    std::string_view const bearer = authorization.substr(scheme.size());
-    std::size_t difference = token.size() ^ bearer.size();
-    for (std::size_t i = 0; i < MaxBearerBytes; ++i)
-        difference |= (i < token.size() ? static_cast<unsigned char>(token[i]) : 0) ^
-                      (i < bearer.size() ? static_cast<unsigned char>(bearer[i]) : 0);
-    return difference == 0;
-}
-
 bool ListenerRouteValid(std::string_view route)
 {
     // The module's identifier rule; percent-encoding, '/' and '?' never pass it.
-    return route.size() <= MaxRouteBytes && ValidIdentifier(std::string(route));
+    return route.size() <= MaxRouteBytes && ValidIdentifier(route);
 }
 
 bool ListenerBodyShape(std::string_view body)
@@ -140,33 +115,6 @@ bool ListenerBodyShape(std::string_view body)
     while (last > first && JsonSpace(body[last - 1]))
         --last;
     return last - first >= 2 && body[first] == '{' && body[last - 1] == '}';
-}
-
-int64_t ListenerWaitMs(std::string_view body, int64_t nowUnixMs)
-{
-    constexpr std::string_view key = "\"deadlineUnixMs\"";
-    std::size_t i = body.find(key);
-    if (i == std::string_view::npos)
-        return ListenerWaitCapMs;
-    i += key.size();
-    while (i < body.size() && JsonSpace(body[i]))
-        ++i;
-    if (i >= body.size() || body[i] != ':')
-        return ListenerWaitCapMs;
-    ++i;
-    while (i < body.size() && JsonSpace(body[i]))
-        ++i;
-    int64_t deadline = 0;
-    std::size_t digits = 0;
-    for (; i < body.size() && Digit(body[i]); ++i)
-    {
-        if (++digits > 16)  // Beyond MaxSafeInteger: not a deadline the mailbox would accept.
-            return ListenerWaitCapMs;
-        deadline = deadline * 10 + (body[i] - '0');
-    }
-    if (!digits)
-        return ListenerWaitCapMs;
-    return std::clamp<int64_t>(deadline - nowUnixMs, 0, ListenerWaitCapMs);
 }
 
 int ListenerStatus(ChannelError error)
@@ -181,15 +129,14 @@ struct ChannelListener::Run
 {
     uint32_t port = 0;
     std::string token;  // Immutable for the run: a token change restarts the listener.
-    std::atomic<bool> stopping{false};
+    std::atomic<bool> stopping{false};  // Set under waitMutex, so no handler starts a wait Stop does not answer.
+    std::mutex waitMutex;
+    std::vector<std::shared_ptr<ChannelAnswer>> waiting;  // The handlers' answers, for Stop.
     httplib::Server server;
     std::thread thread;
 };
 
-ChannelListener::ChannelListener(Receive receive, Take take, Log log)
-    : _receive(std::move(receive)), _take(std::move(take)), _log(std::move(log))
-{
-}
+ChannelListener::ChannelListener(Receive receive, Log log) : _receive(std::move(receive)), _log(std::move(log)) {}
 
 ChannelListener::~ChannelListener()
 {
@@ -201,6 +148,15 @@ void ChannelListener::Write(bool warning, std::string const& line) const
 {
     if (_log)
         _log(warning, line);
+}
+
+void ChannelListener::Overload()
+{
+    // LC.38: a refusal for want of packet slots or route ids is answered overload and logged, at counts 1, 2, 4, ...
+    uint64_t const count = ++_overloads;
+    if ((count & (count - 1)) == 0)
+        Write(true, "[Ollama Chat] Bridge channel overload: " + std::to_string(count) +
+                        " requests answered overload so far (packet slots or route ids).");
 }
 
 bool ChannelListener::Configure(bool enabled, uint32_t port, std::string token)
@@ -247,7 +203,10 @@ uint64_t ChannelListener::Starts() const
     return _starts;
 }
 
-ListenerStats ChannelListener::Stats() const { return {_accepted.load(), _unauthorized.load(), _timeouts.load()}; }
+ListenerStats ChannelListener::Stats() const
+{
+    return {_accepted.load(), _unauthorized.load(), _timeouts.load(), _overloads.load()};
+}
 
 bool ChannelListener::StartLocked(uint32_t port, std::string token)
 {
@@ -274,7 +233,7 @@ bool ChannelListener::StartLocked(uint32_t port, std::string token)
             Reply(res, 403, "forbidden");
             return false;
         }
-        if (!ListenerBearerMatches(req.get_header_value("Authorization"), current->token))
+        if (!BearerMatches(req.get_header_value("Authorization"), current->token))
         {
             ++_unauthorized;
             Reply(res, ChannelError::Unauthorized);
@@ -328,52 +287,52 @@ bool ChannelListener::StartLocked(uint32_t port, std::string token)
                         Reply(res, ChannelError::Invalid);
                         return;
                     }
-                    if (current->stopping)
+                    // LCB6b: the handler waits on this packet's own answer, set by the world thread or by Stop.
+                    auto const answer = std::make_shared<ChannelAnswer>();
                     {
-                        Reply(res, ChannelError::Inactive);
-                        return;
-                    }
-                    auto const until = std::chrono::steady_clock::now() +
-                                       std::chrono::milliseconds(ListenerWaitMs(req.body, UnixMs()));
-                    uint64_t receipt = 0;
-                    ChannelError const received = _receive(current->token, route, req.body, receipt);
-                    if (received != ChannelError::None)
-                    {
-                        Reply(res, received);
-                        return;
-                    }
-                    ++_accepted;
-                    // Take is non-blocking: poll until the world tick publishes. A packet the world drops never
-                    // appears and ends as a timeout. The last Take runs at or after the deadline.
-                    std::unique_ptr<ChannelPacket> packet;
-                    while (true)
-                    {
-                        ChannelError const taken = _take(current->token, receipt, packet);
-                        if (taken == ChannelError::None && packet)
-                            break;
-                        if (taken != ChannelError::None && taken != ChannelError::Unknown)
-                        {
-                            Reply(res, taken);
-                            return;
-                        }
+                        std::lock_guard<std::mutex> lock(current->waitMutex);
                         if (current->stopping)
                         {
                             Reply(res, ChannelError::Inactive);
                             return;
                         }
-                        auto const now = std::chrono::steady_clock::now();
-                        if (now >= until)
-                        {
-                            ++_timeouts;
-                            Reply(res, 504, "timeout");
-                            return;
-                        }
-                        std::this_thread::sleep_for(std::min<std::chrono::steady_clock::duration>(
-                            std::chrono::milliseconds(ListenerPollMs), until - now));
+                        current->waiting.push_back(answer);
+                    }
+                    AtExit const leave{[current, raw = answer.get()]
+                                       {
+                                           std::lock_guard<std::mutex> lock(current->waitMutex);
+                                           std::erase_if(current->waiting,
+                                                         [raw](auto const& item) { return item.get() == raw; });
+                                       }};
+                    ChannelError const received = _receive(route, req.body, answer);
+                    if (received != ChannelError::None)
+                    {
+                        if (received == ChannelError::Capacity)
+                            Overload();
+                        Reply(res, received);
+                        return;
+                    }
+                    ++_accepted;
+                    std::unique_ptr<ChannelPacket> packet;
+                    if (!answer->Wait(std::chrono::steady_clock::now() + std::chrono::milliseconds(ListenerWaitCapMs),
+                                      packet))
+                    {
+                        ++_timeouts;
+                        Reply(res, 504, "timeout");
+                        return;
+                    }
+                    if (!packet)
+                    {
+                        Reply(res, ChannelError::Inactive);  // The listener stopped.
+                        return;
                     }
                     if (packet->error != ChannelError::None || packet->body.empty())
                     {
-                        Reply(res, packet->error == ChannelError::None ? ChannelError::Invalid : packet->error);
+                        ChannelError const error =
+                            packet->error == ChannelError::None ? ChannelError::Invalid : packet->error;
+                        if (error == ChannelError::Capacity)
+                            Overload();
+                        Reply(res, error);
                         return;
                     }
                     // The response owns the packet, and with it the physical mailbox slot, until it is written.
@@ -428,7 +387,12 @@ void ChannelListener::StopLocked(bool log)
 {
     if (!_run)
         return;
-    _run->stopping = true;  // Waiting handlers answer inactive within one poll.
+    {
+        std::lock_guard<std::mutex> lock(_run->waitMutex);
+        _run->stopping = true;
+        for (auto const& answer : _run->waiting)
+            answer->Set(nullptr);  // LCB6b: waiting handlers are answered inactive at once.
+    }
     _run->server.stop();
     if (_run->thread.joinable())
         _run->thread.join();  // listen_after_bind returns after its worker pool has joined.

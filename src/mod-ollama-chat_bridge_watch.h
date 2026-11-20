@@ -23,7 +23,6 @@ enum class DispatchSource : uint8_t;  // bridge_world.h; a watch stores the valu
 constexpr int64_t WatchMinMs = 5000;       // Shortest wait: untilUnixMs - now.
 constexpr int64_t WatchMaxMs = 600000;     // Longest wait, and the whole chain's cap after the player's line.
 constexpr uint8_t WatchMaxDepth = 3;       // Wakes in one chain.
-constexpr std::size_t MaxWatches = 64;     // One per bot; MaxWorldScopes (asserted in bridge_world.h).
 constexpr int64_t WatchScanMs = 500;       // Scan interval of the post-map-join update.
 constexpr int64_t WatchSettleMs = 1000;    // An observation counts only this long after arming.
 constexpr int64_t WatchDebounceMs = 2000;  // A condition must hold this long; a re-pull starts it again.
@@ -134,7 +133,7 @@ struct WatchCounters
     bool operator==(WatchCounters const&) const = default;
 };
 
-// World-thread table of plain values: one watch per bot, at most MaxWatches. Nothing here reads the game; the
+// World-thread table of plain values: one watch per bot, no fixed count (LC.38). Nothing here reads the game; the
 // caller passes facts it read, and Scan asks for them once per watch.
 class WatchTable
 {
@@ -273,8 +272,6 @@ private:
             return CommandRefusal::NotFighting;
         if (watch.condition == WatchCondition::ActivityDone && facts.activity == ActivityIdle)
             return CommandRefusal::NotBusy;
-        if (!Find(watch.botGuid) && _watches.size() >= MaxWatches)
-            return CommandRefusal::CannotNow;
         return CommandRefusal::None;
     }
 

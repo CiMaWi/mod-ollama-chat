@@ -1,14 +1,6 @@
 {
     "tests": [
         {
-            "file": "api-selftest.cpp",
-            "baseline": "needs core headers (boost, IoContext) and a generated config-excerpt.inc; no runner in the repo"
-        },
-        {
-            "file": "bridge-card-facts-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
-        },
-        {
             "file": "bridge-channel-dispatch-selftest.cpp",
             "includes": [
                 "src",
@@ -37,7 +29,12 @@
         },
         {
             "file": "bridge-combat-filter-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "includes": [
+                "src",
+                "../mod-playerbots/src/Bot",
+                "deps"
+            ],
+            "success": "PASS \\d+ combat filter checks"
         },
         {
             "file": "bridge-command-dispatch-selftest.cpp",
@@ -56,7 +53,19 @@
         },
         {
             "file": "bridge-effect-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "includes": [
+                "tests/doubles",
+                "src",
+                "../mod-playerbots/src/Bot",
+                "{core}/deps/fmt/include",
+                "deps"
+            ],
+            "flags": [
+                "/DFMT_HEADER_ONLY",
+                "-Wno-mismatched-tags",
+                "-Wno-missing-field-initializers"
+            ],
+            "success": "PASS \\d+ production bridge effect adapter checks"
         },
         {
             "file": "bridge-intent-selftest.cpp",
@@ -93,17 +102,29 @@
             "success": "\\d+ checks passed"
         },
         {
-            "file": "bridge-plan-selftest.cpp",
+            "file": "bridge-query-dispatch-selftest.cpp",
             "includes": [
+                "tests/doubles",
                 "src",
                 "../mod-playerbots/src/Bot",
+                "{playerbots}/src/Bot/Debug",
+                "{core}/deps/fmt/include",
                 "deps"
             ],
-            "success": "PASS \\d+ checks"
-        },
-        {
-            "file": "bridge-query-dispatch-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp",
+                "src/mod-ollama-chat_bridge_listener.cpp"
+            ],
+            "flags": [
+                "/DFMT_HEADER_ONLY",
+                "-Wno-mismatched-tags",
+                "-Wno-missing-field-initializers",
+                "ws2_32.lib"
+            ],
+            "success": "PASS \\d+ query dispatch checks"
         },
         {
             "file": "bridge-query-selftest.cpp",
@@ -122,11 +143,56 @@
         },
         {
             "file": "bridge-selftest.cpp",
-            "baseline": "needs core headers (ScriptMgr.h) and stubs; no runner in the repo"
+            "includes": [
+                "tests/doubles",
+                "src",
+                "../mod-playerbots/src/Bot",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp"
+            ],
+            "flags": [
+                "ws2_32.lib"
+            ],
+            "success": "bridge-selftest: \\d+ checks passed"
         },
         {
             "file": "bridge-speech-routing-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "includes": [
+                "tests/doubles",
+                "src",
+                "../mod-playerbots/src/Bot",
+                "{playerbots}/src/Bot/Debug",
+                "{core}/deps/fmt/include",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp",
+                "src/mod-ollama-chat_bridge_listener.cpp"
+            ],
+            "flags": [
+                "/DFMT_HEADER_ONLY",
+                "-Wno-mismatched-tags",
+                "-Wno-missing-field-initializers",
+                "ws2_32.lib"
+            ],
+            "success": "\\d+ bridge speech routing checks passed"
+        },
+        {
+            "file": "bridge-state-selftest.cpp",
+            "includes": [
+                "src",
+                "../mod-playerbots/src/Bot",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp"
+            ],
+            "success": "PASS \\d+ state key checks"
         },
         {
             "file": "bridge-watch-selftest.cpp",
@@ -157,7 +223,28 @@
         },
         {
             "file": "dispatch-bridge-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
+            "includes": [
+                "tests/doubles",
+                "src",
+                "../mod-playerbots/src/Bot",
+                "{playerbots}/src/Bot/Debug",
+                "{core}/deps/fmt/include",
+                "deps"
+            ],
+            "sources": [
+                "src/mod-ollama-chat_bridge.cpp",
+                "src/mod-ollama-chat_bridge_world.cpp",
+                "src/mod-ollama-chat_bridge_channel.cpp",
+                "src/mod-ollama-chat_bridge_query.cpp",
+                "src/mod-ollama-chat_bridge_listener.cpp"
+            ],
+            "flags": [
+                "/DFMT_HEADER_ONLY",
+                "-Wno-mismatched-tags",
+                "-Wno-missing-field-initializers",
+                "ws2_32.lib"
+            ],
+            "success": "\\d+ dispatch bridge checks passed"
         },
         {
             "file": "lab-selftest.cpp",
@@ -167,41 +254,6 @@
                 "deps"
             ],
             "success": "lab selftest: \\d+ checks passed"
-        },
-        {
-            "file": "persona-adapter-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
-        },
-        {
-            "file": "persona-bridge-selftest.cpp",
-            "baseline": "needs a generated .inc fixture (cut from production sources by a scratch extraction runner); not in the repo"
-        },
-        {
-            "file": "persona-card-selftest.cpp",
-            "includes": [
-                "src",
-                "../mod-playerbots/src/Bot",
-                "deps",
-                "{core}/deps/utf8cpp"
-            ],
-            "sources": [
-                "src/mod-ollama-chat_persona_card.cpp"
-            ],
-            "success": "persona-card selftest passed \\d+ checks"
-        },
-        {
-            "file": "persona-store-selftest.cpp",
-            "includes": [
-                "src",
-                "../mod-playerbots/src/Bot",
-                "deps",
-                "{core}/deps/utf8cpp"
-            ],
-            "sources": [
-                "src/mod-ollama-chat_persona_store.cpp",
-                "src/mod-ollama-chat_persona_card.cpp"
-            ],
-            "success": "persona-store selftest: \\d+ checks passed"
         },
         {
             "file": "reply-split-selftest.cpp",

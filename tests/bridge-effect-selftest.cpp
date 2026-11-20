@@ -1,25 +1,24 @@
-// The production BridgeCommandExecutor class (src/mod-ollama-chat_bridge_effect.cpp) is extracted verbatim by the
-// runner into bridge-effect-executor.inc (its private section made public so Effect can be called directly) and
-// compiled against game and playerbots doubles that count every read and every call. The playerbots Intent, Result
-// and Order types are extracted from mod-playerbots' BridgeIntentEffect.h. MapIntent and BuildEffectOrder are the
-// real headers. J12: the executor's plan ledger (the real PlanLedger) with Capture/Restore doubles that model each
-// bot's lasting parts; the world tick's expiry, group, controller and logout checks and restores. No game, no
-// playerbots, no server.
+// The production typed-effect unit (src/mod-ollama-chat_bridge_effect.cpp) is compiled whole, with playerbots' own
+// order types (BridgeIntentEffect.h, BridgeAbilities.h), against game doubles and doubles of playerbots' executor
+// boundary that count every read and every call. The world phase is built as in production: by the world tick.
+// LCB2: every command is stepped, so every case runs through Execute as WorldChannel calls it. LC.36: a lasting step
+// runs like any other; the unit keeps no ledger and names no Capture or Restore. No game, no playerbots, no server.
 #include <algorithm>
 #include <functional>
 #include <iostream>
 #include <map>
-#include <new>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
-#include "bridge-effect-playerbots.inc"
-#include "mod-ollama-chat_bridge_plan.h"
+#include "BridgeAbilities.h"
+#include "BridgeIntentEffect.h"
 #include "mod-ollama-chat_bridge_world.h"
 
 // ---- game doubles -------------------------------------------------------------------------------------------------
-float g_SayDistance = 17.5f;
-
 struct ObjectGuid
 {
     ObjectGuid() = default;
@@ -30,18 +29,9 @@ private:
     uint64_t _raw = 0;
 };
 
-struct Sight
-{
-    bool inMap = true;
-    bool samePhase = true;
-    bool inDistance = true;
-    bool canSee = true;
-};
-
 struct Unit
 {
     bool inWorld = true;
-    Sight sight;  // What this unit, as an observer, makes of any other unit.
     bool IsInWorld() const { return inWorld; }
 };
 
@@ -53,22 +43,12 @@ struct Group
     ObjectGuid GetLeaderGUID() const { return ObjectGuid(leader); }
 };
 
-struct Player;
-// The bot's playerbots AI: only its master matters to the plan tick's controller check.
-struct PlayerbotAI
-{
-    Player* master = nullptr;
-    Player* GetMaster() const { return master; }
-};
-
 struct Counters
 {
     unsigned playerLookups = 0;
     unsigned unitLookups = 0;
     unsigned targetReads = 0;
     unsigned groupReads = 0;
-    unsigned distanceCalls = 0;
-    float lastDistance = -1.0f;
 };
 Counters game;
 
@@ -76,16 +56,6 @@ struct Player : Unit
 {
     Group* group = nullptr;
     uint64_t target = 0;
-    PlayerbotAI* ai = nullptr;
-    bool IsInMap(Unit const*) const { return sight.inMap; }
-    bool InSamePhase(Unit const*) const { return sight.samePhase; }
-    bool IsWithinDistInMap(Unit const*, float distance) const
-    {
-        ++game.distanceCalls;
-        game.lastDistance = distance;
-        return sight.inDistance;
-    }
-    bool CanSeeOrDetect(Unit const*, bool, bool) const { return sight.canSee; }
     Group* GetGroup()
     {
         ++game.groupReads;
@@ -124,37 +94,98 @@ struct ObjectAccessor
     }
 };
 
-struct PlayerbotsMgr
+// ---- playerbots doubles: the executor boundary the unit calls (declared in the two headers above) ----------------
+namespace PlayerbotBridge
 {
-    static PlayerbotsMgr& instance()
+struct Doubles
+{
+    bool current = true;  // What PostMapJoin::Current answers.
+    unsigned executes = 0;
+    unsigned reaches = 0;
+    unsigned authorizeCalled = 0;
+    bool authorizeResult = false;
+    bool reachable = false;
+    Result result = Result::Applied;
+    Refusal refusal = Refusal::None;  // DS.14: what Execute reports through its out-param.
+    Order order;
+    Order probe;
+    PostMapJoin const* phase = nullptr;
+    PostMapJoin const* reachPhase = nullptr;
+    // LC3b: the span Execute of a stepped order.
+    unsigned spanExecutes = 0;
+    std::vector<Order> steps;               // The orders of the latest span Execute.
+    std::vector<StepOutcome> stepOutcomes;  // Per step; a step past the list applies.
+    std::optional<Result> spanEarly;        // Refused before authorize (a row-less verb, a malformed step).
+    Refusal wordsFor = Refusal::None;       // The latest RefusalWords argument.
+};
+Doubles pb;
+
+PostMapJoin::PostMapJoin() : _thread(std::this_thread::get_id()) {}
+bool PostMapJoin::Current() const { return pb.current; }
+
+// The one-order Execute: the stepped executor must never call it (the cases check executes == 0).
+Result Execute(PostMapJoin const& phase, Order const& order, std::function<bool()> const& authorize, Refusal* why)
+{
+    ++pb.executes;
+    if (why)
+        *why = pb.refusal;
+    pb.order = order;
+    pb.phase = &phase;
+    ++pb.authorizeCalled;
+    pb.authorizeResult = authorize();
+    return pb.result;
+}
+
+// LC3b: one order of steps, one authorize; each step's configured outcome, the first not Applied ends the order.
+Result Execute(PostMapJoin const& phase, std::span<Order const> steps, std::function<bool()> const& authorize,
+               std::vector<StepOutcome>* outcomes)
+{
+    ++pb.spanExecutes;
+    pb.steps.assign(steps.begin(), steps.end());
+    pb.phase = &phase;
+    if (outcomes)
+        outcomes->clear();
+    if (pb.spanEarly)
+        return *pb.spanEarly;
+    ++pb.authorizeCalled;
+    pb.authorizeResult = authorize();
+    Result result = Result::Applied;
+    for (std::size_t index = 0; index < steps.size() && result == Result::Applied; ++index)
     {
-        static PlayerbotsMgr manager;
-        return manager;
+        StepOutcome const outcome =
+            index < pb.stepOutcomes.size() ? pb.stepOutcomes[index] : StepOutcome{Result::Applied, Refusal::None};
+        if (outcomes)
+            outcomes->push_back(outcome);
+        result = outcome.Outcome;
     }
-    PlayerbotAI* GetPlayerbotAI(Player* player) const { return player ? player->ai : nullptr; }
-};
+    return result;
+}
 
-namespace OllamaBridge
+RefusalText const& RefusalWords(Refusal reason)
 {
-// The steady clock the executor reads once per order (bridge.cpp is not linked).
-int64_t testNowMs = 1000;
-Clock Now() { return {0, testNowMs}; }
+    static RefusalText words{Refusal::None, "pb_word", "A playerbots sentence."};
+    pb.wordsFor = reason;
+    words.Code = reason;
+    return words;
+}
 
-struct EffectPhase
+bool PositionReachable(PostMapJoin const& phase, Order const& order)
 {
-    PlayerbotBridge::PostMapJoin join;
-};
+    ++pb.reaches;
+    pb.probe = order;
+    pb.reachPhase = &phase;
+    return pb.reachable;
+}
+}  // namespace PlayerbotBridge
 
-namespace
-{
-using BridgePlans = PlanLedger<PlayerbotBridge::Baseline>;  // As in bridge_effect.cpp.
-#include "bridge-effect-executor.inc"
-}  // namespace
-}  // namespace OllamaBridge
+#define OLLAMA_SELFTEST_GAME_DOUBLES
+#include "../src/mod-ollama-chat_bridge_effect.cpp"
 
 namespace
 {
 using namespace OllamaBridge;
+// The world phase of the running tick: only ::OllamaDispatch_Update (below) can build one.
+EffectPhase const* worldPhase = nullptr;
 unsigned checks = 0;
 void Check(bool value, char const* label)
 {
@@ -170,55 +201,38 @@ constexpr uint64_t kTarget = 44;
 constexpr uint64_t kOther = 55;
 constexpr uint64_t kStranger = 66;
 constexpr uint64_t kGeneration = 7;
-using PlayerbotBridge::Part;
-
-// The executor's one ledger, fresh (its capacity is const, so rebuilt in place).
-void ResetPlans()
-{
-    BridgePlans& plans = BridgeCommandExecutor::Plans();
-    plans.~BridgePlans();
-    new (&plans) BridgePlans();
-}
 
 struct Env
 {
     Player bot;
     Player controller;
     Player stranger;
-    PlayerbotAI botAI;
     Group botGroup;
     Group controllerGroup;
     Unit target;
     Unit other;
-    EffectPhase phase;
+    EffectPhase const& phase = *worldPhase;
     WorldTicket ticket;
     DispatchGuard guard;
     unsigned authorizeCalls = 0;
     CommandRefusal why = CommandRefusal::None;  // The last Run's refusal reason.
-    std::vector<ChannelStepResult> ran;         // LC3b: the last RunSteps' step results.
+    std::vector<ChannelStepResult> ran;         // LC3b: the last Run's step results.
 
     Env()
     {
         game = Counters{};
         PlayerbotBridge::pb = PlayerbotBridge::Doubles{};
-        g_SayDistance = 17.5f;
         botGroup.guid = controllerGroup.guid = kGroup;
         botGroup.leader = controllerGroup.leader = kController;
         bot.group = &botGroup;
         controller.group = &controllerGroup;
         bot.target = kTarget;
-        bot.ai = &botAI;
-        botAI.master = &controller;
         ObjectAccessor::Players() = {{kBot, &bot}, {kController, &controller}, {kStranger, &stranger}};
         ObjectAccessor::Units() = {{kTarget, &target}, {kOther, &other}};
         ticket.scope.botGuid = kBot;
         ticket.scope.controllerGuid = kController;
         ticket.generation = kGeneration;
         guard.groupGuid = kGroup;
-        testNowMs = 1000;
-        PlayerbotBridge::pb.clock = &testNowMs;
-        ResetPlans();
-        BridgeCommandExecutor::Plans().Open(kGeneration);
     }
 
     std::function<bool()> Authorize()
@@ -230,170 +244,101 @@ struct Env
         };
     }
 
+    // Through the executor's own entry, as WorldChannel calls it: its refusal and its step results.
     EffectResult Run(ChannelCommand const& command)
     {
-        why = CommandRefusal::None;
-        return BridgeCommandExecutor::Effect(phase, ticket, guard, command, Authorize(), why);
+        BridgeCommandExecutor executor;
+        auto const result = executor.Execute(phase, ticket, guard, command, Authorize());
+        why = executor.Refusal();
+        ran = executor.Steps();
+        return result;
     }
 };
 
-ChannelPosition Pos() { return ChannelPosition{100.5, 200.25, 300.125, 1}; }
+using PlayerbotBridge::Intent;
 
-ChannelCommand Cmd(ChannelIntent intent, ChannelParams params = std::monostate{})
+ChannelStep Step(Intent intent)
+{
+    ChannelStep step;
+    step.intent = intent;
+    return step;
+}
+
+ChannelCommand Steps(std::vector<ChannelStep> steps)
 {
     ChannelCommand command;
     command.commandId = "c1";
     command.issuerGuid = kController;
     command.botGuid = kBot;
-    command.intent = intent;
-    command.params = std::move(params);
+    command.steps = std::move(steps);
     return command;
 }
 
-ChannelCommand ValidCmd(ChannelIntent intent)
+// One step of the act, with the fields it takes.
+ChannelCommand ValidCmd(Intent intent)
 {
+    auto step = Step(intent);
     switch (intent)
     {
-        case ChannelIntent::Pull:
-        case ChannelIntent::FocusHealing:
-            return Cmd(intent, ChannelTarget{kTarget});
-        case ChannelIntent::Mark:
-            return Cmd(intent, ChannelMark{kTarget, 3});
-        case ChannelIntent::AssignRole:
-            return Cmd(intent, ChannelRole::Tank);
-        case ChannelIntent::SaveMana:
-            return Cmd(intent, true);
-        case ChannelIntent::Formation:
-            return Cmd(intent, ChannelShape::Close);
-        case ChannelIntent::Position:
-            return Cmd(intent, Pos());
-        case ChannelIntent::DungeonClear:
-            return Cmd(intent, ChannelMode::On);
-        case ChannelIntent::GoTo:
-        case ChannelIntent::MeetAt:
-            return Cmd(intent, ChannelPlace{"Goldshire"});
-        case ChannelIntent::Quest:
-            return Cmd(intent, ChannelQuestId{4242});
+        case Intent::FocusHealing:
+            step.targetGuid = kTarget;
+            break;
+        case Intent::Mark:
+            step.targetGuid = kTarget;
+            step.icon = 3;
+            break;
+        case Intent::SaveMana:
+            step.enabled = true;
+            break;
+        case Intent::Formation:
+            step.shape = 0;
+            break;
+        case Intent::GoTo:
+        case Intent::MeetAt:
+            step.place = "Goldshire";
+            break;
+        case Intent::Quest:
+            step.questId = 4242;
+            break;
         default:
-            return Cmd(intent);
+            break;
     }
+    return Steps({step});
 }
 
-struct Verb
-{
-    ChannelIntent intent;
-    PlayerbotBridge::Intent op;
-    char const* name;
-};
-Verb const kVerbs[] = {{ChannelIntent::AttackOwnTarget, PlayerbotBridge::Intent::AttackOwnTarget, "attack_own_target"},
-                       {ChannelIntent::Mark, PlayerbotBridge::Intent::Mark, "mark"},
-                       {ChannelIntent::Follow, PlayerbotBridge::Intent::Follow, "follow"},
-                       {ChannelIntent::Stay, PlayerbotBridge::Intent::Stay, "stay"},
-                       {ChannelIntent::Flee, PlayerbotBridge::Intent::Flee, "flee"},
-                       {ChannelIntent::Position, PlayerbotBridge::Intent::Position, "position"},
-                       {ChannelIntent::Formation, PlayerbotBridge::Intent::Formation, "formation"},
-                       {ChannelIntent::SaveMana, PlayerbotBridge::Intent::SaveMana, "save_mana"},
-                       {ChannelIntent::FocusHealing, PlayerbotBridge::Intent::FocusHealing, "focus_healing"},
-                       {ChannelIntent::GoTo, PlayerbotBridge::Intent::GoTo, "go_to"},
-                       {ChannelIntent::Quest, PlayerbotBridge::Intent::Quest, "quest"},
-                       {ChannelIntent::Errands, PlayerbotBridge::Intent::Errands, "errands"},
-                       {ChannelIntent::SetHearth, PlayerbotBridge::Intent::SetHearth, "set_hearth"},
-                       {ChannelIntent::GrindHere, PlayerbotBridge::Intent::GrindHere, "grind_here"},
-                       {ChannelIntent::GatherHere, PlayerbotBridge::Intent::GatherHere, "gather_here"},
-                       {ChannelIntent::MeetAt, PlayerbotBridge::Intent::MeetAt, "meet_at"},
-                       {ChannelIntent::PausePlan, PlayerbotBridge::Intent::PausePlan, "pause_plan"},
-                       {ChannelIntent::ResumePlan, PlayerbotBridge::Intent::ResumePlan, "resume_plan"}};
+// The acts of the old one-order path, each sent as a one-step order.
+Intent const kActs[] = {
+    Intent::AttackOwnTarget, Intent::Mark,      Intent::Follow,       Intent::Stay,       Intent::Flee,
+    Intent::Formation,       Intent::SaveMana,  Intent::FocusHealing, Intent::GoTo,       Intent::Quest,
+    Intent::Errands,         Intent::SetHearth, Intent::GrindHere,    Intent::GatherHere, Intent::MeetAt,
+    Intent::PausePlan,       Intent::ResumePlan};
 
 // Nothing reached playerbots and no game read happened.
 bool Untouched()
 {
     auto const& p = PlayerbotBridge::pb;
-    return p.executes == 0 && p.reaches == 0 && game.playerLookups == 0 && game.unitLookups == 0 &&
+    return p.spanExecutes == 0 && p.reaches == 0 && game.playerLookups == 0 && game.unitLookups == 0 &&
            game.targetReads == 0 && game.groupReads == 0;
-}
-
-void VerbSwitch()
-{
-    for (Verb const& verb : kVerbs)
-    {
-        Env env;
-        PlayerbotBridge::pb.reachable = true;
-        PlayerbotBridge::pb.result = PlayerbotBridge::Result::Applied;
-        auto const command = ValidCmd(verb.intent);
-        Check(env.Run(command) == EffectResult::Applied, verb.name);
-        auto const& pb = PlayerbotBridge::pb;
-        Check(pb.executes == 1, "exactly one playerbots call");
-        Check(pb.order.Operation == verb.op, "verb maps to its own playerbots operation");
-        Check(pb.order.Bot == kBot && pb.order.Controller == kController && pb.order.Group == kGroup,
-              "bot, controller and group from scope and guard");
-        Check(pb.phase == &env.phase.join, "the joined phase is forwarded");
-        Check(env.authorizeCalls == 1 && pb.authorizeCalled == 1 && pb.authorizeResult,
-              "authorize passes through and the executor adds none");
-        bool const targeted = verb.intent == ChannelIntent::AttackOwnTarget || verb.intent == ChannelIntent::Mark ||
-                              verb.intent == ChannelIntent::FocusHealing;
-        Check(pb.order.Target == (targeted ? kTarget : 0), "target only for attack, mark and focus heal");
-        Check(pb.order.Icon == (verb.intent == ChannelIntent::Mark ? 3 : 0), "icon only for mark");
-        Check(pb.order.Shape == (verb.intent == ChannelIntent::Formation ? PlayerbotBridge::FormationShape::Close
-                                                                         : PlayerbotBridge::FormationShape::None),
-              "shape only for formation");
-        Check(pb.order.Enabled == (verb.intent == ChannelIntent::SaveMana), "enable flag only for save_mana");
-        bool const position = verb.intent == ChannelIntent::Position;
-        Check(pb.order.MapId == (position ? 1u : 0u) && pb.order.X == (position ? 100.5 : 0.0) &&
-                  pb.order.Y == (position ? 200.25 : 0.0) && pb.order.Z == (position ? 300.125 : 0.0),
-              "destination only for position");
-        Check(pb.reaches == (position ? 1u : 0u), "reachability query only for position");
-        bool const placed = verb.intent == ChannelIntent::GoTo || verb.intent == ChannelIntent::MeetAt;
-        Check(pb.order.PlaceName == (placed ? "Goldshire" : ""), "WT18b: place name only for go_to and meet_at");
-        Check(pb.order.QuestId == (verb.intent == ChannelIntent::Quest ? 4242u : 0u), "WT18b: quest id only for quest");
-        Check(game.targetReads == (verb.intent == ChannelIntent::AttackOwnTarget ? 1u : 0u),
-              "own target read only for attack");
-        Check(game.unitLookups == (targeted ? 1u : 0u), "target unit resolved only for attack, mark and focus heal");
-        Check(game.playerLookups == 2, "bot and controller resolved by guid");
-    }
-}
-
-void OtherVerbs()
-{
-    for (uint8_t raw = 0; raw <= static_cast<uint8_t>(ChannelIntent::ResumePlan); ++raw)
-    {
-        auto const intent = static_cast<ChannelIntent>(raw);
-        bool supported = false;
-        for (Verb const& verb : kVerbs)
-            supported = supported || verb.intent == intent;
-        if (supported)
-            continue;
-        Env env;
-        PlayerbotBridge::pb.reachable = true;
-        Check(env.Run(ValidCmd(intent)) == EffectResult::Rejected, "unsupported verb is rejected");
-        Check(Untouched() && env.authorizeCalls == 0, "unsupported verb: no game read, no playerbots call");
-    }
-    // Out-of-range verb values too.
-    Env env;
-    Check(env.Run(Cmd(static_cast<ChannelIntent>(250))) == EffectResult::Rejected && Untouched(),
-          "unknown verb value is rejected before any read");
 }
 
 void Gates()
 {
     {
         Env env;
-        env.phase.join.current = false;
-        Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Rejected && Untouched(),
+        PlayerbotBridge::pb.current = false;
+        Check(env.Run(ValidCmd(Intent::Follow)) == EffectResult::Rejected && Untouched(),
               "a phase that is no longer current reads nothing");
     }
     {
         Env env;
-        BridgeCommandExecutor executor;
-        static_assert(kBridgeEffectsReleased, "effects are on since J6b4 (DS.5)");
-        Check(executor.Execute(env.phase, env.ticket, env.guard, ValidCmd(ChannelIntent::Follow), env.Authorize()) ==
-                      EffectResult::Applied &&
-                  PlayerbotBridge::pb.executes == 1 && env.authorizeCalls == 1,
-              "open release gate: Execute reaches the typed effect");
+        Check(env.Run(ValidCmd(Intent::Follow)) == EffectResult::Applied && PlayerbotBridge::pb.spanExecutes == 1 &&
+                  env.authorizeCalls == 1,
+              "Execute reaches the typed effect");
     }
     {
         Env env;
-        env.phase.join.current = false;
-        Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Rejected,
+        PlayerbotBridge::pb.current = false;
+        Check(env.Run(ValidCmd(Intent::Mark)) == EffectResult::Rejected,
               "a mark refused before playerbots is rejected");
     }
     for (int which = 0; which < 3; ++which)
@@ -405,7 +350,7 @@ void Gates()
             ObjectAccessor::Players().erase(kController);
         else
             env.bot.inWorld = false;
-        Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 &&
+        Check(env.Run(ValidCmd(Intent::Follow)) == EffectResult::Rejected && PlayerbotBridge::pb.spanExecutes == 0 &&
                   env.why == CommandRefusal::Unavailable,
               "a missing or out-of-world bot, or an offline partner, is rejected");
     }
@@ -413,549 +358,53 @@ void Gates()
         // DS.14: the partner need only be online; playerbots checks what each verb needs of it.
         Env env;
         env.controller.inWorld = false;
-        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied && PlayerbotBridge::pb.executes == 1,
+        Check(env.Run(ValidCmd(Intent::Stay)) == EffectResult::Applied && PlayerbotBridge::pb.spanExecutes == 1,
               "a connected partner out of the world still gets the bot's own act");
     }
 }
 
-void Facts()
+// DS.14: the captured group, not a re-read one, is what playerbots is given; an ungrouped bot's stay reaches it with
+// group 0. What each act needs of the group, the partner and a target is
+// playerbots' gate.
+void Groups()
 {
-    // DS.14 group facts: the bot's group must still be the captured one (0: ungrouped then and now); the partner's
-    // group matters only to the verbs that need the partner in the bot's group.
-    for (int which = 0; which < 3; ++which)
     {
-        Env env;
-        if (which == 0)
-            env.botGroup.guid = kGroup + 1;
-        else if (which == 1)
-            env.guard.groupGuid = kGroup + 1;
-        else
-            env.bot.group = nullptr;
-        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 &&
-                  env.why == CommandRefusal::CannotNow,
-              "a bot whose group changed since the capture is rejected");
-    }
-    for (Verb const& verb : kVerbs)
-    {
-        CommandRefusal const groupWhy =
-            verb.intent == ChannelIntent::Follow ? CommandRefusal::NotWithYou : CommandRefusal::NotInGroup;
-        bool const needsPartner = verb.intent == ChannelIntent::Follow || verb.intent == ChannelIntent::Formation ||
-                                  verb.intent == ChannelIntent::SaveMana;
-        bool const needsGroup =
-            needsPartner || verb.intent == ChannelIntent::Mark || verb.intent == ChannelIntent::FocusHealing;
-        for (int which = 0; which < 2; ++which)
-        {
-            Env env;
-            PlayerbotBridge::pb.reachable = true;
-            if (which == 0)
-                env.controllerGroup.guid = kGroup + 1;  // The partner is in another group.
-            else
-                env.controller.group = nullptr;  // The partner is in none.
-            EffectResult const result = env.Run(ValidCmd(verb.intent));
-            Check(needsPartner
-                      ? result == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 && env.why == groupWhy
-                      : result == EffectResult::Applied && PlayerbotBridge::pb.order.Group == kGroup,
-                  "partner outside the bot's group: follow not_with_you, formation and save_mana not_in_group, the "
-                  "bot's own acts and its group's marks and heals applied in the bot's group");
-        }
-        Env env;
-        PlayerbotBridge::pb.reachable = true;
-        env.guard.groupGuid = 0;
-        env.bot.group = nullptr;
-        EffectResult const result = env.Run(ValidCmd(verb.intent));
-        Check(needsGroup ? result == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 && env.why == groupWhy
-                         : result == EffectResult::Applied && PlayerbotBridge::pb.order.Group == 0,
-              "ungrouped bot: follow not_with_you, other group verbs not_in_group, its own acts applied with group 0");
-    }
-    {
-        // DS.14: an ungrouped bot's stay reaches playerbots with group 0 and the ledger keeps it as a plan.
         Env env;
         env.guard.groupGuid = 0;
         env.bot.group = env.controller.group = nullptr;
-        BridgePlans& plans = BridgeCommandExecutor::Plans();
-        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied && PlayerbotBridge::pb.order.Group == 0 &&
-                  plans.Size() == 1 && plans.LiveBots().size() == 1 && plans.LiveBots()[0].owner.groupGuid == 0 &&
-                  plans.LiveBots()[0].owner.controllerGuid == kController,
-              "an ungrouped stay is applied with group 0 and recorded as the partner's plan");
+        Check(env.Run(ValidCmd(Intent::Stay)) == EffectResult::Applied && PlayerbotBridge::pb.steps[0].Group == 0 &&
+                  PlayerbotBridge::pb.steps[0].Controller == kController,
+              "an ungrouped stay is applied with group 0 for its partner");
     }
     {
-        // The captured group, not a re-read one, is what playerbots is given.
         Env env;
-        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied &&
-                  PlayerbotBridge::pb.order.Group == env.guard.groupGuid,
+        Check(env.Run(ValidCmd(Intent::Stay)) == EffectResult::Applied &&
+                  PlayerbotBridge::pb.steps[0].Group == env.guard.groupGuid,
               "captured group reaches playerbots");
     }
-    {
-        // Scope, not wire: a command for another bot or from another issuer is refused.
-        Env env;
-        auto command = ValidCmd(ChannelIntent::Stay);
-        command.botGuid = kOther;
-        Check(env.Run(command) == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0, "wire bot mismatch");
-        command = ValidCmd(ChannelIntent::Stay);
-        command.issuerGuid = kOther;
-        Check(env.Run(command) == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0, "wire issuer mismatch");
-    }
-    // Attack: own target only.
-    {
-        Env env;
-        env.bot.target = 0;
-        Check(env.Run(ValidCmd(ChannelIntent::AttackOwnTarget)) == EffectResult::Rejected && game.unitLookups == 0 &&
-                  PlayerbotBridge::pb.executes == 0,
-              "attack without an own target resolves nothing");
-    }
-    {
-        Env env;
-        env.bot.target = kOther;
-        Check(env.Run(ValidCmd(ChannelIntent::AttackOwnTarget)) == EffectResult::Applied &&
-                  PlayerbotBridge::pb.order.Target == kOther,
-              "attack targets the bot's own current target");
-    }
-    {
-        Env env;
-        env.bot.target = 9999;  // Not resolvable.
-        Check(env.Run(ValidCmd(ChannelIntent::AttackOwnTarget)) == EffectResult::Rejected &&
-                  PlayerbotBridge::pb.executes == 0,
-              "unresolvable own target");
-    }
-    {
-        // A mark never reads the bot's target and uses the wire guid.
-        Env env;
-        env.bot.target = kOther;
-        Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Applied && game.targetReads == 0 &&
-                  PlayerbotBridge::pb.order.Target == kTarget,
-              "mark ignores the bot's own target");
-    }
-    // DS.14, LCB1e: what the bot perceives is playerbots' one rule (Perceives, when the act runs); the module only
-    // resolves the unit, and the partner's sight plays no part.
-    for (ChannelIntent intent : {ChannelIntent::AttackOwnTarget, ChannelIntent::Mark})
-        for (int observer = 0; observer < 2; ++observer)
-            for (int respect = 0; respect < 6; ++respect)
-            {
-                Env env;
-                Unit& who = observer == 0 ? static_cast<Unit&>(env.bot) : static_cast<Unit&>(env.controller);
-                if (respect == 0)
-                    who.sight.inMap = false;
-                else if (respect == 1)
-                    who.sight.samePhase = false;
-                else if (respect == 2)
-                    who.sight.inDistance = false;
-                else if (respect == 3)
-                    who.sight.canSee = false;
-                else if (respect == 4)
-                    env.target.inWorld = false;
-                else
-                    ObjectAccessor::Units().erase(kTarget);
-                if (intent == ChannelIntent::AttackOwnTarget && respect == 5)
-                    env.bot.target = kTarget;  // Guid stays; the unit cannot be resolved.
-                bool const unresolved = respect == 5;
-                EffectResult const result = env.Run(ValidCmd(intent));
-                Check(unresolved ? result == EffectResult::Rejected && PlayerbotBridge::pb.executes == 0 &&
-                                       env.why == CommandRefusal::TargetNotVisible
-                                 : result == EffectResult::Applied && PlayerbotBridge::pb.order.Target == kTarget,
-                      "only a unit the module cannot resolve is rejected before playerbots; sight is playerbots'");
-            }
-    {
-        Env env;
-        g_SayDistance = 0.0f;
-        Check(env.Run(ValidCmd(ChannelIntent::Mark)) == EffectResult::Applied && game.distanceCalls == 0,
-              "the module measures no distance to a target");
-        g_SayDistance = 17.5f;
-    }
-    // Position: a fact only when playerbots finds it reachable, and the probe carries the exact destination.
-    {
-        Env env;
-        PlayerbotBridge::pb.reachable = false;
-        Check(env.Run(ValidCmd(ChannelIntent::Position)) == EffectResult::Rejected &&
-                  PlayerbotBridge::pb.reaches == 1 && PlayerbotBridge::pb.executes == 0,
-              "unreachable position is rejected");
-    }
-    {
-        Env env;
-        PlayerbotBridge::pb.reachable = true;
-        Check(env.Run(ValidCmd(ChannelIntent::Position)) == EffectResult::Applied, "reachable position");
-        auto const& probe = PlayerbotBridge::pb.probe;
-        Check(probe.Operation == PlayerbotBridge::Intent::Position && probe.Bot == kBot &&
-                  probe.Controller == kController && probe.MapId == 1 && probe.X == 100.5 && probe.Y == 200.25 &&
-                  probe.Z == 300.125,
-              "reachability probe carries scope guids and the exact destination");
-        Check(PlayerbotBridge::pb.reachPhase == &env.phase.join, "probe uses the joined phase");
-    }
-    {
-        // A non-position verb never asks about reachability even when a position payload would be reachable.
-        Env env;
-        PlayerbotBridge::pb.reachable = true;
-        Check(env.Run(ValidCmd(ChannelIntent::Flee)) == EffectResult::Applied && PlayerbotBridge::pb.reaches == 0,
-              "no reachability query for other verbs");
-    }
 }
 
-// J12: the wire's shape and flag reach playerbots as its own values; a focus heal target must be seen.
+// A step's shape (its choice's index) and flag reach playerbots as its own values.
 void LastingOrders()
 {
-    struct Pair
-    {
-        ChannelShape wire;
-        PlayerbotBridge::FormationShape playerbots;
-    };
-    Pair const pairs[] = {{ChannelShape::Close, PlayerbotBridge::FormationShape::Close},
-                          {ChannelShape::Spread, PlayerbotBridge::FormationShape::Spread},
-                          {ChannelShape::Line, PlayerbotBridge::FormationShape::Line}};
-    for (Pair const& pair : pairs)
+    PlayerbotBridge::FormationShape const shapes[] = {PlayerbotBridge::FormationShape::Close,
+                                                      PlayerbotBridge::FormationShape::Spread,
+                                                      PlayerbotBridge::FormationShape::Line};
+    for (uint8_t index = 0; index < 3; ++index)
     {
         Env env;
-        Check(env.Run(Cmd(ChannelIntent::Formation, pair.wire)) == EffectResult::Applied &&
-                  PlayerbotBridge::pb.order.Shape == pair.playerbots,
-              "each wire shape maps to its playerbots shape");
+        auto line = Step(Intent::Formation);
+        line.shape = index;
+        Check(env.Run(Steps({line})) == EffectResult::Applied && PlayerbotBridge::pb.steps[0].Shape == shapes[index],
+              "each shape choice maps to its playerbots shape");
     }
     {
         Env env;
-        Check(env.Run(Cmd(ChannelIntent::SaveMana, false)) == EffectResult::Applied &&
-                  PlayerbotBridge::pb.executes == 1 && !PlayerbotBridge::pb.order.Enabled,
+        auto mana = Step(Intent::SaveMana);
+        mana.enabled = false;
+        Check(env.Run(Steps({mana})) == EffectResult::Applied && PlayerbotBridge::pb.spanExecutes == 1 &&
+                  !PlayerbotBridge::pb.steps[0].Enabled,
               "save_mana off carries false");
-    }
-    {
-        Env env;
-        env.target.inWorld = false;
-        Check(env.Run(ValidCmd(ChannelIntent::FocusHealing)) == EffectResult::Rejected &&
-                  PlayerbotBridge::pb.executes == 0 && env.authorizeCalls == 0,
-              "a focus heal target nobody sees is refused before playerbots");
-    }
-}
-
-PlanKey MovementKey() { return {kBot, PlanKind::Movement}; }
-uint16_t Movement() { return PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies; }
-
-// A stay plan over a person's earlier movement state 4.
-void ApplyStay(Env& env)
-{
-    PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 4;
-    Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied, "stay plan applied");
-}
-
-// J12 executor flow: admission and capture before every attempt, record after every attempt that may have written.
-void PlanFlow()
-{
-    auto const& pb = PlayerbotBridge::pb;
-    BridgePlans& plans = BridgeCommandExecutor::Plans();
-    {
-        Env env;
-        ApplyStay(env);
-        Check(pb.capturesAtExecute == 1 && pb.captures == 2, "the state is captured before the attempt and after it");
-        Check(plans.Size() == 1 && plans.Counters().applied == 1 && plans.Counters().unrecorded == 0,
-              "one plan recorded");
-        auto const applied = plans.LiveApplied(MovementKey());
-        Check(applied && applied->Strategies == 2 && applied->Held == Part::Movement && applied->Bot == kBot,
-              "the ledger keeps what the bridge set, for this bot and part");
-    }
-    {
-        Env env;
-        env.ticket.generation = kGeneration + 1;
-        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Rejected && pb.captures == 0 &&
-                  pb.executes == 0 && env.authorizeCalls == 0 && plans.Empty(),
-              "a plan the ledger refuses (stale generation) reads and changes nothing");
-    }
-    {
-        Env env;
-        PlayerbotBridge::pb.captureFails = true;
-        Check(env.Run(ValidCmd(ChannelIntent::Formation)) == EffectResult::Rejected && pb.captures == 1 &&
-                  pb.executes == 0 && env.authorizeCalls == 0 && plans.Empty(),
-              "no baseline, no mutation");
-    }
-    for (auto const result : {PlayerbotBridge::Result::Rejected, PlayerbotBridge::Result::Unavailable})
-    {
-        Env env;
-        PlayerbotBridge::pb.result = result;
-        env.Run(ValidCmd(ChannelIntent::SaveMana));
-        Check(pb.executes == 1 && pb.captures == 1 && plans.Empty() && plans.Counters().unrecorded == 0,
-              "an attempt that promises no mutation records none");
-    }
-    // Review J12 NOTE B: unreachable today, but an attempt that may have written and left no entry is counted.
-    for (auto const result : {PlayerbotBridge::Result::Applied, PlayerbotBridge::Result::Failed})
-    {
-        Env env;
-        PlayerbotBridge::pb.result = result;
-        PlayerbotBridge::pb.captureFailsAfterExecute = true;
-        env.Run(ValidCmd(ChannelIntent::Formation));
-        Check(pb.executes == 1 && pb.captures == 2 && plans.Empty() && plans.Counters().applied == 0 &&
-                  plans.Counters().unrecorded == 1,
-              "an attempt whose state cannot be read afterwards is counted as unrecorded");
-    }
-    {
-        Env env;
-        PlayerbotBridge::pb.duringExecute = [] { BridgeCommandExecutor::Plans().RetireAll(); };
-        Check(env.Run(ValidCmd(ChannelIntent::SaveMana)) == EffectResult::Applied && pb.captures == 2 &&
-                  plans.Empty() && plans.Counters().unrecorded == 1,
-              "an attempt whose record the ledger refuses is counted as unrecorded");
-    }
-    {
-        Env env;
-        PlayerbotBridge::pb.result = PlayerbotBridge::Result::Failed;
-        Check(
-            env.Run(ValidCmd(ChannelIntent::SaveMana)) == EffectResult::Failed && pb.captures == 2 && plans.Size() == 1,
-            "a failed attempt may have written: recorded");
-    }
-    {
-        Env env;
-        PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 4;
-        Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Applied, "follow plan");
-        testNowMs += 1000;
-        PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 9;  // A person's own command in between.
-        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied && pb.captures == 4 &&
-                  pb.capturesAtExecute == 3,
-              "a repeat captures the state again before its attempt");
-        Check(plans.Size() == 1 && plans.Counters().applied == 1 && plans.Counters().renewed == 1,
-              "follow then stay renew the one movement plan");
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
-        Check(pb.restores == 1 && pb.restoreBefore.Strategies == 9 && pb.restoreApplied.Strategies == 2 &&
-                  Movement() == 9,
-              "the person's state captured before the repeat is the restore target");
-    }
-    {
-        Env env;
-        ApplyStay(env);
-        testNowMs += 1000;
-        PlayerbotBridge::pb.captureFails = true;
-        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Rejected && pb.executes == 1,
-              "a repeat whose capture fails does not execute");
-    }
-    {
-        Env env;
-        ApplyStay(env);
-        testNowMs += PlanLifetimeMs - 1;
-        PlayerbotBridge::pb.executeAdvanceMs = 5;
-        Check(env.Run(ValidCmd(ChannelIntent::Stay)) == EffectResult::Applied && plans.Counters().renewed == 1 &&
-                  plans.LiveApplied(MovementKey()),
-              "admission and record use one clock reading, so a slow renewal is still recorded");
-    }
-    for (auto const intent : {ChannelIntent::Flee, ChannelIntent::Mark, ChannelIntent::AttackOwnTarget})
-    {
-        Env env;
-        Check(env.Run(ValidCmd(intent)) == EffectResult::Applied && pb.captures == 0 && plans.Empty() &&
-                  plans.Counters().unrecorded == 0,
-              "one-shot verbs have no plan");
-    }
-}
-
-// J12 world tick through the executor: apply -> expire -> restore, group and controller changes, logout, retries,
-// a later command, retirement, and one part per kind.
-void PlanTick()
-{
-    auto const& pb = PlayerbotBridge::pb;
-    BridgePlans& plans = BridgeCommandExecutor::Plans();
-    {
-        Env env;
-        unsigned const lookups = game.playerLookups;
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs);
-        Check(game.playerLookups == lookups && pb.restores == 0, "an empty ledger reads nothing");
-    }
-    {
-        Env env;
-        int64_t const start = testNowMs;
-        ApplyStay(env);
-        BridgeCommandExecutor::UpdatePlans(env.phase, start + PlanLifetimeMs - 1);
-        Check(pb.restores == 0 && plans.Size() == 1 && Movement() == 2, "a live plan is not restored early");
-        BridgeCommandExecutor::UpdatePlans(env.phase, start + PlanLifetimeMs);
-        Check(pb.restores == 1 && pb.restoredBot == kBot && pb.restoreBefore.Strategies == 4 &&
-                  pb.restoreApplied.Strategies == 2,
-              "expiry restores the captured state");
-        Check(Movement() == 4 && plans.Empty() && plans.Counters().expired == 1 && plans.Counters().restored == 1,
-              "the baseline is back and the ledger is empty");
-        BridgeCommandExecutor::UpdatePlans(env.phase, start + PlanLifetimeMs + 1);
-        Check(pb.restores == 1, "restored once");
-    }
-    {
-        Env env;
-        ApplyStay(env);
-        env.phase.join.current = false;
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
-        Check(pb.restores == 0 && plans.Size() == 1 && !plans.Empty(), "no tick work outside the post-map-join phase");
-    }
-    // Review J6e-a B1: a stay or a focus heal admitted from a partner outside the grouped bot's group needed no partner
-    // in that group, so it holds across world ticks; the partner logging out restores it.
-    for (auto const intent : {ChannelIntent::Stay, ChannelIntent::FocusHealing})
-    {
-        for (int which = 0; which < 2; ++which)
-        {
-            Env env;
-            PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 4;
-            if (which == 0)
-                env.controllerGroup.guid = kGroup + 1;  // The partner is in another group.
-            else
-                env.controller.group = nullptr;  // The partner is in none.
-            Check(env.Run(ValidCmd(intent)) == EffectResult::Applied && plans.Size() == 1,
-                  "a stay or a focus heal from a partner outside the bot's group is applied and recorded");
-            auto const held = [intent]
-            {
-                return intent == ChannelIntent::Stay
-                           ? Movement() == 2
-                           : PlayerbotBridge::pb.state[kBot][Part::FocusHeal].FocusHealStrategy;
-            };
-            for (int64_t tick = 1; tick <= 3; ++tick)
-                BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + tick);
-            Check(pb.restores == 0 && plans.Size() == 1 && plans.Counters().regrouped == 0 && held(),
-                  "it holds across world ticks while the partner stays online outside the bot's group");
-            ObjectAccessor::Players().erase(kController);
-            BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 4);
-            Check(pb.restores == 1 && plans.Empty() && plans.Counters().regrouped == 1 && !held(),
-                  "the partner logging out restores it");
-        }
-    }
-    // Review J6e-a B1: a group change or the partner logging out ends every plan at once; the partner leaving the bot's
-    // group ends only a plan whose admission needed the partner in it (a follow), never a stay.
-    for (bool const follow : {false, true})
-    {
-        for (int which = 0; which < 5; ++which)
-        {
-            Env env;
-            PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 4;
-            Check(env.Run(ValidCmd(follow ? ChannelIntent::Follow : ChannelIntent::Stay)) == EffectResult::Applied,
-                  "follow or stay plan applied");
-            if (which == 0)
-                env.botGroup.guid = 99;  // The bot's group changed.
-            else if (which == 1)
-                env.bot.group = nullptr;  // The bot left its group.
-            else if (which == 2)
-                ObjectAccessor::Players().erase(kController);  // The partner logged out.
-            else if (which == 3)
-                env.controllerGroup.guid = 77;  // The partner is in another group.
-            else
-                env.controller.group = nullptr;  // The partner left the bot's group.
-            BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
-            bool const kept = !follow && which >= 3;
-            Check(kept ? pb.restores == 0 && plans.Size() == 1 && Movement() == 2
-                       : pb.restores == 1 && Movement() == 4 && plans.Empty() && plans.Counters().regrouped == 1,
-                  "a group change or the partner logging out restores at once; the partner leaving the bot's group "
-                  "restores a follow, never a stay");
-        }
-    }
-    // DS.14: who leads the bot plays no part; the plan holds while its partner stays in the bot's group.
-    for (int which = 0; which < 5; ++which)
-    {
-        Env env;
-        ApplyStay(env);
-        if (which == 0)
-            env.botAI.master = &env.stranger;  // Another master.
-        else if (which == 1)
-            env.botAI.master = nullptr;  // Masterless, led by the partner.
-        else if (which == 2)
-        {
-            env.botAI.master = &env.stranger;  // The partner is neither master nor leader.
-            env.botGroup.leader = env.controllerGroup.leader = kStranger;
-        }
-        else if (which == 3)
-            env.bot.ai = nullptr;  // No playerbots AI to ask.
-        else
-            env.controller.inWorld = false;  // Connected, between maps.
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
-        Check(pb.restores == 0 && plans.Size() == 1 && Movement() == 2,
-              "the plan holds while its partner stays in the bot's group, whoever leads the bot");
-    }
-    // DS.14: an ungrouped bot's plan holds while its partner is online and the bot stays ungrouped.
-    for (int which = 0; which < 4; ++which)
-    {
-        Env env;
-        env.guard.groupGuid = 0;
-        env.bot.group = env.controller.group = nullptr;
-        ApplyStay(env);
-        bool kept = true;
-        if (which == 1)
-            env.controller.group = &env.controllerGroup;  // The partner joins a group of their own.
-        else if (which == 2)
-        {
-            ObjectAccessor::Players().erase(kController);  // The partner logged out.
-            kept = false;
-        }
-        else if (which == 3)
-        {
-            env.bot.group = &env.botGroup;  // The bot joined a group.
-            kept = false;
-        }
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
-        Check(kept ? pb.restores == 0 && plans.Size() == 1 && Movement() == 2
-                   : pb.restores == 1 && Movement() == 4 && plans.Empty() && plans.Counters().regrouped == 1,
-              "an ungrouped plan holds while the bot stays alone and the partner online; it is restored when the "
-              "partner logs out or the bot joins a group");
-    }
-    // The partner rule is per plan: the partner leaving the bot's group ends its save_mana plan and keeps its stay.
-    {
-        Env env;
-        PlayerbotBridge::pb.state[kBot][Part::ManaSave].ManaSaveLevel = 1.0;
-        ApplyStay(env);
-        Check(env.Run(ValidCmd(ChannelIntent::SaveMana)) == EffectResult::Applied && plans.Size() == 2,
-              "a stay and a save_mana plan from the partner in the bot's group");
-        env.controller.group = nullptr;
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
-        Check(pb.restores == 1 && pb.state.at(kBot).at(Part::ManaSave).ManaSaveLevel == 1.0 && Movement() == 2 &&
-                  plans.Size() == 1 && plans.LiveApplied(MovementKey()) && plans.Counters().regrouped == 1,
-              "the partner leaving the bot's group restores save_mana and keeps the stay");
-    }
-    {
-        Env env;
-        ApplyStay(env);
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
-        Check(pb.restores == 0 && plans.Size() == 1 && Movement() == 2, "unchanged group and master keep the plan");
-    }
-    {
-        Env env;
-        ApplyStay(env);
-        ObjectAccessor::Players().erase(kBot);
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
-        Check(pb.restores == 0 && plans.Empty() && plans.Counters().departed == 1,
-              "a logged-out bot's plan is dropped unrestored");
-    }
-    {
-        Env env;
-        ApplyStay(env);
-        PlayerbotBridge::pb.restoreResult = PlayerbotBridge::RestoreResult::Gone;
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
-        Check(pb.restores == 1 && plans.Empty() && plans.Counters().departed == 1 && plans.Counters().abandoned == 0,
-              "a restore that finds the bot gone drops the plan");
-    }
-    {
-        Env env;
-        ApplyStay(env);
-        int64_t const due = testNowMs + PlanLifetimeMs;
-        PlayerbotBridge::pb.restoreResult = PlayerbotBridge::RestoreResult::Failed;
-        BridgeCommandExecutor::UpdatePlans(env.phase, due);
-        Check(pb.restores == 1 && plans.Size() == 1, "a failed restore stays pending");
-        BridgeCommandExecutor::UpdatePlans(env.phase, due + PlanRestoreRetryMs - 1);
-        Check(pb.restores == 1, "retried only after the retry interval");
-        BridgeCommandExecutor::UpdatePlans(env.phase, due + PlanRestoreRetryMs);
-        Check(pb.restores == 2 && plans.Size() == 1, "second attempt");
-        BridgeCommandExecutor::UpdatePlans(env.phase, due + 2 * PlanRestoreRetryMs);
-        Check(pb.restores == 3 && plans.Empty() && plans.Counters().abandoned == 1, "dropped after the last attempt");
-    }
-    {
-        Env env;
-        ApplyStay(env);
-        PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 1;  // A person's follow since.
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
-        Check(pb.restores == 1 && Movement() == 1 && plans.Empty() && plans.Counters().restored == 1,
-              "a later command wins: superseded, left as it is");
-    }
-    {
-        Env env;
-        ApplyStay(env);
-        plans.RetireAll();  // What RetireBridgeWork's hook does.
-        Check(plans.Size() == 1 && !plans.Empty() && Movement() == 2, "retirement leaves the plan restore-pending");
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + 1);
-        Check(pb.restores == 1 && Movement() == 4 && plans.Empty() && plans.Counters().retired == 1,
-              "the next tick restores a retired plan");
-    }
-    {
-        Env env;
-        PlayerbotBridge::pb.state[kBot][Part::Formation].Formation = "chaos";
-        PlayerbotBridge::pb.state[kBot][Part::ManaSave].ManaSaveLevel = 1.0;
-        Check(env.Run(ValidCmd(ChannelIntent::Formation)) == EffectResult::Applied &&
-                  env.Run(ValidCmd(ChannelIntent::SaveMana)) == EffectResult::Applied && plans.Size() == 2,
-              "formation and save_mana are two plans");
-        Check(pb.state.at(kBot).at(Part::Formation).Formation != "chaos" &&
-                  pb.state.at(kBot).at(Part::ManaSave).ManaSaveLevel == 0.5,
-              "both applied");
-        BridgeCommandExecutor::UpdatePlans(env.phase, testNowMs + PlanLifetimeMs);
-        Check(pb.restores == 2 && pb.state.at(kBot).at(Part::Formation).Formation == "chaos" &&
-                  pb.state.at(kBot).at(Part::ManaSave).ManaSaveLevel == 1.0 && Movement() == 0 && plans.Empty(),
-              "each kind restores its own part only");
     }
 }
 
@@ -971,13 +420,12 @@ void ResultMapping()
                           {PlayerbotBridge::Result::Applied, EffectResult::Applied},
                           {PlayerbotBridge::Result::Failed, EffectResult::Failed},
                           {static_cast<PlayerbotBridge::Result>(99), EffectResult::Failed}};
-    for (Verb const& verb : kVerbs)
+    for (Intent const intent : kActs)
         for (Pair const& pair : pairs)
         {
             Env env;
-            PlayerbotBridge::pb.reachable = true;
-            PlayerbotBridge::pb.result = pair.in;
-            Check(env.Run(ValidCmd(verb.intent)) == pair.out && PlayerbotBridge::pb.executes == 1,
+            PlayerbotBridge::pb.stepOutcomes = {{pair.in, PlayerbotBridge::Refusal::None}};
+            Check(env.Run(ValidCmd(intent)) == pair.out && PlayerbotBridge::pb.spanExecutes == 1,
                   "playerbots result maps one to one; unknown is failed, never applied");
         }
 
@@ -1011,15 +459,14 @@ void ResultMapping()
     {
         {
             Env env;
-            PlayerbotBridge::pb.result = PlayerbotBridge::Result::Rejected;
-            PlayerbotBridge::pb.refusal = reason.in;
-            Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Rejected && env.why == reason.out,
+            PlayerbotBridge::pb.stepOutcomes = {{PlayerbotBridge::Result::Rejected, reason.in}};
+            Check(env.Run(ValidCmd(Intent::Follow)) == EffectResult::Rejected && env.why == reason.out,
                   "each playerbots refusal reason maps to its own words; none or an unknown one stays unworded");
         }
         {
             Env env;
-            PlayerbotBridge::pb.refusal = reason.in;
-            Check(env.Run(ValidCmd(ChannelIntent::Follow)) == EffectResult::Applied && env.why == CommandRefusal::None,
+            PlayerbotBridge::pb.stepOutcomes = {{PlayerbotBridge::Result::Applied, reason.in}};
+            Check(env.Run(ValidCmd(Intent::Follow)) == EffectResult::Applied && env.why == CommandRefusal::None,
                   "a reason is read only from a refusal");
         }
     }
@@ -1027,30 +474,6 @@ void ResultMapping()
 }  // namespace
 
 // ---- LC3b: stepped orders -----------------------------------------------------------------------------------------
-ChannelStep Step(ChannelIntent intent)
-{
-    ChannelStep step;
-    step.intent = intent;
-    return step;
-}
-
-ChannelCommand Steps(std::vector<ChannelStep> steps)
-{
-    auto command = Cmd(ChannelIntent::Stay);
-    command.steps = std::move(steps);
-    return command;
-}
-
-// Through the executor's own entry, as WorldChannel calls it: its refusal and its step results.
-EffectResult RunSteps(Env& env, ChannelCommand const& command)
-{
-    BridgeCommandExecutor executor;
-    auto const result = executor.Execute(env.phase, env.ticket, env.guard, command, env.Authorize());
-    env.why = executor.Refusal();
-    env.ran = executor.Steps();
-    return result;
-}
-
 bool AllApplied(std::vector<ChannelStepResult> const& ran, std::size_t count)
 {
     return ran.size() == count &&
@@ -1061,24 +484,22 @@ bool AllApplied(std::vector<ChannelStepResult> const& ran, std::size_t count)
 
 void SteppedOrders()
 {
-    using PlayerbotBridge::Intent;
     using PlayerbotBridge::Refusal;
     using PlayerbotBridge::Result;
     auto const& pb = PlayerbotBridge::pb;
-    BridgePlans& plans = BridgeCommandExecutor::Plans();
-    auto mark = Step(ChannelIntent::Mark);
+    auto mark = Step(Intent::Mark);
     mark.targetName = "Hogger";
     mark.icon = 7;
-    auto go = Step(ChannelIntent::GoTo);
+    auto go = Step(Intent::GoTo);
     go.place = "Goldshire";
-    auto spot = Step(ChannelIntent::Position);
-    spot.position = Pos();
-    auto close = Step(ChannelIntent::Formation);
+    auto meet = Step(Intent::MeetAt);
+    meet.place = "you";
+    auto close = Step(Intent::Formation);
     close.shape = 0;
     {
-        // One order of all steps: one span Execute, one authorize; names and spots go to playerbots' gate as given.
+        // One order of all steps: one span Execute, one authorize; names and places go to playerbots' gate as given.
         Env env;
-        Check(RunSteps(env, Steps({mark, go, spot})) == EffectResult::Applied && env.why == CommandRefusal::None &&
+        Check(env.Run(Steps({mark, go, meet})) == EffectResult::Applied && env.why == CommandRefusal::None &&
                   AllApplied(env.ran, 3),
               "a stepped order applied, each step applied");
         Check(pb.spanExecutes == 1 && pb.executes == 0 && env.authorizeCalls == 1 && pb.authorizeCalled == 1 &&
@@ -1086,9 +507,8 @@ void SteppedOrders()
               "one span Execute in the world phase, one authorize, no one-order Execute");
         Check(pb.steps.size() == 3 && pb.steps[0].Operation == Intent::Mark && pb.steps[0].TargetName == "Hogger" &&
                   pb.steps[0].Target == 0 && pb.steps[0].Icon == 7 && pb.steps[1].Operation == Intent::GoTo &&
-                  pb.steps[1].PlaceName == "Goldshire" && pb.steps[2].Operation == Intent::Position &&
-                  pb.steps[2].MapId == 1 && pb.steps[2].X == 100.5 && pb.steps[2].Y == 200.25 &&
-                  pb.steps[2].Z == 300.125,
+                  pb.steps[1].PlaceName == "Goldshire" && pb.steps[2].Operation == Intent::MeetAt &&
+                  pb.steps[2].PlaceName == "you",
               "each step's act and fields as given: playerbots resolves the name");
         Check(std::all_of(pb.steps.begin(), pb.steps.end(),
                           [](PlayerbotBridge::Order const& order)
@@ -1096,76 +516,65 @@ void SteppedOrders()
                               return order.Bot == kBot && order.Controller == kController && order.Group == kGroup;
                           }),
               "every step carries the scope's bot, partner and captured group");
-        Check(pb.reaches == 0 && plans.Size() == 0, "no module pre-check of the spot; one-shot steps record no plan");
+        Check(pb.reaches == 0, "no module pre-check of the place");
     }
     {
         Env env;
-        auto heal = Step(ChannelIntent::FocusHealing);
+        auto heal = Step(Intent::FocusHealing);
         heal.targetGuid = kTarget;
-        auto quest = Step(ChannelIntent::Quest);
+        auto quest = Step(Intent::Quest);
         quest.questName = "The Collector";
-        auto line = Step(ChannelIntent::Formation);
+        auto line = Step(Intent::Formation);
         line.shape = 2;
-        Check(RunSteps(env, Steps({heal, quest, line})) == EffectResult::Applied && pb.steps.size() == 3 &&
+        Check(env.Run(Steps({heal, quest, line})) == EffectResult::Applied && pb.steps.size() == 3 &&
                   pb.steps[0].Target == kTarget && pb.steps[0].TargetName.empty() &&
                   pb.steps[1].QuestName == "The Collector" && pb.steps[1].QuestId == 0 &&
-                  pb.steps[2].Shape == PlayerbotBridge::FormationShape::Line && plans.Size() == 2,
-              "a unit by id, a quest by title, a shape by its choice; both lasting steps recorded");
+                  pb.steps[2].Shape == PlayerbotBridge::FormationShape::Line && AllApplied(env.ran, 3),
+              "a unit by id, a quest by title, a shape by its choice");
     }
     {
         Env env;
-        auto quest = Step(ChannelIntent::Quest);
+        auto quest = Step(Intent::Quest);
         quest.questId = 4242;
-        auto mana = Step(ChannelIntent::SaveMana);
+        auto mana = Step(Intent::SaveMana);
         mana.enabled = true;
-        Check(RunSteps(env, Steps({quest, mana, close})) == EffectResult::Applied && pb.steps[0].QuestId == 4242 &&
+        Check(env.Run(Steps({quest, mana, close})) == EffectResult::Applied && pb.steps[0].QuestId == 4242 &&
                   pb.steps[0].QuestName.empty() && pb.steps[1].Enabled &&
                   pb.steps[2].Shape == PlayerbotBridge::FormationShape::Close,
               "a quest by id, a flag, the first shape");
     }
     {
-        // Every lasting step admitted and captured before the order, recorded after it.
-        Env env;
-        PlayerbotBridge::pb.state[kBot][Part::Movement].Strategies = 4;
-        Check(RunSteps(env, Steps({Step(ChannelIntent::Stay), close})) == EffectResult::Applied &&
-                  pb.capturesAtExecute == 2 && pb.captures == 4 && plans.Size() == 2 && plans.Counters().applied == 2,
-              "two lasting steps: captured before the order, recorded after it");
-        auto const applied = plans.LiveApplied(MovementKey());
-        Check(applied && applied->Strategies == 2 && Movement() == 2, "the stay plan keeps what the order set");
-    }
-    {
-        // A refused second step ends the order: the first is recorded, the refused and the skipped ones are not.
+        // A refused second step ends the order: the skipped third one gets no result.
         Env env;
         PlayerbotBridge::pb.stepOutcomes = {{Result::Applied, Refusal::None}, {Result::Rejected, Refusal::UnknownName}};
-        auto mana = Step(ChannelIntent::SaveMana);
+        auto mana = Step(Intent::SaveMana);
         mana.enabled = true;
-        auto heal = Step(ChannelIntent::FocusHealing);
+        auto heal = Step(Intent::FocusHealing);
         heal.targetName = "Brother Paxton";
-        Check(RunSteps(env, Steps({Step(ChannelIntent::Stay), mana, heal})) == EffectResult::Rejected &&
-                  env.why == CommandRefusal::UnknownName && pb.capturesAtExecute == 3 && pb.captures == 4 &&
-                  plans.Size() == 1 && plans.LiveApplied(MovementKey()),
-              "only the lasting step that ran and applied is recorded");
+        Check(env.Run(Steps({Step(Intent::Stay), mana, heal})) == EffectResult::Rejected &&
+                  env.why == CommandRefusal::UnknownName && pb.steps.size() == 3,
+              "a refused step ends the order");
         Check(env.ran.size() == 2 && env.ran[0].outcome == ChannelOutcome::Applied &&
                   env.ran[1].outcome == ChannelOutcome::Rejected && env.ran[1].reason == "pb_word" &&
                   env.ran[1].reasonText == "A playerbots sentence." && pb.wordsFor == Refusal::UnknownName,
               "the refused step in playerbots' words for its refusal");
     }
     {
-        // A failed step may have written: it is recorded, worded as the module's failure.
+        // A failed step may have written: it is worded as the module's failure.
         Env env;
         PlayerbotBridge::pb.stepOutcomes = {{Result::Failed, Refusal::None}};
         auto const failed = DescribeRefusal(CommandRefusal::Failed);
-        Check(RunSteps(env, Steps({Step(ChannelIntent::Stay), go})) == EffectResult::Failed && plans.Size() == 1 &&
-                  env.ran.size() == 1 && env.ran[0].outcome == ChannelOutcome::Failed &&
-                  env.ran[0].reason == failed.code && env.ran[0].reasonText == failed.text,
-              "a failed lasting step is recorded and worded failed");
+        Check(env.Run(Steps({Step(Intent::Stay), go})) == EffectResult::Failed && env.ran.size() == 1 &&
+                  env.ran[0].outcome == ChannelOutcome::Failed && env.ran[0].reason == failed.code &&
+                  env.ran[0].reasonText == failed.text,
+              "a failed lasting step is worded failed");
     }
     {
         // A refusal without a reason reads cannot_now; a refused mark notes nothing.
         Env env;
         PlayerbotBridge::pb.stepOutcomes = {{Result::Applied, Refusal::None}, {Result::Rejected, Refusal::None}};
         auto const cannot = DescribeRefusal(CommandRefusal::CannotNow);
-        Check(RunSteps(env, Steps({go, mark})) == EffectResult::Rejected && env.ran.size() == 2 &&
+        Check(env.Run(Steps({go, mark})) == EffectResult::Rejected && env.ran.size() == 2 &&
                   env.ran[1].reason == cannot.code && env.ran[1].reasonText == cannot.text,
               "an unworded refusal reads cannot_now");
     }
@@ -1173,111 +582,104 @@ void SteppedOrders()
         Env env;
         PlayerbotBridge::pb.stepOutcomes = {{Result::Unavailable, Refusal::None}};
         auto const unavailable = DescribeRefusal(CommandRefusal::Unavailable);
-        Check(RunSteps(env, Steps({go})) == EffectResult::Unavailable && env.why == CommandRefusal::Unavailable &&
+        Check(env.Run(Steps({go})) == EffectResult::Unavailable && env.why == CommandRefusal::Unavailable &&
                   env.ran.size() == 1 && env.ran[0].outcome == ChannelOutcome::Rejected &&
                   env.ran[0].reason == unavailable.code,
               "an unavailable step is rejected as unavailable");
     }
     {
-        // playerbots refused the order before any step ran (a malformed step): no step result, no record.
+        // playerbots refused the order before any step ran (a malformed step): no step result.
         Env env;
         PlayerbotBridge::pb.spanEarly = Result::Unavailable;
-        Check(RunSteps(env, Steps({Step(ChannelIntent::Stay), go})) == EffectResult::Unavailable && env.ran.empty() &&
-                  env.authorizeCalls == 0 && plans.Size() == 0 && pb.captures == 1,
-              "an order refused before its steps: no step result, no record");
+        Check(env.Run(Steps({Step(Intent::Stay), go})) == EffectResult::Unavailable && env.ran.empty() &&
+                  env.authorizeCalls == 0,
+              "an order refused before its steps: no step result");
     }
     {
-        // Two steps of one lasting part: refused before any admission, capture or Execute.
+        // LC.36: the hand-over keeps no ledger. Two steps of one lasting part run as one order (the bot's last action
+        // wins), and a lasting step from another group runs over an earlier one: playerbots decides, nothing blocks.
         Env env;
-        Check(RunSteps(env, Steps({Step(ChannelIntent::Follow), go, Step(ChannelIntent::Stay)})) ==
-                      EffectResult::Rejected &&
-                  env.why == CommandRefusal::CannotNow && pb.spanExecutes == 0 && pb.captures == 0 &&
-                  env.authorizeCalls == 0 && env.ran.empty() && plans.Size() == 0,
-              "two steps of one lasting part are refused before anything runs");
-    }
-    {
-        // A lasting step another owner's plan blocks: busy before any capture.
-        Env env;
-        ApplyStay(env);
-        auto const captures = pb.captures;
+        Check(env.Run(Steps({Step(Intent::Follow), go, Step(Intent::Stay)})) == EffectResult::Applied &&
+                  env.why == CommandRefusal::None && pb.spanExecutes == 1 && env.authorizeCalls == 1 &&
+                  pb.steps.size() == 3 && pb.steps[2].Operation == Intent::Stay && AllApplied(env.ran, 3),
+              "two steps of one lasting part run as one order");
         env.guard.groupGuid = kOther;
-        Check(RunSteps(env, Steps({go, close})) == EffectResult::Rejected && env.why == CommandRefusal::Busy &&
-                  pb.spanExecutes == 0 && pb.captures == captures && env.ran.empty(),
-              "a blocked lasting step: busy, no capture, nothing runs");
+        Check(env.Run(Steps({close, Step(Intent::Stay)})) == EffectResult::Applied && pb.spanExecutes == 2 &&
+                  pb.steps[0].Group == kOther && AllApplied(env.ran, 2),
+              "a lasting step after another group's runs; nothing holds it back");
     }
     {
         Env env;
-        PlayerbotBridge::pb.captureFails = true;
-        Check(RunSteps(env, Steps({go, Step(ChannelIntent::Stay)})) == EffectResult::Rejected &&
-                  env.why == CommandRefusal::CannotNow && pb.spanExecutes == 0 && env.authorizeCalls == 0,
-              "a part that cannot be captured: nothing runs");
-    }
-    {
-        Env env;
-        env.phase.join.current = false;
-        Check(RunSteps(env, Steps({go})) == EffectResult::Rejected && env.why == CommandRefusal::Unavailable &&
+        PlayerbotBridge::pb.current = false;
+        Check(env.Run(Steps({go})) == EffectResult::Rejected && env.why == CommandRefusal::Unavailable &&
                   pb.spanExecutes == 0 && env.authorizeCalls == 0,
               "no current world phase: unavailable, nothing runs");
     }
     {
         Env env;
         env.bot.inWorld = false;
-        Check(RunSteps(env, Steps({go})) == EffectResult::Rejected && env.why == CommandRefusal::Unavailable &&
+        Check(env.Run(Steps({go})) == EffectResult::Rejected && env.why == CommandRefusal::Unavailable &&
                   pb.spanExecutes == 0,
               "a bot out of the world: unavailable, nothing runs");
     }
     {
-        // LC16c: an act the old form lacks: its Intent value and the four new fields go to playerbots as given; it has
-        // no plan kind, so no ledger entry.
+        // LC16c: an open act: its Intent value and the four new fields go to playerbots as given.
         Env env;
-        auto cast = Step(static_cast<ChannelIntent>(22));
+        auto cast = Step(static_cast<Intent>(22));
         cast.itemName = "Hearthstone";
         cast.spellName = "Frost Nova";
         cast.choice = 1;
         cast.count = 1000;
-        Check(RunSteps(env, Steps({cast, mark})) == EffectResult::Applied && pb.steps.size() == 2 &&
+        Check(env.Run(Steps({cast, mark})) == EffectResult::Applied && pb.steps.size() == 2 &&
                   static_cast<uint8_t>(pb.steps[0].Operation) == 22 && pb.steps[0].ItemName == "Hearthstone" &&
                   pb.steps[0].SpellName == "Frost Nova" && pb.steps[0].Choice == 1 && pb.steps[0].Count == 1000 &&
                   pb.steps[0].Icon == 0 && pb.steps[0].Shape == PlayerbotBridge::FormationShape::None &&
                   pb.steps[1].ItemName.empty() && pb.steps[1].SpellName.empty() && pb.steps[1].Choice == 0 &&
-                  pb.steps[1].Count == 0 && pb.steps[1].Icon == 7 && plans.Size() == 0 && AllApplied(env.ran, 2),
-              "an open act's value and its item, spell, choice and count reach playerbots; no plan recorded");
+                  pb.steps[1].Count == 0 && pb.steps[1].Icon == 7 && AllApplied(env.ran, 2),
+              "an open act's value and its item, spell, choice and count reach playerbots");
     }
     {
         // A refusal the module has no CommandRefusal for passes in playerbots' word and sentence.
         Env env;
-        auto cast = Step(static_cast<ChannelIntent>(22));
+        auto cast = Step(static_cast<Intent>(22));
         cast.count = 3;
         PlayerbotBridge::pb.stepOutcomes = {{Result::Rejected, static_cast<Refusal>(200)}};
-        Check(RunSteps(env, Steps({cast})) == EffectResult::Rejected && env.ran.size() == 1 &&
+        Check(env.Run(Steps({cast})) == EffectResult::Rejected && env.ran.size() == 1 &&
                   env.ran[0].outcome == ChannelOutcome::Rejected && env.ran[0].reason == "pb_word" &&
                   env.ran[0].reasonText == "A playerbots sentence." && pb.wordsFor == static_cast<Refusal>(200),
               "an open refusal in playerbots' words");
     }
-    {
-        // The old form keeps the one-order way and reports no steps.
-        Env env;
-        BridgeCommandExecutor executor;
-        Check(executor.Execute(env.phase, env.ticket, env.guard, ValidCmd(ChannelIntent::Stay), env.Authorize()) ==
-                      EffectResult::Applied &&
-                  pb.executes == 1 && pb.spanExecutes == 0 && executor.Steps().empty(),
-              "an old-form command takes the one-order Execute and reports no steps");
-    }
 }
+
+// EffectPhase is built only by the world tick, its friend: the selftest's tick builds one and runs the cases in it.
+void OllamaDispatch_Update(uint32_t, PlayerbotBridge::PostMapJoin const& join)
+{
+    OllamaBridge::EffectPhase const phase(join);
+    worldPhase = &phase;
+    Gates();
+    Groups();
+    ResultMapping();
+    LastingOrders();
+    SteppedOrders();
+    worldPhase = nullptr;
+}
+
+// PostMapJoin's one friend: the token is built on the stack of the world script's tick.
+class OllamaBotRandomChatter
+{
+public:
+    static void Tick()
+    {
+        PlayerbotBridge::PostMapJoin const join;
+        OllamaDispatch_Update(0, join);
+    }
+};
 
 int main()
 {
     try
     {
-        VerbSwitch();
-        OtherVerbs();
-        Gates();
-        Facts();
-        ResultMapping();
-        LastingOrders();
-        PlanFlow();
-        PlanTick();
-        SteppedOrders();
+        OllamaBotRandomChatter::Tick();
     }
     catch (std::exception const& error)
     {

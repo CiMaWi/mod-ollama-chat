@@ -1,19 +1,22 @@
-// Exact production Player/Group adapter and dispatcher channel glue, with controlled world objects.
-// Actual query/world/channel translation units and serialization; no server, native transport or provider.
+// The query route end to end: the world adapter and the dispatcher compiled whole (this file includes both production
+// .cpp files after its own doubles of the game; tests/doubles names the game headers), with the query, world and
+// channel units and serialization linked, and controlled world objects. No server, native transport or provider.
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <deque>
 #include <functional>
 #include <iostream>
 #include <list>
 #include <nlohmann/json.hpp>
+#include <span>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
+#include "SharedDefines.h"
 #include "mod-ollama-chat_bridge_query.h"
-#include "mod-ollama-chat_persona_db.h"
-
-using namespace OllamaBridge;
-using Json = nlohmann::json;
 
 namespace
 {
@@ -27,7 +30,9 @@ void Check(bool value, char const* label)
     if (!value)
         throw std::runtime_error(label);
 }
+}  // namespace
 
+// --- game doubles (tests/doubles/game-doubles.h) ---------------------------
 struct ObjectGuid
 {
     uint64_t value = 0;
@@ -38,6 +43,9 @@ struct ObjectGuid
 };
 struct Group;
 struct Player;
+struct Guild
+{
+};
 struct Unit
 {
     virtual ~Unit() = default;
@@ -75,6 +83,15 @@ struct Player : Unit
     Group* GetGroup() const { return group; }
     uint32_t GetTeamId() const { return team; }
     Player* ToPlayer() override { return this; }
+    uint8_t getRace() const { return RACE_HUMAN; }
+    uint8_t getClass() const { return CLASS_WARRIOR; }
+    uint8_t getGender() const { return GENDER_MALE; }
+    uint8_t GetLevel() const { return 10; }
+    uint32_t GetZoneId() const { return 12; }
+    bool InBattleground() const { return false; }
+    bool InArena() const { return false; }
+    Guild* GetGuild() const { return nullptr; }
+    uint32_t GetGuildId() const { return 0; }
 };
 struct Group
 {
@@ -95,15 +112,36 @@ struct Group
         return std::any_of(members.begin(), members.end(), [&](Slot const& item) { return item.guid == guid; });
     }
 };
-Player players[3];
-Unit enemy;
-Group party;
+// No check routes a chat line: every send is refused.
 struct PlayerbotAI
 {
     Player* master = nullptr;
     Player* GetMaster() { return master; }
     bool IsBotAI() const { return true; }
-} ai;
+    bool Say(std::string const&) { return false; }
+    bool Yell(std::string const&) { return false; }
+    bool Whisper(std::string const&, std::string const&) { return false; }
+    bool SayToParty(std::string const&) { return false; }
+    bool SayToRaid(std::string const&) { return false; }
+    bool SayToGuild(std::string const&) { return false; }
+};
+struct Channel
+{
+    bool IsOn(ObjectGuid) const { return false; }
+    void Say(ObjectGuid, std::string const&, uint32_t) {}
+};
+struct ChannelMgr
+{
+    static ChannelMgr* forTeam(uint32_t) { return nullptr; }
+    Channel* GetChannel(std::string const&, Player*) { return nullptr; }
+};
+namespace
+{
+Player players[3];
+Unit enemy;
+Group party;
+PlayerbotAI ai;
+}  // namespace
 struct PlayerbotsMgr
 {
     static PlayerbotsMgr& instance()
@@ -132,75 +170,118 @@ struct ObjectAccessor
         return FindConnectedPlayer(guid);
     }
 };
+namespace Acore
+{
+struct AnyPlayerInObjectRangeCheck
+{
+    AnyPlayerInObjectRangeCheck(Player*, float, bool, bool) {}
+};
+template <typename Check>
+struct PlayerListSearcher
+{
+    std::list<Player*>& found;
+    PlayerListSearcher(Player*, std::list<Player*>& list, Check&) : found(list) {}
+};
+namespace Crypto
+{
+template <std::size_t Size>
+std::array<uint8_t, Size> GetRandomBytes()
+{
+    return {};
+}
+}  // namespace Crypto
+}  // namespace Acore
+struct Cell
+{
+    template <typename Searcher>
+    static void VisitObjects(Player*, Searcher&, float)
+    {
+    }
+};
+#define OLLAMA_SELFTEST_GAME_DOUBLES
+
+// --- the production units ---------------------------------------------------
+#include "../src/mod-ollama-chat_bridge_adapter.cpp"
+#include "../src/mod-ollama-chat_dispatch.cpp"
+
+// --- doubles of the module's other units ------------------------------------
+bool g_DebugEnabled = false;
+bool g_EnableTypingSimulation = false;
+uint32_t g_TypingSimulationBaseDelay = 100;
+uint32_t g_TypingSimulationDelayPerChar = 10;
+uint32_t g_TypingSimulationMaxDelay = 1000;
+uint32_t g_MaxQueueDepth = 64;
+uint32_t g_DispatchWorkerThreads = 1;
+uint32_t g_MaxReplyLength = 240;
 bool g_Enable = true;
 bool g_EnableWhisperReplies = true;
-bool g_DisableForParty = false;
 bool g_DisableForSayYell = false;
-float g_SayDistance = 25;
-float g_YellDistance = 100;
-// The adapter's debug-only card churn line (J14c).
-bool g_DebugEnabled = false;
-#define LOG_INFO(...) ((void)0)
-bool OllamaIsRealPlayer(Player* player) { return player && player->human; }
-std::string Roleplay_BuildVoicePrompt(Player*) { return "A quiet traveler."; }
+bool g_DisableForParty = false;
+bool g_DisableForGuild = false;
+float g_SayDistance = 25.0f;
+float g_YellDistance = 100.0f;
+const char* ChatChannelSourceLocalStr[] = {"Undefined", "Say", "Party", "Raid", "Guild", "Officer", "Yell", "Whisper"};
 
-// The extracted capture reads the persona card through the production store (compiled in, gate closed: voice only),
-// so a card is never offered.
+OllamaEndpointSettings OllamaConfig_Snapshot() { return {}; }
+OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const&, OllamaBridge::Request const&) { return {}; }
+std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t) { return text; }
+std::string Roleplay_FilterMetaTerms(std::string const& text) { return text; }
+bool OllamaIsBotPlayer(Player* player) { return !player->human; }
+bool OllamaGroupHasRealPlayer(Player*) { return true; }
+void OllamaWorldSnapshot::Build() {}
+bool OllamaWorldSnapshot::RealPlayerInChannel(Channel*) const { return true; }
+bool Governor_IsRepetitive(ObjectGuid, std::string const&, std::string const&) { return false; }
+bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool) { return true; }
+void Governor_RecordUtterance(ObjectGuid, std::string const&, std::string const&) {}
+std::string Governor_MakeScopeKey(char const*, uint32_t, std::string const&, uint32_t, uint32_t) { return "scope"; }
 
-Clock clockNow;
-WorldPolicy g_bridgeWorld;
-}  // namespace
-
-namespace OllamaPersona
+// The production channel names the world-only typed effect adapter (bridge_effect.cpp). This fixture stands in with
+// the closed release gate: every command is refused without a game read. No plan lives here.
+OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
 {
-void ForgetPersona(uint64_t) {}
-void RetirePersonas(uint64_t) {}
-}  // namespace OllamaPersona
-
-QueryWorldSource& OllamaChat_BridgeQuerySource();
-bool OllamaChat_BridgeObserve(WorldTicket const&, DispatchGuard&);
-void OllamaChat_BridgeRefresh();
-// J5f-b: the topic reader (playerbots, outside the extract) is not part of these checks.
-bool BridgeBotStateTopic(uint64_t, StateTopic, std::string const&, std::vector<StateEntry>& entries)
-{
-    entries.clear();
-    return false;
-}
-// J6e-c: the watch fact reader (outside the extract) is not part of these checks.
-bool BridgeWatchFacts(uint64_t, uint64_t, WatchFacts& facts)
-{
-    facts = {};
-    return false;
-}
-WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
-// The production channel names the world-only typed effect adapter, which needs game headers. This fixture stands in
-// with the closed release gate: every command is refused without a game read.
-CommandExecutor& OllamaChat_BridgeCommandExecutor()
-{
-    struct Closed final : CommandExecutor
+    struct Closed final : OllamaBridge::CommandExecutor
     {
-        EffectResult Execute(EffectPhase const&, WorldTicket const&, DispatchGuard const&, ChannelCommand const&,
-                             std::function<bool()> const&) override
+        OllamaBridge::EffectResult Execute(OllamaBridge::EffectPhase const&, OllamaBridge::WorldTicket const&,
+                                           OllamaBridge::DispatchGuard const&, OllamaBridge::ChannelCommand const&,
+                                           std::function<bool()> const&) override
         {
-            return EffectResult::Rejected;
+            return OllamaBridge::EffectResult::Rejected;
         }
     };
     static Closed executor;
     return executor;
 }
 
+// --- doubles of playerbots' readers: the state, facts and traits are fixed; topics are not part of these checks --
+namespace PlayerbotBridge
+{
+bool ReadBotState(ObjectGuid const&, ObjectGuid const&, BotStateFacts& facts)
+{
+    facts.healthPct = 90.0f;
+    facts.alive = true;
+    return true;
+}
+bool ReadBotFacts(ObjectGuid const&, BotFacts&) { return true; }
+bool ReadBotPersonality(ObjectGuid const&, BotPersonality&) { return true; }
+bool ReadBotStateTopic(ObjectGuid const&, BotStateTopic, std::string const&, std::vector<BotStateItem>& items)
+{
+    items.clear();
+    return false;
+}
+std::span<AbilityRow const> AbilityRows() { return {}; }
+std::vector<AbilityData> Catalogue() { return {}; }
+uint64_t CatalogueHash(std::vector<AbilityData> const&) { return 0; }
+char const* KindWord(AbilityKind) { return ""; }
+char const* KindWord(ParamKind) { return ""; }
+char const* CompletionWord(Completion) { return ""; }
+}  // namespace PlayerbotBridge
+
+using namespace OllamaBridge;
+using Json = nlohmann::json;
+
 namespace
 {
-auto g_bridgeObserver = ::OllamaChat_BridgeObserve;
-}  // namespace
-
-#include "dispatch-channel.inc"
-#include "handler-query.inc"
-
-namespace
-{
-// BridgeSubmit, which this fixture does not extract, is the only caller of the extracted card opportunity.
-[[maybe_unused]] auto const g_cardOpportunityUse = &BridgeCardOpportunity;
+OllamaBridge::Clock clockNow;
 }  // namespace
 
 namespace
@@ -213,6 +294,7 @@ struct Fixture
     DispatchGuard guard;
     Fixture()
     {
+        g_bridgeObserver = OllamaChat_BridgeObserve;  // OllamaDispatch_Start's observer.
         onResolve = {};
         resolutions = 0;
         g_bridgeChannel.Retire();
@@ -235,16 +317,16 @@ struct Fixture
         enemy.name = "Visible enemy";
         ai.master = &players[1];
         g_bridgeWorld.Configured(true, settings, "epoch-" + std::to_string(++fixtureSerial));
-        Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::NoLiveCaptures), "select epoch");
+        Check(g_bridgeWorld.ObserveDrain(true), "select epoch");
         g_bridgeChannel.Configure(true);
         Check(g_bridgeChannel.Activate(), "activate production dispatcher mailbox");
-        BridgeView view;
+        BindingCapture view;
         Check(BridgeCapture(11, 22, DispatchSource::Whisper, view), "capture production game scope");
         auto& scope = view.guard.scope;
-        scope.contextRevision = scope.membershipRevision = scope.personaRevision = scope.perceptionScope = "rev1";
+        scope.contextRevision = scope.membershipRevision = scope.perceptionScope = "rev1";
         guard = view.guard;
         Check(g_bridgeWorld.ObserveScope(scope, clockNow), "observe trusted scope");
-        g_bridgeBindings.push_back({g_bridgeWorld.Generation(), view, CaptureDeadline(clockNow, WorldLivenessMs),
+        g_bridgeBindings.push_back({g_bridgeWorld.Generation(), view, CaptureDeadline(clockNow, BindingHeartbeatMs),
                                     CaptureDeadline(clockNow, MaxLifetimeMs), ""});
         auto input = view.context;
         input.text = "What can we see?";
@@ -273,19 +355,18 @@ struct Fixture
                     {"query", "observable_group"}}
             .dump();
     }
-    uint64_t Receive()
+    // LCB6b: the answer a listener thread waits on.
+    std::shared_ptr<ChannelAnswer> Receive()
     {
-        uint64_t receipt = 0;
-        Check(OllamaDispatch_ChannelReceive(settings.token, ticket.request.requestId, Query(), receipt) ==
-                  ChannelError::None,
+        auto receipt = std::make_shared<ChannelAnswer>();
+        Check(OllamaDispatch_ChannelReceive(ticket.request.requestId, Query(), receipt) == ChannelError::None,
               "actual dispatcher receive");
         return receipt;
     }
-    std::unique_ptr<ChannelPacket> Take(uint64_t receipt)
+    static std::unique_ptr<ChannelPacket> Take(std::shared_ptr<ChannelAnswer> const& receipt)
     {
         std::unique_ptr<ChannelPacket> packet;
-        Check(OllamaDispatch_ChannelTake(settings.token, receipt, packet) == ChannelError::None && packet,
-              "actual dispatcher take");
+        Check(receipt->Wait(std::chrono::steady_clock::now(), packet) && packet, "actual dispatcher answer");
         return packet;
     }
 };
@@ -296,7 +377,10 @@ void Queries()
         Fixture f;
         players[2].visible = false;
         auto receipt = f.Receive();
+        uint64_t const checked = g_bridgeWorld.Checks();
         Check(g_bridgeChannel.Update() == 1, "dequeue actual query");
+        Check(g_bridgeWorld.Checks() - checked == 1,
+              "LCB6b: one WorldPolicy check for an observable_group packet through the production adapter");
         auto packet = f.Take(receipt);
         auto value = Json::parse(packet->body);
         Check(value["type"] == "query.result" && value["units"].size() == 2, "production visible query result");
@@ -308,49 +392,33 @@ void Queries()
         packet.reset();
         Check(g_bridgeChannel.Drained(), "payload disposal releases slot");
     }
-    for (unsigned change = 0; change < 8; ++change)
+    // LCB6b: the read follows the one check at once on the world thread, so a change before the tick is what the
+    // read sees (the unit filtered, or its fresh name), and a partner lost before it answers the packet stale.
+    for (unsigned change = 0; change < 4; ++change)
     {
         Fixture f;
         auto receipt = f.Receive();
-        // CaptureQuery resolves three initial units and three validation units. The seventh lookup is
-        // Current AFTER actual FinishQuery serialization, immediately before mailbox publication.
-        onResolve = [change](unsigned count)
+        if (change == 0)
+            players[2].visible = false;
+        if (change == 1)
+            players[2].group = nullptr;
+        if (change == 2)
+            players[2].name = "Changed";
+        if (change == 3)
+            players[1].online = false;
+        Check(g_bridgeChannel.Update() == 1, "dequeue actual query");
+        auto packet = f.Take(receipt);
+        if (change == 3)
+            Check(packet->error == ChannelError::Stale && packet->body.empty(), "a partner lost before the read");
+        else
         {
-            if (count != 7)
-                return;
-            switch (change)
-            {
-                case 0:
-                    players[2].visible = false;
-                    break;
-                case 1:
-                    players[2].online = false;
-                    break;
-                case 2:
-                    players[2].health = 20;
-                    break;
-                case 3:
-                    players[2].name = "Changed";
-                    break;
-                case 4:
-                    players[2].map = 2;
-                    break;
-                case 5:
-                    players[2].phase = 2;
-                    break;
-                case 6:
-                    players[2].group = nullptr;
-                    break;
-                case 7:
-                    party.members.pop_back();
-                    break;
-            }
-        };
-        Check(g_bridgeChannel.Update() == 1 && resolutions >= 7, "reach post-serialization world validation");
-        std::unique_ptr<ChannelPacket> packet;
-        Check(OllamaDispatch_ChannelTake(settings.token, receipt, packet) == ChannelError::Unknown && !packet &&
-                  g_bridgeChannel.Drained(),
-              "stale serialized query never becomes consumable");
+            auto const units = Json::parse(packet->body)["units"];
+            Check(change == 2 ? units.size() == 3 && packet->body.find("Changed") != std::string::npos
+                              : units.size() == 2,
+                  "a change before the tick is what the read sees");
+        }
+        packet.reset();
+        Check(g_bridgeChannel.Drained(), "every answered query releases its slot");
     }
     for (unsigned change = 0; change < 5; ++change)
     {
@@ -410,8 +478,8 @@ void Lifetimes()
             g_bridgeWorld, OllamaChat_BridgeObserve, [] { return clockNow; }, &OllamaChat_BridgeQuerySource());
         channel.Configure(true);
         Check(channel.Activate() && channel.Register(f.ticket, f.guard), "controlled-clock production channel");
-        uint64_t receipt = 0;
-        Check(channel.Receive(settings.token, f.ticket.request.requestId, f.Query(), receipt) == ChannelError::None,
+        auto const receipt = std::make_shared<ChannelAnswer>();
+        Check(channel.Receive(f.ticket.request.requestId, f.Query(), receipt) == ChannelError::None,
               "capture bounded query packet age");
         if (clock == 0)
             clockNow.unixMs += WorldLivenessMs;
@@ -422,29 +490,33 @@ void Lifetimes()
                 clockNow.unixMs -= 10000;
         }
         Check(g_bridgeWorld.ObserveScope(f.guard.scope, clockNow), "heartbeat cannot renew packet age");
-        Check(channel.Update() == 1 && channel.Drained(), "either clock expires at equality, including rollback");
-        std::unique_ptr<ChannelPacket> packet;
-        Check(channel.Take(settings.token, receipt, packet) == ChannelError::Unknown && !packet,
-              "expired query never enters publication map");
+        Check(channel.Update() == 1, "either clock expires at equality, including rollback");
+        Check(Fixture::Take(receipt)->error == ChannelError::Stale, "LCB6b: an expired query is answered stale");
+        Check(channel.Drained(), "expired query never enters publication map");
     }
     {
         Fixture f;
+        std::vector<std::shared_ptr<ChannelAnswer>> answers;
         for (unsigned i = 0; i < 12; ++i)
         {
-            uint64_t receipt = 0;
-            Check(OllamaDispatch_ChannelReceive(settings.token, f.ticket.request.requestId,
-                                                f.Query("query-" + std::to_string(i)), receipt) == ChannelError::None,
+            answers.push_back(std::make_shared<ChannelAnswer>());
+            Check(OllamaDispatch_ChannelReceive(f.ticket.request.requestId, f.Query("query-" + std::to_string(i)),
+                                                answers.back()) == ChannelError::None,
                   "admit bounded receive batch");
         }
         Check(g_bridgeChannel.Update() == WorldChannel::TickBudget, "eight dequeues per world tick");
         Check(g_bridgeChannel.Used() == 12, "completions and remaining receives share physical slots");
         g_bridgeChannel.Retire();
+        unsigned inactive = 0;
+        for (auto const& answer : answers)
+            inactive += Fixture::Take(answer)->error == ChannelError::Inactive ? 1 : 0;
+        Check(inactive == 12 - WorldChannel::TickBudget, "LCB6b: a reload answers every queued packet inactive");
+        answers.clear();
         Check(g_bridgeChannel.Drained(), "reload disposes both receive and completion payloads");
         Check(!g_bridgeChannel.Activate(), "reconnect cannot reuse retired epoch");
-        uint64_t receipt = 0;
-        Check(OllamaDispatch_ChannelReceive(settings.token, f.ticket.request.requestId, f.Query(), receipt) ==
-                  ChannelError::Unauthorized,
-              "retired bearer cannot admit old routes");
+        auto const receipt = std::make_shared<ChannelAnswer>();
+        Check(OllamaDispatch_ChannelReceive(f.ticket.request.requestId, f.Query(), receipt) == ChannelError::Inactive,
+              "a retired channel cannot admit old routes");
     }
     {
         Fixture f;
@@ -452,10 +524,8 @@ void Lifetimes()
         g_bridgeWorld.Configured(true, settings, "replacement-epoch");
         Check(g_bridgeChannel.Update() == 0, "reload invalidates selection before world work");
         g_bridgeChannel.Retire();
-        std::unique_ptr<ChannelPacket> packet;
-        Check(OllamaDispatch_ChannelTake(settings.token, receipt, packet) == ChannelError::Unauthorized &&
-                  g_bridgeChannel.Drained(),
-              "reload failure disposes old queued payload");
+        Check(Fixture::Take(receipt)->error == ChannelError::Inactive, "LCB6b: a reload answers the queued packet");
+        Check(g_bridgeChannel.Drained(), "reload failure disposes old queued payload");
     }
 }
 }  // namespace
@@ -467,7 +537,7 @@ int main()
         Queries();
         Events();
         Lifetimes();
-        std::cout << "PASS " << checks << " production query/dispatch/game-adapter checks\n";
+        std::cout << "PASS " << checks << " query dispatch checks (adapter and dispatcher compiled whole)\n";
     }
     catch (std::exception const& error)
     {

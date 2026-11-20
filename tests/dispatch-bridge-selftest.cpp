@@ -1,6 +1,6 @@
-// Actual bridge/world translation units plus exact extracted dispatch helpers (see hub J4b-2a-check runner).
-// Handler adapter is extracted verbatim too; game objects/route/governor/cleanup/API are controlled stand-ins.
-// No full handler/dispatch TU or live-game proof.
+// The dispatcher and the bridge's world adapter, compiled whole: this file includes the two production .cpp files
+// after its own doubles of the game, playerbots and the module's other units (tests/doubles names the game headers).
+// The bridge, world-policy, channel, query and listener units are linked. No live-game proof.
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -12,86 +12,15 @@
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <thread>
 #include <vector>
 
-#include "mod-ollama-chat_bridge_plan.h"
+#include "SharedDefines.h"
 #include "mod-ollama-chat_bridge_query.h"
 #include "mod-ollama-chat_bridge_world.h"
-#include "mod-ollama-chat_persona_db.h"
 #include "mod-ollama-chat_reply_split.h"
-
-enum class OllamaProvider
-{
-    Ollama,
-    Bridge
-};
-enum class OllamaRequestKind
-{
-    ChatReply,
-    EventChatter
-};
-enum ChatChannelSourceLocal
-{
-    SRC_SAY_LOCAL = 1,
-    SRC_PARTY_LOCAL = 2,
-    SRC_RAID_LOCAL = 3,
-    SRC_YELL_LOCAL = 6,
-    SRC_WHISPER_LOCAL = 7
-};
-using OllamaBridgeObserver = bool (*)(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&);
-#define LOG_INFO(...) ((void)0)
-#define LOG_ERROR(...) ((void)0)
-
-OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource();
-// The production phase holds the post-map-join token; the stand-in executor below never reads it.
-namespace OllamaBridge
-{
-struct EffectPhase
-{
-};
-}  // namespace OllamaBridge
-// The production channel names the world-only typed effect adapter, which needs game headers. This fixture stands in
-// with the closed release gate (every command refused without a game read) unless a DS.14 silent-answer test opens
-// it: then it asks the channel's authorization once and reports the chosen result only when granted.
-OllamaBridge::EffectResult executorResult = OllamaBridge::EffectResult::Rejected;
-OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
-{
-    struct Closed final : OllamaBridge::CommandExecutor
-    {
-        OllamaBridge::EffectResult Execute(OllamaBridge::EffectPhase const&, OllamaBridge::WorldTicket const&,
-                                           OllamaBridge::DispatchGuard const&, OllamaBridge::ChannelCommand const&,
-                                           std::function<bool()> const& authorize) override
-        {
-            if (executorResult == OllamaBridge::EffectResult::Rejected || !authorize())
-                return OllamaBridge::EffectResult::Rejected;
-            return executorResult;
-        }
-    };
-    static Closed executor;
-    return executor;
-}
-OllamaPersona::ProposalStatus OllamaChat_BridgeProposeCard(OllamaBridge::WorldTicket const&, uint64_t, uint64_t,
-                                                           std::string);
-
-// Seams the bridge translation units name but this lifecycle check never reaches: the persona store lifecycle (gate
-// closed here) and the events route of the production channel glue.
-namespace OllamaPersona
-{
-void ForgetPersona(uint64_t) {}
-void RetirePersonas(uint64_t) {}
-}  // namespace OllamaPersona
-
-#include "dispatch-types.inc"
-
-OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
-bool OllamaDispatch_SubmitBridge(OllamaChatRequest, OllamaBridge::WorldScope const&, OllamaBridge::Context,
-                                 OllamaBridge::DispatchGuard, int64_t);
-bool OllamaChat_BridgeObserve(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&);
-void OllamaChat_BridgeRefresh();
-void OllamaChat_BridgeReset();
-void OllamaChat_BridgeRemember(OllamaBridge::WorldTicket const&, std::string const&);
 
 namespace
 {
@@ -108,15 +37,6 @@ unsigned scopeChange = 0;
 void ChangeScope();
 bool filterEmpty = false;
 bool cleanupEmpty = false;
-bool g_DebugEnabled = false;
-bool g_EnableTypingSimulation = false;
-uint32_t g_TypingSimulationBaseDelay = 100;
-uint32_t g_TypingSimulationDelayPerChar = 10;
-uint32_t g_TypingSimulationMaxDelay = 1000;
-uint32_t g_MaxQueueDepth = 64;
-OllamaEndpointSettings config;
-OllamaEndpointSettings observedSettings;
-OllamaApiResult apiResult;
 OllamaBridge::DispatchGuard gameGuard;
 std::atomic<unsigned> apiCalls{0};
 std::mutex apiMutex;
@@ -128,16 +48,9 @@ std::string routedText;
 std::vector<std::string> routed;  // LC10: every routed message, in order.
 unsigned routeFailAt = 0;         // LC10: the route call (1-based) that fails; 0 = none.
 uint32_t cleanupMaxLen = 0;       // LC10: the clamp bound the cleanup was asked for.
-uint32_t g_MaxReplyLength = 240;  // The legacy clamp; the bridge path never passes it.
 bool adapterMode = false;
 bool secondBot = false;  // players[3] is a second bot of the group, sharing the first bot's AI double.
-bool g_Enable = true;
-bool g_EnableWhisperReplies = true;
-bool g_DisableForSayYell = false;
-bool g_DisableForParty = false;
-float g_SayDistance = 25.0f;
-float g_YellDistance = 100.0f;
-std::string voice = "A quiet traveler.";
+unsigned findCalls = 0;  // LCB3c: game reads in adapter mode, to count captures.
 
 void Check(bool condition, char const* message)
 {
@@ -146,34 +59,18 @@ void Check(bool condition, char const* message)
         throw std::runtime_error(message);
 }
 
-OllamaEndpointSettings OllamaConfig_Snapshot() { return config; }
-OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, OllamaBridge::Request const&)
+// Where every route of the production RouteMessage ends: one of the bot AI's send calls.
+bool Routed(std::string const& text)
 {
-    ++apiCalls;
-    observedSettings = settings;
-    std::unique_lock lock(apiMutex);
-    apiEntered = true;
-    apiCv.notify_all();
-    if (!apiCv.wait_for(lock, std::chrono::seconds(3), [] { return !apiBlocked; }))
-        throw std::runtime_error("API fixture deadline");
-    if (throwApi)
-        throw std::runtime_error("synthetic failure");
-    return apiResult;
+    if (++routeCalls == routeFailAt)
+        return false;
+    routedText = text;
+    routed.push_back(text);
+    return true;
 }
-std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t maxLen)
-{
-    ++cleanupCalls;
-    cleanupMaxLen = maxLen;
-    return cleanupEmpty ? "" : text;
-}
-std::string Roleplay_FilterMetaTerms(std::string const& text)
-{
-    ++filterCalls;
-    return filterEmpty ? "" : text;
-}
-void Memory_RunCondensation(uint64_t, std::string const&) {}
-void Memory_RunRelationshipUpdate(uint64_t, uint64_t, std::string const&, std::string const&) {}
+}  // namespace
 
+// --- game doubles (tests/doubles/game-doubles.h) ---------------------------
 struct ObjectGuid
 {
     uint64_t value;
@@ -184,6 +81,9 @@ struct ObjectGuid
 };
 struct Group;
 struct Player;
+struct Guild
+{
+};
 struct Unit
 {
     virtual ~Unit() = default;
@@ -218,6 +118,15 @@ struct Player : Unit
     Group* GetGroup() const { return group; }
     uint32_t GetTeamId() const { return team; }
     Player* ToPlayer() override { return this; }
+    uint8_t getRace() const { return RACE_HUMAN; }
+    uint8_t getClass() const { return CLASS_WARRIOR; }
+    uint8_t getGender() const { return GENDER_MALE; }
+    uint8_t GetLevel() const { return 10; }
+    uint32_t GetZoneId() const { return 12; }
+    bool InBattleground() const { return false; }
+    bool InArena() const { return false; }
+    Guild* GetGuild() const { return nullptr; }
+    uint32_t GetGuildId() const { return 0; }
 };
 struct Group
 {
@@ -246,30 +155,44 @@ struct PlayerbotAI
     bool isBot = true;
     Player* GetMaster() { return master; }
     bool IsBotAI() const { return isBot; }
+    bool Say(std::string const& text) { return Routed(text); }
+    bool Yell(std::string const& text) { return Routed(text); }
+    bool Whisper(std::string const& text, std::string const&) { return Routed(text); }
+    bool SayToParty(std::string const& text) { return Routed(text); }
+    bool SayToRaid(std::string const& text) { return Routed(text); }
+    bool SayToGuild(std::string const& text) { return Routed(text); }
 };
+// No test routes to a channel: the bridge takes whisper, say, yell and party lines only.
+struct Channel
+{
+    bool IsOn(ObjectGuid) const { return false; }
+    void Say(ObjectGuid, std::string const&, uint32_t) {}
+};
+struct ChannelMgr
+{
+    static ChannelMgr* forTeam(uint32_t) { return nullptr; }
+    Channel* GetChannel(std::string const&, Player*) { return nullptr; }
+};
+namespace
+{
 Player players[70];
 Group party;
 PlayerbotAI gameAI;
-bool OllamaIsRealPlayer(Player* player) { return player && player->human; }
-std::string Roleplay_BuildVoicePrompt(Player*) { return voice; }
-struct Channel
-{
-};
-struct OllamaWorldSnapshot
-{
-};
+}  // namespace
 struct ObjectAccessor
 {
     static Player* FindConnectedPlayer(ObjectGuid guid)
     {
         if (adapterMode)
         {
+            ++findCalls;
             for (auto& player : players)
                 if (player.guid == guid.value && player.online)
                     return &player;
             return nullptr;
         }
         static Player player;
+        player.group = &party;  // A party line's route asks for the bot's group.
         return &player;
     }
     static Unit* GetUnit(Unit const&, ObjectGuid guid) { return FindConnectedPlayer(guid); }
@@ -289,53 +212,99 @@ struct PlayerbotsMgr
         return &ai;
     }
 };
-// The extracted capture reads the persona card through the production store (compiled in). It stays off (voice
-// only, no card offered) except in CardTests. J14e: the handler's world-side fact gatherer (outside the extract) is a
-// stand-in that fills fixed facts and counts its calls.
-unsigned cardFactsCalls = 0;
-void BridgeCardFacts(Player*, OllamaBridge::CardFacts& facts)
+// The grid search of a say or yell route: every online player of the fixture stands in range.
+namespace Acore
 {
-    ++cardFactsCalls;
-    facts.race = "Dwarf";
-    facts.className = "Warrior";
-    facts.level = 42;
-}
-// J5f: the bot-state reader (playerbots, outside the extract) is a stand-in too. Each call reads 10 points less
-// health, the rest stays fixed; the marker zone shows whether state leaked into a signature or a prompt.
-unsigned stateFactsCalls = 0;
-void BridgeBotStateFacts(Player*, Player*, OllamaBridge::BotState& state)
+struct AnyPlayerInObjectRangeCheck
 {
-    ++stateFactsCalls;
-    state.present = true;
-    state.healthPct = 100.0f - 10.0f * static_cast<float>(stateFactsCalls);
-    state.alive = true;
-    state.zone = "MARKERZONE";
-}
-// LC10: the facts and traits gatherer (outside the extract) is a stand-in too; its marker shows a leak.
-unsigned factsCalls = 0;
-void BridgeFactsAndTraits(Player*, OllamaBridge::Context& input)
+    AnyPlayerInObjectRangeCheck(Player*, float, bool, bool) {}
+};
+template <typename Check>
+struct PlayerListSearcher
 {
-    ++factsCalls;
-    input.facts.emplace().phrase = "MARKERFACT";
-    input.traits.words = {"MARKERTRAIT"};
-}
-// J5f-b: the topic reader (playerbots, outside the extract); not exercised here.
-bool BridgeBotStateTopic(uint64_t, OllamaBridge::StateTopic, std::string const&,
-                         std::vector<OllamaBridge::StateEntry>& entries)
+    std::list<Player*>& found;
+    PlayerListSearcher(Player*, std::list<Player*>& list, Check&) : found(list) {}
+};
+namespace Crypto
 {
-    entries.clear();
-    return false;
-}
-// J6e-c: the watch fact reader and the wake's governor scope (outside the extract) are stand-ins.
-OllamaBridge::WatchFacts watchFacts;
-unsigned watchFactsCalls = 0;
-bool BridgeWatchFacts(uint64_t, uint64_t, OllamaBridge::WatchFacts& facts)
+template <std::size_t Size>
+std::array<uint8_t, Size> GetRandomBytes()
 {
-    ++watchFactsCalls;
-    facts = watchFacts;
-    return facts.ready;
+    return {};
 }
-std::string BridgeWakeScopeKey(Player*, ChatChannelSourceLocal) { return "wake-scope"; }
+}  // namespace Crypto
+}  // namespace Acore
+struct Cell
+{
+    template <typename Searcher>
+    static void VisitObjects(Player*, Searcher& searcher, float)
+    {
+        for (auto& player : players)
+            if (player.online)
+                searcher.found.push_back(&player);
+    }
+};
+#define OLLAMA_SELFTEST_GAME_DOUBLES
+
+// --- the production units ---------------------------------------------------
+#include "../src/mod-ollama-chat_bridge_adapter.cpp"
+#include "../src/mod-ollama-chat_dispatch.cpp"
+#include "bridge-ability-double.h"
+
+// --- doubles of the module's other units ------------------------------------
+bool g_DebugEnabled = false;
+bool g_EnableTypingSimulation = false;
+uint32_t g_TypingSimulationBaseDelay = 100;
+uint32_t g_TypingSimulationDelayPerChar = 10;
+uint32_t g_TypingSimulationMaxDelay = 1000;
+uint32_t g_MaxQueueDepth = 64;
+uint32_t g_DispatchWorkerThreads = 1;
+uint32_t g_MaxReplyLength = 240;  // The legacy clamp; the bridge path never passes it.
+bool g_Enable = true;
+bool g_EnableWhisperReplies = true;
+bool g_DisableForSayYell = false;
+bool g_DisableForParty = false;
+bool g_DisableForGuild = false;
+float g_SayDistance = 25.0f;
+float g_YellDistance = 100.0f;
+const char* ChatChannelSourceLocalStr[] = {"Undefined", "Say", "Party", "Raid", "Guild", "Officer", "Yell", "Whisper"};
+
+namespace
+{
+OllamaEndpointSettings config;
+OllamaEndpointSettings observedSettings;
+OllamaApiResult apiResult;
+}  // namespace
+
+OllamaEndpointSettings OllamaConfig_Snapshot() { return config; }
+OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, OllamaBridge::Request const&)
+{
+    ++apiCalls;
+    observedSettings = settings;
+    std::unique_lock lock(apiMutex);
+    apiEntered = true;
+    apiCv.notify_all();
+    if (!apiCv.wait_for(lock, std::chrono::seconds(3), [] { return !apiBlocked; }))
+        throw std::runtime_error("API fixture deadline");
+    if (throwApi)
+        throw std::runtime_error("synthetic failure");
+    return apiResult;
+}
+std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t maxLen)
+{
+    ++cleanupCalls;
+    cleanupMaxLen = maxLen;
+    return cleanupEmpty ? "" : text;
+}
+std::string Roleplay_FilterMetaTerms(std::string const& text)
+{
+    ++filterCalls;
+    return filterEmpty ? "" : text;
+}
+bool OllamaIsBotPlayer(Player* player) { return !player->human; }
+bool OllamaGroupHasRealPlayer(Player*) { return true; }
+void OllamaWorldSnapshot::Build() {}
+bool OllamaWorldSnapshot::RealPlayerInChannel(Channel*) const { return true; }
 bool Governor_IsRepetitive(ObjectGuid, std::string const&, std::string const&) { return false; }
 bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool)
 {
@@ -343,15 +312,107 @@ bool Governor_TryConsumeSend(ObjectGuid, std::string const&, bool)
     return true;
 }
 void Governor_RecordUtterance(ObjectGuid, std::string const&, std::string const&) { ++recordCalls; }
-bool RouteMessage(Player*, PlayerbotAI*, Completion const&, std::string const& text, OllamaWorldSnapshot const&,
-                  Channel*&)
+// J6e-c: the wake's governor scope is the partner's, keyed by the governor.
+std::string Governor_MakeScopeKey(char const*, uint32_t, std::string const&, uint32_t, uint32_t)
 {
-    if (++routeCalls == routeFailAt)
-        return false;
-    routedText = text;
-    routed.push_back(text);
+    return "wake-scope";
+}
+
+// The typed effect adapter (bridge_effect.cpp) needs playerbots' executor. This double is the closed release gate
+// (every command refused without a game read) unless a DS.14 silent-answer test opens it: then it asks the channel's
+// authorization once and reports the chosen result only when granted. No lasting plan lives here.
+OllamaBridge::EffectResult executorResult = OllamaBridge::EffectResult::Rejected;
+OllamaBridge::CommandExecutor& OllamaChat_BridgeCommandExecutor()
+{
+    struct Closed final : OllamaBridge::CommandExecutor
+    {
+        std::vector<OllamaBridge::ChannelStepResult> ran;  // LC3b: every step applied, or the one failed step.
+        std::vector<OllamaBridge::ChannelStepResult> Steps() const override { return ran; }
+        OllamaBridge::EffectResult Execute(OllamaBridge::EffectPhase const&, OllamaBridge::WorldTicket const&,
+                                           OllamaBridge::DispatchGuard const&,
+                                           OllamaBridge::ChannelCommand const& command,
+                                           std::function<bool()> const& authorize) override
+        {
+            ran.clear();
+            if (executorResult == OllamaBridge::EffectResult::Rejected || !authorize())
+                return OllamaBridge::EffectResult::Rejected;
+            if (executorResult == OllamaBridge::EffectResult::Applied)
+                ran.assign(command.steps.size(), {OllamaBridge::ChannelOutcome::Applied, "", ""});
+            else if (executorResult == OllamaBridge::EffectResult::Failed)
+                ran.assign(1, {OllamaBridge::ChannelOutcome::Failed, "", ""});
+            return executorResult;
+        }
+    };
+    static Closed executor;
+    return executor;
+}
+
+// --- doubles of playerbots' readers -----------------------------------------
+namespace
+{
+// J5f: each state read is 10 points less health, the rest stays fixed; the marker zone shows whether state leaked
+// into a capture or a prompt.
+unsigned stateFactsCalls = 0;
+// LC10: the facts and traits carry markers that show a leak. LCB3c: a nonzero factsTick changes the facts and traits
+// of every request.
+unsigned factsCalls = 0;
+unsigned factsTick = 0;
+}  // namespace
+
+namespace PlayerbotBridge
+{
+bool ReadBotState(ObjectGuid const&, ObjectGuid const&, BotStateFacts& facts)
+{
+    ++stateFactsCalls;
+    facts.healthPct = 100.0f - 10.0f * static_cast<float>(stateFactsCalls);
+    facts.alive = true;
+    facts.zone = "MARKERZONE";
     return true;
 }
+bool ReadBotFacts(ObjectGuid const&, BotFacts& facts)
+{
+    ++factsCalls;
+    facts.phrase = "MARKERFACT";
+    if (factsTick)
+        facts.phrase += std::to_string(factsTick);
+    return true;
+}
+bool ReadBotPersonality(ObjectGuid const&, BotPersonality& out)
+{
+    out.words = {"MARKERTRAIT"};
+    if (factsTick)
+        out.words.push_back("trait" + std::to_string(factsTick));
+    return true;
+}
+// J5f-b: the topic reader is not exercised here.
+bool ReadBotStateTopic(ObjectGuid const&, BotStateTopic, std::string const&, std::vector<BotStateItem>& items)
+{
+    items.clear();
+    return false;
+}
+// LC3: the tests install bridge-ability-double.h's index; the adapter's own installer is not run.
+std::span<AbilityRow const> AbilityRows() { return {}; }
+std::vector<AbilityData> Catalogue() { return {}; }
+uint64_t CatalogueHash(std::vector<AbilityData> const&) { return 0; }
+char const* KindWord(AbilityKind) { return ""; }
+char const* KindWord(ParamKind) { return ""; }
+char const* CompletionWord(Completion) { return ""; }
+PostMapJoin::PostMapJoin() : _thread(std::this_thread::get_id()) {}
+}  // namespace PlayerbotBridge
+
+// The post-map-join token's one construction site is this class's world update; here it runs one dispatcher tick.
+class OllamaBotRandomChatter
+{
+public:
+    static void Tick()
+    {
+        PlayerbotBridge::PostMapJoin const join;
+        OllamaDispatch_Update(0, join);
+    }
+};
+
+namespace
+{
 bool Observe(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard& guard)
 {
     guard = gameGuard;
@@ -363,10 +424,6 @@ bool Observe(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard& guar
     return true;
 }
 }  // namespace
-
-#include "dispatch-helpers.inc"
-#include "handler-bridge.inc"
-#include "bridge-ability-double.h"
 
 namespace
 {
@@ -402,14 +459,18 @@ void Reset()
     g_done.clear();
     Check(OllamaBridge::DispatchSlot::Used() == 0, "all physical slots disposed");
     config = {};
-    config.provider = OllamaProvider::Bridge;
     config.bridge = {"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-bearer-only"};
-    config.systemPrompt = "owned-system";
-    g_bridgeWorld.Configured(true, config.bridge, "epoch-1");
-    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures), "selected");
+    // LCB6b: the channel runs whenever the bridge does, so the fixture opens it as OllamaDispatch_BridgeConfigured
+    // does. ChannelPolicy never rebinds its previous epoch, so every fixture selects its own.
+    static unsigned fixtures = 0;
+    std::string const epoch = "epoch-r" + std::to_string(++fixtures);
+    g_bridgeWorld.Configured(true, config.bridge, epoch);
+    Check(g_bridgeWorld.ObserveDrain(true), "selected");
+    g_bridgeChannel.Configure(true);
+    Check(g_bridgeChannel.Activate(), "channel open");
     g_bridgeGeneration = g_bridgeWorld.Generation();
     gameGuard = {};
-    gameGuard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "party", "visible", "c1", "m1", "p1"};
+    gameGuard.scope = {1, "fixture", "codex", epoch, 11, 22, "conversation", "party", "visible", "c1", "m1"};
     gameGuard.source = OllamaBridge::DispatchSource::Party;
     gameGuard.speakerGuid = 33;
     gameGuard.groupGuid = 99;
@@ -450,9 +511,6 @@ bool Submit(bool addressed = true, std::string memory = {}, int64_t lifetimeMs =
     request.source = SRC_PARTY_LOCAL;
     request.directAddress = addressed;
     request.scopeKey = "party-99";
-    request.recordHistory = request.updateSentiment = request.triggerBotReplies = true;
-    request.prompt = "FORBIDDEN LEGACY PROMPT";
-    request.originMessage = "FORBIDDEN LEGACY HISTORY";
     OllamaBridge::Context input;
     input.speakerGuid = 33;
     input.channel = "party";
@@ -516,9 +574,6 @@ void GuardTests()
     changed.scope.membershipRevision = "m2";
     reject(changed, "membership revision changed");
     changed = captured;
-    changed.scope.personaRevision = "p2";
-    reject(changed, "persona revision changed");
-    changed = captured;
     changed.humanSpeaker = false;
     reject(changed, "bot-origin forbidden");
     Check(
@@ -535,29 +590,14 @@ void AdmissionTests()
     g_bridgeObserver = nullptr;
     Check(!Submit() && !apiCalls && !OllamaBridge::DispatchSlot::Used(), "unbound fails closed");
     g_bridgeObserver = Observe;
-    OllamaChatRequest legacy;
-    legacy.botGuid = 11;
-    legacy.prompt = "legacy";
-    Check(!OllamaDispatch_Submit(legacy), "prompt-only Bridge rejected");
-    config.provider = OllamaProvider::Ollama;
-    Check(OllamaDispatch_Submit(legacy), "legacy admission preserved");
-    g_queue.clear();
-    legacy.bridgeGeneration = 123;
-    Check(!OllamaDispatch_Submit(legacy), "forged bridge tag rejected");
-    config.provider = OllamaProvider::Bridge;
     Check(!Submit(true, std::string(8193, 'x')), "actual builder rejects oversize context");
     Check(Submit(), "bound request admitted");
     auto const original = config;
     config.bridge.token = "synthetic-game-link-bearer-rotated";
-    config.systemPrompt = "reloaded";
     auto done = Finish();
-    Check(apiCalls == 1 && observedSettings.bridge.token == original.bridge.token &&
-              observedSettings.systemPrompt == original.systemPrompt,
+    Check(apiCalls == 1 && observedSettings.bridge.token == original.bridge.token,
           "worker uses immutable full snapshot");
     Check(!cleanupCalls && !filterCalls, "worker skips world cleanup/filter");
-    Check(done.request.prompt.empty() && done.request.originMessage.empty() && !done.request.recordHistory &&
-              !done.request.updateSentiment && !done.request.triggerBotReplies,
-          "legacy context and effects excluded");
     g_bridgeWorld.Configured(true, config.bridge, "epoch-2");
     g_bridgeGeneration = 0;
     Check(!PrepareBridge(done) && !cleanupCalls && !routeCalls, "token reload rejects before cleanup");
@@ -565,17 +605,21 @@ void AdmissionTests()
 
 void CapacityTests()
 {
+    // LC.38: no fixed count of reservations or slots; the generation queue's depth is the bound, and a full queue
+    // stages its bounded terminal (the outage line) as before.
     Reset();
-    for (unsigned i = 0; i < OllamaBridge::MaxWorldPending; ++i)
-        Check(Submit(), "physical slot admitted");
+    g_MaxQueueDepth = 200;
+    for (unsigned i = 0; i < 200; ++i)
+        Check(Submit(), "LC.38: 200 generations admitted, no slot cap");
+    Check(g_queue.size() == 200 && g_done.empty() && OllamaBridge::DispatchSlot::Used() == 200,
+          "every queued task holds its physical slot");
     auto now = OllamaBridge::Now();
     now.unixMs += 1001;
     now.steadyMs += 1001;
     g_bridgeWorld.Expire(now);
-    Check(!g_bridgeWorld.Pending() && OllamaBridge::DispatchSlot::Used() == 64, "expiry retains physical queue slots");
-    Check(!Submit() && g_done.empty(), "full physical capacity cannot stage fallback");
+    Check(!g_bridgeWorld.Pending() && OllamaBridge::DispatchSlot::Used() == 200, "expiry retains physical queue slots");
     g_queue.pop_front();
-    Check(OllamaBridge::DispatchSlot::Used() == 63 && Submit(), "actual disposal releases exactly one slot");
+    Check(OllamaBridge::DispatchSlot::Used() == 199, "actual disposal releases exactly one slot");
     g_queue.clear();
     Check(!OllamaBridge::DispatchSlot::Used(), "queue disposal frees slots");
     Reset();
@@ -594,20 +638,17 @@ void CapacityTests()
 void PublicationTest()
 {
     Reset();
-    for (unsigned i = 0; i < OllamaBridge::MaxWorldPending; ++i)
-        Check(Submit(), "fill physical slots before publication");
+    Check(Submit() && Submit(), "two generations queued");
     Task task = std::move(g_queue.front());
     g_queue.pop_front();
     RunBridgeTask(task);
-    Check(OllamaBridge::DispatchSlot::Used() == 64 && g_done.size() == 1, "publication keeps capacity owned");
+    Check(OllamaBridge::DispatchSlot::Used() == 2 && g_done.size() == 1, "publication keeps its slot owned");
     Check(!task.bridgeSlot && !task.request.bridgeGeneration && task.request.bridgeSettings.bridge.token.empty() &&
-              task.request.bridgeSettings.systemPrompt.empty() &&
               task.request.bridgeTicket.request.input.text.empty() && task.request.bridgeGuard.audience.empty(),
           "published completion leaves no worker request payload");
-    Check(!Submit(), "completion still occupies final physical slot");
     g_bridgeWorld.Cancel(g_done.front().request.bridgeTicket);
     g_done.clear();
-    Check(OllamaBridge::DispatchSlot::Used() == 63 && Submit(), "completion disposal admits exactly one replacement");
+    Check(OllamaBridge::DispatchSlot::Used() == 1, "completion disposal releases exactly its slot");
     Check(!task.request.bridgeGeneration && task.request.bridgeTicket.request.input.text.empty(),
           "old worker remains alive but empty after replacement admission");
 }
@@ -665,8 +706,8 @@ void ClaimedScopeTests()
 void TerminalTests()
 {
     using OllamaBridge::WorldOutcome;
-    for (auto outcome : {WorldOutcome::Unavailable, WorldOutcome::Timeout, WorldOutcome::CircuitOpen,
-                         WorldOutcome::Malformed, WorldOutcome::Empty, WorldOutcome::Filtered, WorldOutcome::QueueFull})
+    for (auto outcome : {WorldOutcome::Unavailable, WorldOutcome::Timeout, WorldOutcome::Malformed, WorldOutcome::Empty,
+                         WorldOutcome::Filtered, WorldOutcome::QueueFull})
     {
         Reset();
         Check(Submit(), "fallback admission");
@@ -747,8 +788,7 @@ void DrainTest()
     config.bridge.token = "synthetic-game-link-bearer-new";
     g_bridgeWorld.Configured(true, config.bridge, "epoch-2");
     g_bridgeGeneration = 0;
-    bool const waits =
-        !g_bridgeWorld.ObserveDrain(g_bridgeInFlight == 0, OllamaBridge::RetirementProof::NoLiveCaptures);
+    bool const waits = !g_bridgeWorld.ObserveDrain(g_bridgeInFlight == 0);
     {
         std::lock_guard lock(g_queueMutex);
         g_running = false;
@@ -763,8 +803,7 @@ void DrainTest()
     Check(entered && counted && waits, "cancellation is not actual worker drain");
     Check(!g_bridgeInFlight && !OllamaBridge::DispatchSlot::Used() && g_done.empty(),
           "stale worker disposes actual payload before drain");
-    Check(g_bridgeWorld.ObserveDrain(true, OllamaBridge::RetirementProof::NoLiveCaptures),
-          "actual drain permits selection");
+    Check(g_bridgeWorld.ObserveDrain(true), "actual drain permits selection");
 }
 
 void AdapterFixture()
@@ -788,44 +827,41 @@ void AdapterFixture()
     g_DisableForParty = g_DisableForSayYell = false;
     g_SayDistance = 25.0f;
     g_YellDistance = 100.0f;
-    voice = "A quiet traveler.";
     g_bridgeObserver = OllamaChat_BridgeObserve;
 }
 
 bool AdapterSubmit(ChatChannelSourceLocal source = SRC_PARTY_LOCAL, std::string text = "A public question.")
 {
-    return BridgeSubmit(&players[0], &players[2], source, text, true, "party-99", 0);
+    return BridgeSubmit(&players[0], &players[2], source, text, true, "party-99");
 }
 
 // DS.14 (b): one typed act on the generation's own route, as the bridge sends it before the terminal result.
 void SendAct(OllamaBridge::WorldTicket const& ticket, OllamaBridge::EffectResult result)
 {
-    static OllamaBridge::EffectPhase const phase{};
     executorResult = result;
-    nlohmann::json const act = {{"version", 1},
-                                {"instance", ticket.scope.instance},
-                                {"provider", ticket.scope.provider},
-                                {"epoch", ticket.scope.epoch},
-                                {"requestId", ticket.request.requestId},
-                                {"deadlineUnixMs", ticket.request.deadline.unixMs},
-                                {"type", "command"},
-                                {"commandId", "act-" + ticket.request.requestId},  // Ids are once per epoch.
-                                {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
-                                {"botGuid", std::to_string(ticket.scope.botGuid)},
-                                {"intent", "attack_own_target"},
-                                {"params", nlohmann::json::object()}};
-    uint64_t receipt = 0;
+    nlohmann::json const act = {
+        {"version", 1},
+        {"instance", ticket.scope.instance},
+        {"provider", ticket.scope.provider},
+        {"epoch", ticket.scope.epoch},
+        {"requestId", ticket.request.requestId},
+        {"deadlineUnixMs", ticket.request.deadline.unixMs},
+        {"type", "command"},
+        {"commandId", "act-" + ticket.request.requestId},  // Ids are once per epoch.
+        {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
+        {"botGuid", std::to_string(ticket.scope.botGuid)},
+        {"steps", nlohmann::json::array({{{"act", "follow"}, {"params", nlohmann::json::object()}}})}};
+    auto const receipt = std::make_shared<OllamaBridge::ChannelAnswer>();
     auto const before = g_bridgeChannel.Commands();
-    Check(g_bridgeChannel.Receive(config.bridge.token, ticket.request.requestId, act.dump(), receipt) ==
-              OllamaBridge::ChannelError::None,
+    Check(g_bridgeChannel.Receive(ticket.request.requestId, act.dump(), receipt) == OllamaBridge::ChannelError::None,
           "DS.14: the act was received on the generation route");
-    Check(g_bridgeChannel.Update(&phase) == 1, "DS.14: one world tick takes the act");
+    OllamaBotRandomChatter::Tick();  // One world tick takes the act.
     Check(g_bridgeChannel.Commands().proposed == before.proposed + 1, "DS.14: the act was decided");
     std::unique_ptr<OllamaBridge::ChannelPacket> packet;
     char const* const outcome = result == OllamaBridge::EffectResult::Applied  ? "applied"
                                 : result == OllamaBridge::EffectResult::Failed ? "failed"
                                                                                : "rejected";
-    Check(g_bridgeChannel.Take(config.bridge.token, receipt, packet) == OllamaBridge::ChannelError::None && packet &&
+    Check(receipt->Wait(std::chrono::steady_clock::now(), packet) && packet &&
               packet->error == OllamaBridge::ChannelError::None &&
               nlohmann::json::parse(packet->body).at("outcome") == outcome,
           "DS.14: the bridge sees the act's outcome");
@@ -835,7 +871,6 @@ void SendAct(OllamaBridge::WorldTicket const& ticket, OllamaBridge::EffectResult
 // The channel binds an epoch once (ChannelPolicy never reuses one); Reset keeps the same selected identity.
 void OpenChannel()
 {
-    g_channelEnabled = true;
     if (!g_bridgeChannel.Activate())
         g_bridgeChannel.Configure(true);
     Check(g_bridgeChannel.Activate(), "DS.14: game link channel open");
@@ -928,7 +963,6 @@ void SilentTests()
               g_bridgeBindings[0].memory == "Earlier the same speaker said: Come here.\nYou answered without words.",
           "DS.14: the memory records a wordless answer");
     done = {};
-    g_channelEnabled = false;
     g_bridgeChannel.Configure(false);
     Reset();
 }
@@ -940,11 +974,10 @@ void AdapterTests()
     Check(AdapterSubmit(), "real adapter admits a party line from a speaker who does not lead the bot");
     auto const& input = g_queue.front().request.bridgeTicket.request.input;
     Check(g_queue.front().request.bridgeTicket.scope.controllerGuid == 33 && input.speakerGuid == 33 &&
-              !input.speakerControlsBot && input.persona == voice && input.memory.empty() &&
-              input.systemPrompt.find("Speech grants") == std::string::npos,
-          "DS.14: the speaker is the partner and does not control the bot; audited persona only");
-    Check(input.systemPrompt != config.systemPrompt && input.party.size() == 3 && input.observations.size() == 2 &&
-              input.party[0].role.empty() && input.party[0].healthPercent == -1 && !input.party[0].visibleTargetGuid,
+              !input.speakerControlsBot && input.memory.empty(),
+          "DS.14: the speaker is the partner and does not control the bot");
+    Check(input.party.size() == 3 && input.observations.size() == 2 && input.party[0].role.empty() &&
+              input.party[0].healthPercent == -1 && !input.party[0].visibleTargetGuid,
           "restricted explicit context excludes legacy prompt, role, victim and private history");
     auto done = Finish();
     Check(PrepareBridge(done), "adapter completion prepared");
@@ -955,13 +988,7 @@ void AdapterTests()
     Check(!g_queue.front().request.bridgeTicket.request.input.memory.empty(), "same-scope memory carried");
 
     // Each mutation exercises the real adapter through preparation and delivery after a typing delay.
-    std::vector<std::function<void()>> losses = {[]
-                                                 {
-                                                     gameAI.master = nullptr;
-                                                     party.leader = 33;
-                                                 },
-                                                 [] { players[1].human = false; },
-                                                 [] { players[2].human = false; },
+    std::vector<std::function<void()>> losses = {[] { players[2].human = false; },
                                                  [] { players[2].online = false; },
                                                  [] { players[0].inWorld = false; },
                                                  [] { gameAI.isBot = false; },
@@ -973,7 +1000,6 @@ void AdapterTests()
                                                  [] { players[2].map = 2; },
                                                  [] { players[2].instance = 2; },
                                                  [] { players[2].phase = 2; },
-                                                 [] { players[2].phase = 3; },
                                                  [] { players[1].visible = false; },
                                                  [] { players[2].visible = false; },
                                                  [] { players[2].distance = 26; },
@@ -982,12 +1008,9 @@ void AdapterTests()
                                                      players[3].online = false;
                                                      party.members.push_back({ObjectGuid(44)});
                                                  },
-                                                 [] { voice += " Revised."; },
-                                                 [] { players[2].name = "Renamed"; },
                                                  [] { g_DisableForParty = true; },
                                                  [] { g_Enable = false; },
-                                                 [] { g_bridgeBindings[0].heartbeat.unixMs = 1; },
-                                                 [] { g_bridgeBindings[0].heartbeat.steadyMs = 1; },
+                                                 [] { g_bridgeBindings[0].idleUntil.unixMs = 1; },
                                                  [] { g_bridgeBindings[0].idleUntil.steadyMs = 1; }};
     for (auto const& lose : losses)
     {
@@ -1002,25 +1025,35 @@ void AdapterTests()
               "world loss invalidates before delivery, including scoped memory");
         done = {};
     }
-    // DS.14: who leads the bot is no part of the capture's identity; a follow that makes the partner the bot's
-    // master, or any other change of master, keeps the in-flight reply.
-    std::vector<std::function<void()>> const leads = {
-        [] { gameAI.master = &players[3]; }, [] { gameAI.master = &players[2]; }, [] { gameAI.master = nullptr; }};
-    for (auto const& lead : leads)
+    // LCB3c: a change that is neither the scope nor the audience keeps the in-flight reply. DS.14: who leads the bot
+    // is no part of the capture's identity (a follow that makes the partner the bot's master, any other change of
+    // master, another group leader); nor is a listener being a bot, or a phase the partner still shares.
+    std::vector<std::function<void()>> const kept = {[] { gameAI.master = &players[3]; },
+                                                     [] { gameAI.master = &players[2]; },
+                                                     [] { gameAI.master = nullptr; },
+                                                     []
+                                                     {
+                                                         gameAI.master = nullptr;
+                                                         party.leader = 33;
+                                                     },
+                                                     [] { players[1].human = false; },
+                                                     [] { players[2].phase = 3; }};
+    for (auto const& keep : kept)
     {
         AdapterFixture();
-        Check(AdapterSubmit(), "lead change fixture admitted");
+        Check(AdapterSubmit(), "kept binding fixture admitted");
         done = Finish();
-        Check(PrepareBridge(done), "lead change fixture prepared");
-        lead();
+        Check(PrepareBridge(done), "kept binding fixture prepared");
+        keep();
         DeliverBridge(done, {});
-        Check(routeCalls == 1 && g_bridgeBindings.size() == 1, "DS.14: a change of master keeps the in-flight reply");
+        Check(routeCalls == 1 && g_bridgeBindings.size() == 1,
+              "LCB3c: a change outside the scope and audience keeps the in-flight reply");
         done = {};
     }
     // DS.14: the speaker is the bot's conversation partner whoever leads it; speakerControlsBot only describes the
     // master or, for a masterless bot, the group leader.
     AdapterFixture();
-    Check(BridgeSubmit(&players[0], &players[1], SRC_PARTY_LOCAL, "A public question.", true, "party-99", 0) &&
+    Check(BridgeSubmit(&players[0], &players[1], SRC_PARTY_LOCAL, "A public question.", true, "party-99") &&
               g_queue.front().request.bridgeTicket.scope.controllerGuid == 22 &&
               g_queue.front().request.bridgeTicket.request.input.speakerControlsBot,
           "DS.14: the master speaking is the partner and controls the bot");
@@ -1055,12 +1088,6 @@ void AdapterTests()
                   view.guard.nonRaid && !ticket.request.input.speakerControlsBot &&
                   ticket.request.input.party.size() == 2,
               "DS.14: the far whisper keeps the bot's group");
-        IntentContext facts;
-        facts.controllerGuid = ticket.scope.controllerGuid;
-        facts.botGuid = ticket.scope.botGuid;
-        facts.expectedGroupGuid = facts.controllerGroupGuid = facts.botGroupGuid = view.guard.groupGuid;
-        Check(MapIntent({"f", 33, 11, ChannelIntent::Follow, std::monostate{}}, facts).has_value(),
-              "DS.14: the far partner in the bot's group may ask it to follow");
     }
     done = Finish();
     Check(PrepareBridge(done), "DS.14: far whisper prepared");
@@ -1078,15 +1105,6 @@ void AdapterTests()
         Check(ticket.scope.controllerGuid == 33 && !view.guard.groupGuid && !view.guard.nonRaid &&
                   ticket.request.input.party.size() == 2,
               "DS.14: an ungrouped bot's whisper carries no group");
-        IntentContext facts;
-        facts.controllerGuid = ticket.scope.controllerGuid;
-        facts.botGuid = ticket.scope.botGuid;
-        facts.controllerGroupGuid = 99;
-        CommandRefusal why = CommandRefusal::None;
-        Check(MapIntent({"s", 33, 11, ChannelIntent::Stay, std::monostate{}}, facts).has_value() &&
-                  !MapIntent({"f", 33, 11, ChannelIntent::Follow, std::monostate{}}, facts, &why) &&
-                  why == CommandRefusal::NotWithYou,
-              "DS.14: an ungrouped bot may stay; it follows nobody");
     }
     // DS.14: an addressed say or yell reaches an unled bot within hearing; party still needs the bot's group.
     AdapterFixture();
@@ -1125,19 +1143,14 @@ void AdapterTests()
     Check(AdapterSubmit(), "party after whisper admitted");
     Check(g_queue.back().request.bridgeTicket.request.input.memory.empty(), "private memory never crosses to party");
     g_queue.clear();
-    Check(BridgeSubmit(&players[0], &players[1], SRC_WHISPER_LOCAL, "Other speaker", true, "scope", 0),
+    Check(BridgeSubmit(&players[0], &players[1], SRC_WHISPER_LOCAL, "Other speaker", true, "scope"),
           "another direct speaker admitted");
     Check(g_queue.front().request.bridgeTicket.request.input.memory.empty(), "memory separated by speaker");
     AdapterFixture();
     Check(!AdapterSubmit(SRC_RAID_LOCAL), "unsupported raid rejected");
-    Check(!BridgeSubmit(&players[0], &players[2], SRC_SAY_LOCAL, "ambient", false, "scope", 0),
+    Check(!BridgeSubmit(&players[0], &players[2], SRC_SAY_LOCAL, "ambient", false, "scope"),
           "unaddressed ambient skipped");
-    Check(!BridgeSubmit(&players[0], &players[2], SRC_WHISPER_LOCAL, "bot chain", true, "scope", 1),
-          "bot-origin chain rejected");
     Check(!AdapterSubmit(SRC_PARTY_LOCAL, std::string(4097, 'x')), "text bound fails closed");
-    voice.assign(8193, 'x');
-    Check(!AdapterSubmit(), "persona bound fails closed");
-    voice = "voice";
     players[2].name.assign(129, 'x');
     Check(!AdapterSubmit(), "name bound fails closed");
     AdapterFixture();
@@ -1165,7 +1178,7 @@ void AdapterTests()
     Check(!g_bridgeBindings.empty(), "J5e: the out-of-sight whisper binding survives a refresh");
     for (auto const source : {DispatchSource::Say, DispatchSource::Party})
     {
-        BridgeView view;
+        OllamaBridge::BindingCapture view;
         char const* why = nullptr;
         Check(!BridgeCapture(players[0].guid, players[2].guid, source, view, &why) && why &&
                   std::string(why) == "out_of_range",
@@ -1177,6 +1190,7 @@ void AdapterTests()
     done = Finish();
     auto const old = done.request.bridgeTicket;
     players[2].visible = false;
+    g_bridgeBindings[0].heartbeat.steadyMs = 1;  // LCB3c: the next capture is due.
     OllamaChat_BridgeRefresh();
     players[2].visible = true;
     Check(AdapterSubmit(), "fresh eligibility permits new request");
@@ -1191,7 +1205,7 @@ void AdapterTests()
     DeliverBridge(done, {});
     Check(g_bridgeBindings[0].memory.empty(), "outage is not an exchange memory");
     done = {};
-    for (unsigned loss = 0; loss < 5; ++loss)
+    for (unsigned loss = 0; loss < 4; ++loss)
     {
         AdapterFixture();
         Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Private memory marker"), "memory invalidation fixture");
@@ -1203,17 +1217,18 @@ void AdapterTests()
         if (loss == 0)
             players[2].inWorld = false;  // J5e: a whisper ignores distance and sight, not presence
         else if (loss == 1)
-            g_bridgeBindings[0].heartbeat.unixMs = 1;
+            g_bridgeBindings[0].idleUntil.unixMs = 1;
         else if (loss == 2)
-            g_bridgeBindings[0].heartbeat.steadyMs = 1;
-        else if (loss == 3)
-            party.members.push_back({ObjectGuid(44)});
+            g_bridgeBindings[0].idleUntil.steadyMs = 1;
         else
         {
             g_bridgeWorld.Configured(true, config.bridge, "new-epoch");
-            Check(g_bridgeWorld.ObserveDrain(true, RetirementProof::NoLiveCaptures), "reload selected");
+            Check(g_bridgeWorld.ObserveDrain(true), "reload selected");
             g_bridgeGeneration = g_bridgeWorld.Generation();
+            g_bridgeChannel.Configure(true);  // LCB6b: a reload reopens the channel on the new epoch, as production.
+            Check(g_bridgeChannel.Activate(), "reload channel open");
         }
+        g_bridgeBindings[0].heartbeat.steadyMs = 1;  // LCB3c: the next capture is due.
         OllamaChat_BridgeRefresh();
         Check(g_bridgeBindings.empty(), "loss or reload erases actual stored memory");
         players[2].inWorld = true;
@@ -1231,102 +1246,25 @@ void AdapterTests()
           "oversized combined exchange retains bounded human statement only");
     done = {};
     AdapterFixture();
-    for (unsigned i = 1; i <= MaxWorldScopes; ++i)
-        Check(BridgeSubmit(&players[0], &players[i], SRC_WHISPER_LOCAL, "Question", true, "scope", 0),
-              "bounded distinct conversation admitted");
+    g_MaxQueueDepth = 0;  // Unbounded here: the bindings are under test, not the queue.
+    for (unsigned i = 1; i < std::size(players); ++i)
+        Check(BridgeSubmit(&players[0], &players[i], SRC_WHISPER_LOCAL, "Question", true, "scope"),
+              "LC.38: every distinct conversation admitted, no fixed count");
     g_queue.clear();
-    Check(!DispatchSlot::Used() && g_bridgeBindings.size() == MaxWorldScopes,
-          "bindings bounded independently of slots");
-    Check(!BridgeSubmit(&players[0], &players[65], SRC_WHISPER_LOCAL, "Question", true, "scope", 0),
-          "sixty-fifth binding refused even with free worker capacity");
+    Check(!DispatchSlot::Used() && g_bridgeBindings.size() == std::size(players) - 1,
+          "LC.38: 69 bindings, more than the old 64, held independently of slots");
     for (auto& binding : g_bridgeBindings)
         binding.idleUntil.steadyMs = 1;
     OllamaChat_BridgeRefresh();
     Check(g_bridgeBindings.empty(), "idle bindings and memory retire within bounded lifetime");
-    Check(BridgeSubmit(&players[0], &players[65], SRC_WHISPER_LOCAL, "Question", true, "scope", 0),
+    Check(BridgeSubmit(&players[0], &players[65], SRC_WHISPER_LOCAL, "Question", true, "scope"),
           "expired binding capacity reusable");
     Reset();
 }
 
-// The persona store's port: loads and writes wait in submitted until the test completes them.
-struct CardPort final : OllamaPersona::StorePort
-{
-    std::deque<OllamaPersona::StoreOperation> submitted;
-    std::deque<OllamaPersona::StoreCompletion> completed;
-    bool TrySubmit(OllamaPersona::StoreOperation operation) override
-    {
-        submitted.push_back(std::move(operation));
-        return true;
-    }
-    std::optional<OllamaPersona::StoreCompletion> TryPop() override
-    {
-        if (completed.empty())
-            return std::nullopt;
-        auto completion = std::move(completed.front());
-        completed.pop_front();
-        return completion;
-    }
-    // Completes the oldest operation: a load as a confirmed missing row or the given accepted card, a write as
-    // committed with its exact readback.
-    void Complete(std::string const& accepted = {})
-    {
-        auto operation = std::move(submitted.front());
-        submitted.pop_front();
-        OllamaPersona::StoreCompletion completion{operation.botGuid, operation.id, OllamaPersona::LookupStatus::Missing,
-                                                  std::nullopt, false};
-        if (operation.write)
-        {
-            completion.lookup = OllamaPersona::LookupStatus::Found;
-            completion.row = operation.write->next;
-            completion.committed = true;
-        }
-        else if (!accepted.empty())
-        {
-            OllamaPersona::State row;
-            row.botGuid = operation.botGuid;
-            row.revision = 1;
-            row.accepted = OllamaPersona::Card{OllamaPersona::Source::Manual, accepted};
-            completion.lookup = OllamaPersona::LookupStatus::Found;
-            completion.row = std::move(row);
-        }
-        completed.push_back(std::move(completion));
-        OllamaPersona::WorldStore().Pump(std::chrono::steady_clock::now());
-    }
-} cardPort;
-
-void CardFixture()
-{
-    while (!cardPort.submitted.empty())
-        cardPort.Complete();
-    AdapterFixture();
-    cardFactsCalls = 0;
-    // J5e: a same-state Configure keeps loaded rows, so the fixture switches off first to start empty.
-    OllamaPersona::WorldStore().Configure(false);
-    OllamaPersona::WorldStore().Configure(true);
-    Check(OllamaPersona::WorldStore().SetPort(&cardPort), "card: store port attached");
-}
-
-// The controlling human whispers the bot (DS.12: any speaker and channel reads the card).
-bool CardSubmit(std::string const& text)
-{
-    return BridgeSubmit(&players[0], &players[1], SRC_WHISPER_LOCAL, text, true, "whisper-22", 0);
-}
-
-bool CardDeliver()
-{
-    auto done = Finish();
-    bool const prepared = PrepareBridge(done);
-    DeliverBridge(done, {});
-    return prepared;
-}
-
-// J14c (DS.8): a card going from empty or loading to ready keeps the binding and its in-flight reply (Refresh and
-// Observe); Submit compares strictly and renews the binding with the card, keeping its one-exchange memory. A ready
-// card that changes under the same voice is churn: the binding is erased and counted. J14d: Submit keeps a tolerated
-// binding while the new card is not ready either or while one of its replies is in flight.
 // J5f (DS.14 (d)): the bot state is read on world for every request, outside the capture. Two messages whose
 // state differs only in health keep the same binding (BridgeSame, no renewal) and each request carries its own
-// reading; a refresh reads no state; no state value reaches the binding signature, system prompt or persona.
+// reading; a refresh reads no state; no state value reaches the binding.
 void StateTests()
 {
     AdapterFixture();
@@ -1338,250 +1276,122 @@ void StateTests()
     Check(stateFactsCalls == 1 && g_bridgeBindings.size() == 1, "state: a refresh reads no state");
     Check(AdapterSubmit(SRC_PARTY_LOCAL, "Where are you?"), "state: second message admitted");
     auto const second = g_queue.back().request.bridgeTicket;
-    Check(stateFactsCalls == 2 && first.request.input.state.present && second.request.input.state.present &&
-              first.request.input.state.healthPct == 90.0f && second.request.input.state.healthPct == 80.0f,
+    Check(stateFactsCalls == 2 && first.request.input.state && second.request.input.state &&
+              first.request.input.state->healthPct == 90.0f && second.request.input.state->healthPct == 80.0f,
           "state: each request carries its own fresh reading");
     Check(second.scope == first.scope && g_bridgeBindings.size() == 1,
           "state: a health-only difference stays BridgeSame (no renewal)");
     auto const leaks = [](std::string const& text) { return text.find("MARKERZONE") != std::string::npos; };
-    Check(!leaks(g_bridgeBindings[0].view.signature) && !leaks(g_bridgeBindings[0].view.context.systemPrompt) &&
-              !leaks(g_bridgeBindings[0].view.context.persona) && !leaks(second.request.input.systemPrompt) &&
-              !leaks(second.request.input.persona) && g_bridgeBindings[0].view.context.state.zone.empty(),
-          "state: no state value in the binding, signature, system prompt or persona");
-    auto const marked = [](std::string const& text)
-    { return text.find("MARKERFACT") != std::string::npos || text.find("MARKERTRAIT") != std::string::npos; };
+    Check(!g_bridgeBindings[0].view.context.state || !leaks(g_bridgeBindings[0].view.context.state->zone),
+          "state: no state value in the binding");
     Check(factsCalls == 2 && first.request.input.facts && second.request.input.facts &&
               second.request.input.facts->phrase == "MARKERFACT" && second.request.input.traits.words.size() == 1,
           "facts: each request reads the facts and traits at submit");
-    Check(!g_bridgeBindings[0].view.context.facts && g_bridgeBindings[0].view.context.traits.words.empty() &&
-              !marked(g_bridgeBindings[0].view.signature) && !marked(g_bridgeBindings[0].view.context.persona) &&
-              !marked(second.request.input.systemPrompt) && !marked(second.request.input.persona),
-          "facts: no fact or trait in the binding, signature, system prompt or persona");
+    Check(!g_bridgeBindings[0].view.context.facts && g_bridgeBindings[0].view.context.traits.words.empty(),
+          "facts: no fact or trait in the binding");
     g_queue.clear();
 }
 
-void CardTests()
+// LCB3c: a binding is its scope and audience. For 100 world ticks the facts and traits of every request, the bot's
+// place and phase, its master, its group's leader and members and the partner's distance change while the partner
+// and the audience of a whisper stay: one binding, one scope, its memory kept, and the refresh captured only on the
+// ticks whose heartbeat had lapsed (every tenth). Another listener on a party line then ends its binding once.
+void BindingTests()
 {
-    using namespace OllamaBridge;
-    auto const persona = [] { return g_queue.back().request.bridgeTicket.request.input.persona; };
-
-    // A: empty -> loading -> missing across refreshes; the first reply is delivered and remembered.
-    CardFixture();
-    Check(CardSubmit("First words."), "card A: first message admitted");
-    auto const first = g_queue.front().request.bridgeTicket;
-    Check(!first.request.input.card.offered && first.request.input.persona == voice && cardPort.submitted.size() == 1,
-          "card A: the first message rides on the voice and requests one load");
-    OllamaChat_BridgeRefresh();
-    Check(g_bridgeBindings.size() == 1 && g_bridgeBindings[0].view.card.status == OllamaPersona::CardStatus::Unready &&
-              g_bridgeWorld.Current(first, Now()),
-          "card A: empty -> loading keeps the binding and its request");
-    cardPort.Complete();
-    OllamaChat_BridgeRefresh();
-    Check(g_bridgeBindings.size() == 1 && g_bridgeWorld.Current(first, Now()),
-          "card A: loading -> missing keeps the binding and its request");
-    Check(CardDeliver() && routeCalls == 1 && g_bridgeBindings.size() == 1, "card A: the first reply is delivered");
-    Check(g_bridgeBindings[0].memory.find("First words.") != std::string::npos, "card A: first exchange remembered");
-
-    // B: strict Submit renews the binding once, offers the now-known card and keeps the exchange memory.
-    auto const churn = g_bridgeCardChurn;
-    Check(CardSubmit("Second words."), "card B: next message admitted");
-    auto const second = g_queue.back().request.bridgeTicket;
-    Check(!(second.scope == first.scope) && second.scope.personaRevision != first.scope.personaRevision &&
-              !g_bridgeWorld.Current(first, Now()) && g_bridgeBindings.size() == 1,
-          "card B: strict submit renews the binding and its persona revision");
-    Check(second.request.input.card.offered && second.request.input.card.stamp && !second.request.input.card.revision &&
-              !second.request.input.card.accepted && second.request.input.persona == voice,
-          "card B: the renewal offers the missing card");
-    Check(second.request.input.card.facts.race == "Dwarf" && second.request.input.card.facts.level == 42 &&
-              cardFactsCalls == 1,
-          "card B: the offer carries the bot's facts, gathered once on world");
-    Check(second.request.input.memory.find("First words.") != std::string::npos,
-          "card B: the renewal keeps the one-exchange memory");
-    Check(g_bridgeCardChurn == churn, "card B: a renewal from an empty card is not churn");
-    Check(CardSubmit("Third words.") && g_queue.back().request.bridgeTicket.scope == second.scope,
-          "card B: an unchanged ready card keeps the renewed binding");
-
-    // C: a ready card that changes (a committed proposal) erases the binding and counts churn.
-    Check(OllamaPersona::ProposeCard(OllamaPersona::WorldStore(), g_bridgeWorld.Generation(), players[0].guid, "codex",
-                                     0, second.request.input.card.stamp,
-                                     "A careful hunter.") == OllamaPersona::ProposalStatus::Queued,
-          "card C: the generated card is staged for direct application");
-    OllamaChat_BridgeRefresh();
-    Check(g_bridgeBindings.empty() && g_bridgeCardChurn == churn + 1 && !g_bridgeWorld.Current(second, Now()),
-          "card C: a changed ready card erases the binding and counts churn");
-    g_queue.clear();
-    cardPort.Complete();
-    Check(CardSubmit("Fourth words.") && g_queue.back().request.bridgeTicket.request.input.card.revision == 1 &&
-              g_queue.back().request.bridgeTicket.request.input.memory.empty(),
-          "card C: after churn a fresh binding starts without memory");
-    g_queue.clear();
-
-    // D: Observe alone (no refresh between) tolerates a card that became accepted; the renewal carries the card.
-    CardFixture();
-    Check(CardSubmit("Hello."), "card D: first message admitted");
-    cardPort.Complete("A careful hunter.");
-    Check(CardDeliver() && routeCalls == 1 && g_bridgeBindings.size() == 1,
-          "card D: observe tolerates empty -> accepted, the reply is delivered");
-    Check(CardSubmit("Again.") && persona() == voice + "\n\n" + "A careful hunter." &&
-              g_queue.back().request.bridgeTicket.request.input.card.accepted &&
-              g_queue.back().request.bridgeTicket.request.input.card.revision == 1 &&
-              g_queue.back().request.bridgeTicket.request.input.card.facts.race.empty() && !cardFactsCalls,
-          "card D: the renewal carries the accepted card and no facts");
-    g_queue.clear();
-
-    // E: a message while the card loads keeps the not-ready binding and its revision (J14d: the renewal would bring
-    // no card); that binding tolerates loading -> ready and the next message renews it.
-    CardFixture();
-    Check(CardSubmit("One."), "card E: first message admitted");
-    auto const one = g_queue.front().request.bridgeTicket;
-    Check(CardDeliver() && routeCalls == 1 && !g_bridgeWorld.PendingFor(one.scope, Now()),
-          "card E: the first reply is delivered while the card loads");
-    Check(CardSubmit("Two."), "card E: message while loading admitted");
-    auto const loading = g_queue.back().request.bridgeTicket;
-    Check(g_bridgeBindings.size() == 1 && loading.scope == one.scope &&
-              g_bridgeBindings[0].view.card.status == OllamaPersona::CardStatus::Unready &&
-              !loading.request.input.card.offered,
-          "card E: a loading card keeps the binding and its revision");
-    cardPort.Complete();
-    OllamaChat_BridgeRefresh();
-    Check(g_bridgeBindings.size() == 1 && g_bridgeWorld.Current(loading, Now()) && CardDeliver() && routeCalls == 2,
-          "card E: loading -> missing keeps the request and delivers its reply");
-    Check(CardSubmit("Three.") && !(g_queue.back().request.bridgeTicket.scope == one.scope) &&
-              g_queue.back().request.bridgeTicket.request.input.card.offered &&
-              g_queue.back().request.bridgeTicket.request.input.memory.find("Two.") != std::string::npos,
-          "card E: the next message renews with the card and the exchange memory");
-    g_queue.clear();
-
-    // G (J14d): a quick second line on a first meeting, after the card loaded but before reply 1 arrived, keeps the
-    // tolerated binding while reply 1 is in flight. Both replies are delivered in order on the same voice-only view;
-    // the next message renews with the card and the latest exchange.
-    CardFixture();
-    Check(CardSubmit("Hi."), "card G: first message admitted");
-    auto const hi = g_queue.front().request.bridgeTicket;
-    cardPort.Complete();
-    OllamaChat_BridgeRefresh();
-    Check(CardSubmit("How are you?"), "card G: second line admitted while reply 1 is in flight");
-    auto const how = g_queue.back().request.bridgeTicket;
-    Check(g_queue.size() == 2 && how.scope == hi.scope && g_bridgeWorld.Current(hi, Now()) &&
-              g_bridgeWorld.Current(how, Now()) && g_bridgeBindings.size() == 1,
-          "card G: the in-flight reply keeps the binding and its ticket");
-    Check(!how.request.input.card.offered && how.request.input.persona == voice && how.request.input.memory.empty(),
-          "card G: the second line rides on the same voice-only view");
-    Check(CardDeliver() && routeCalls == 1 && g_bridgeBindings.size() == 1 &&
-              g_bridgeBindings[0].memory.find("Hi.") != std::string::npos,
-          "card G: reply 1 is delivered first");
-    Check(CardDeliver() && routeCalls == 2 && g_bridgeBindings.size() == 1 &&
-              g_bridgeBindings[0].memory.find("How are you?") != std::string::npos,
-          "card G: reply 2 is delivered next");
-    Check(CardSubmit("Glad to hear."), "card G: next message admitted");
-    auto const glad = g_queue.back().request.bridgeTicket;
-    Check(!(glad.scope == hi.scope) && glad.scope.personaRevision != hi.scope.personaRevision &&
-              glad.request.input.card.offered && glad.request.input.persona == voice &&
-              glad.request.input.memory.find("How are you?") != std::string::npos && g_bridgeCardChurn == churn + 1,
-          "card G: the next message renews with the card and the latest exchange");
-    g_queue.clear();
-
-    // F: the tolerance covers card fields only; a voice or audience change still erases a not-ready binding.
-    for (unsigned change = 0; change < 2; ++change)
-    {
-        CardFixture();
-        Check(CardSubmit("Hi."), "card F: first message admitted");
-        cardPort.Complete();
-        if (change == 0)
-            voice += " Revised.";
-        else
-            players[1].name = "Renamed";  // DS.14: a whisper partner's sight is no audience change, a name is.
-        OllamaChat_BridgeRefresh();
-        Check(g_bridgeBindings.empty() && g_bridgeCardChurn == churn + 1,
-              "card F: a non-card change erases a not-ready binding and is not churn");
-        g_queue.clear();
-    }
-
-    // H (J14e, DS.12): a bot without a card is offered at most MaxCardOffers times per bridge generation.
-    CardFixture();
-    Check(CardSubmit("Morning."), "card H: first message admitted");
-    cardPort.Complete();
-    OllamaChat_BridgeRefresh();
-    Check(CardDeliver(), "card H: the first reply is delivered");
-    unsigned offers = 0;
-    for (unsigned i = 0; i < OllamaPersona::MaxCardOffers + 2; ++i)
-    {
-        Check(CardSubmit("Still there? " + std::to_string(i)), "card H: message admitted");
-        auto const card = g_queue.back().request.bridgeTicket.request.input.card;
-        if (card.offered)
-            ++offers;
-        Check(card.offered ? !card.accepted && card.facts.race == "Dwarf" : card.facts.race.empty(),
-              "card H: an offer carries the facts, no offer carries none");
-        Check(CardDeliver(), "card H: reply delivered");
-    }
-    Check(offers == OllamaPersona::MaxCardOffers && cardFactsCalls == OllamaPersona::MaxCardOffers,
-          "card H: three offers per bot and generation, facts gathered only for an offer");
-    g_queue.clear();
-
-    // I (J14e notes): a submit the dispatcher refuses sent no offer and does not use up the bot's offers.
-    CardFixture();
-    Check(CardSubmit("Morning."), "card I: first message admitted");
-    cardPort.Complete();
-    OllamaChat_BridgeRefresh();
-    Check(CardDeliver(), "card I: the first reply is delivered");
-    {
-        std::vector<OllamaBridge::DispatchSlot> held;
-        while (auto slot = OllamaBridge::DispatchSlot::Acquire())
-            held.push_back(std::move(slot));
-        for (int i = 0; i < 5; ++i)
-            Check(!CardSubmit("Refused " + std::to_string(i)), "card I: a full dispatcher refuses");
-    }
-    unsigned countedOffers = 0;
-    for (unsigned i = 0; i < OllamaPersona::MaxCardOffers + 2; ++i)
-    {
-        Check(CardSubmit("Back again " + std::to_string(i)), "card I: message admitted");
-        if (g_queue.back().request.bridgeTicket.request.input.card.offered)
-            ++countedOffers;
-        Check(CardDeliver(), "card I: reply delivered");
-    }
-    Check(countedOffers == OllamaPersona::MaxCardOffers,
-          "card I: refused submits did not use up the three offers per bot and generation");
-    g_queue.clear();
-
-    // J6d -> J14e: a stranger's whisper reads the bot's own card too (DS.12: the player never sees it).
-    CardFixture();
+    AdapterFixture();
     gameAI.master = nullptr;
-    players[0].group = nullptr;
-    Check(CardSubmit("Who are you?") && cardPort.submitted.size() == 1,
-          "card J14e: a stranger's whisper requests the bot's card");
+    Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Remember me."), "binding: whisper admitted");
+    auto const firstTraits = g_queue.back().request.bridgeTicket.request.input.traits.words;
+    Completion done = Finish();
+    Check(PrepareBridge(done), "binding: whisper prepared");
+    DeliverBridge(done, {});
+    Check(g_bridgeBindings.size() == 1 && !g_bridgeBindings[0].memory.empty(), "binding: the exchange is remembered");
+    auto const scope = g_bridgeBindings[0].view.guard.scope;
+    std::vector<std::string> lastTraits;
+    unsigned captures = 0;
+    bool offBeat = false;
+    for (unsigned tick = 1; tick <= 100; ++tick)
+    {
+        factsTick = tick;
+        players[0].map = players[2].map = tick;
+        players[0].phase = players[2].phase = 1u << (tick % 4);
+        players[2].distance = 30.0f * static_cast<float>(tick);
+        gameAI.master = tick % 3 == 0 ? &players[2] : tick % 3 == 1 ? &players[1] : nullptr;
+        party.leader = tick % 2 ? 22 : 33;
+        if (tick == 30)
+            party.members.push_back({ObjectGuid(44)});
+        if (tick == 60)
+            party.members.pop_back();
+        bool const due = tick % 10 == 0;
+        if (due)
+            g_bridgeBindings[0].heartbeat.steadyMs = 1;
+        unsigned const before = findCalls;
+        OllamaChat_BridgeRefresh();
+        if (findCalls != before)
+            ++captures;
+        offBeat = offBeat || (findCalls != before && !due);
+        if (tick % 25 == 0)
+        {
+            Check(AdapterSubmit(SRC_WHISPER_LOCAL, "Still there?"), "binding: a later line admitted");
+            lastTraits = g_queue.back().request.bridgeTicket.request.input.traits.words;
+            done = Finish();
+            Check(PrepareBridge(done), "binding: a later line prepared");
+            DeliverBridge(done, {});
+        }
+        Check(g_bridgeBindings.size() == 1 && g_bridgeBindings[0].view.guard.scope == scope,
+              "binding: the binding survives facts, traits, place, master and group changes");
+    }
+    factsTick = 0;
+    Check(captures == 10 && !offBeat, "binding: the refresh captured once per lapsed heartbeat, never between");
+    Check(!g_bridgeBindings[0].memory.empty() && !lastTraits.empty() && lastTraits != firstTraits,
+          "binding: the memory survives while each request carried its own traits");
+    Check(g_bridgeBindings[0].view.guard.mapId == 100, "binding: a kept binding holds the fresh capture");
     g_queue.clear();
+    done = {};
 
-    while (!cardPort.submitted.empty())
-        cardPort.Complete();
-    OllamaPersona::WorldStore().Configure(false);
-    Check(OllamaPersona::WorldStore().SetPort(nullptr), "card: store port detached");
-    Reset();
+    AdapterFixture();
+    Check(AdapterSubmit(), "binding: party line admitted");
+    g_queue.clear();
+    auto const partyScope = g_bridgeBindings[0].view.guard.scope;
+    party.members.push_back({ObjectGuid(44)});  // players[3] joins the party: another listener.
+    unsigned erased = 0;
+    for (unsigned tick = 1; tick <= 20; ++tick)
+    {
+        bool const had = !g_bridgeBindings.empty();
+        if (had && tick % 10 == 0)
+            g_bridgeBindings[0].heartbeat.steadyMs = 1;
+        OllamaChat_BridgeRefresh();
+        erased += had && g_bridgeBindings.empty();
+    }
+    Check(erased == 1, "binding: another listener ends the party binding exactly once");
+    Check(AdapterSubmit() && !(g_bridgeBindings[0].view.guard.scope == partyScope) &&
+              g_bridgeBindings[0].view.guard.audience.size() == 4,
+          "binding: the new audience opens a new binding");
+    g_queue.clear();
 }
 
 // J6e-c (DS.14 (c)): one act on a route as the bridge sends it; the act's result.
 nlohmann::json WakeAct(OllamaBridge::WorldTicket const& ticket, std::string const& id)
 {
-    static OllamaBridge::EffectPhase const phase{};
     executorResult = OllamaBridge::EffectResult::Applied;
-    nlohmann::json const act = {{"version", 1},
-                                {"instance", ticket.scope.instance},
-                                {"provider", ticket.scope.provider},
-                                {"epoch", ticket.scope.epoch},
-                                {"requestId", ticket.request.requestId},
-                                {"deadlineUnixMs", ticket.request.deadline.unixMs},
-                                {"type", "command"},
-                                {"commandId", id},
-                                {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
-                                {"botGuid", std::to_string(ticket.scope.botGuid)},
-                                {"intent", "attack_own_target"},
-                                {"params", nlohmann::json::object()}};
-    uint64_t receipt = 0;
-    Check(g_bridgeChannel.Receive(config.bridge.token, ticket.request.requestId, act.dump(), receipt) ==
-              OllamaBridge::ChannelError::None,
+    nlohmann::json const act = {
+        {"version", 1},
+        {"instance", ticket.scope.instance},
+        {"provider", ticket.scope.provider},
+        {"epoch", ticket.scope.epoch},
+        {"requestId", ticket.request.requestId},
+        {"deadlineUnixMs", ticket.request.deadline.unixMs},
+        {"type", "command"},
+        {"commandId", id},
+        {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
+        {"botGuid", std::to_string(ticket.scope.botGuid)},
+        {"steps", nlohmann::json::array({{{"act", "follow"}, {"params", nlohmann::json::object()}}})}};
+    auto const receipt = std::make_shared<OllamaBridge::ChannelAnswer>();
+    Check(g_bridgeChannel.Receive(ticket.request.requestId, act.dump(), receipt) == OllamaBridge::ChannelError::None,
           "wake: the act was received on the wake route");
-    Check(g_bridgeChannel.Update(&phase) == 1, "wake: one world tick takes the act");
+    OllamaBotRandomChatter::Tick();  // One world tick takes the act.
     std::unique_ptr<OllamaBridge::ChannelPacket> packet;
-    Check(g_bridgeChannel.Take(config.bridge.token, receipt, packet) == OllamaBridge::ChannelError::None && packet &&
+    Check(receipt->Wait(std::chrono::steady_clock::now(), packet) && packet &&
               packet->error == OllamaBridge::ChannelError::None,
           "wake: the act's result is published");
     executorResult = OllamaBridge::EffectResult::Rejected;
@@ -1630,7 +1440,7 @@ void WakeTests()
           "wake: the fixed in-world sentence and the watch's condition and id");
     Check(!input.directAddress && !wakeAddressed, "wake: never addressed, so a failure stays silent");
     Check(input.wakeDepth == 2 && input.originUnixMs == watch.originUnixMs, "wake: the chain's depth and origin");
-    Check(stateFactsCalls == 2 && input.state.present, "wake: the bot's state is read again for the wake");
+    Check(stateFactsCalls == 2 && input.state, "wake: the bot's state is read again for the wake");
     Check(input.facts && input.facts->phrase == "MARKERFACT", "wake: the facts are read for the wake too");
     Check(wakeScopeKey == "wake-scope" && wake.scope.botGuid == 77 && wake.scope.controllerGuid == players[2].guid &&
               wake.scope.contextId == line.scope.contextId,
@@ -1659,7 +1469,7 @@ void WakeTests()
     Check(!OllamaChat_BridgeWake(watch) && g_queue.size() == queued, "wake: the partner gone, nothing opens");
     players[2].online = true;
 
-    Check(BridgeSubmit(&players[0], &players[2], SRC_SAY_LOCAL, "Bot, wait for me.", true, "say-key", 0),
+    Check(BridgeSubmit(&players[0], &players[2], SRC_SAY_LOCAL, "Bot, wait for me.", true, "say-key"),
           "wake: an addressed say line admitted");
     auto sayWatch = watch;
     sayWatch.id = "watch-say";
@@ -1807,12 +1617,12 @@ int main()
         SplitTests();
         DrainTest();
         AdapterTests();
-        CardTests();
         StateTests();
+        BindingTests();
         g_queue.clear();
         g_done.clear();
         Check(!OllamaBridge::DispatchSlot::Used(), "final no leaked slots");
-        std::cout << checks << " dispatch bridge checks passed (extracted helpers; game/API stubs)\n";
+        std::cout << checks << " dispatch bridge checks passed (production dispatcher and adapter; game/API doubles)\n";
         return 0;
     }
     catch (std::exception const& error)

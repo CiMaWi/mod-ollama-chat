@@ -1,7 +1,6 @@
 #include "mod-ollama-chat_bridge_channel.h"
 
 #include <algorithm>
-#include <charconv>
 #include <limits>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -10,30 +9,13 @@
 #include <tuple>
 #include <utility>
 
+#include "mod-ollama-chat_bridge_json.h"
+
 namespace OllamaBridge
 {
 namespace
 {
 using Json = nlohmann::json;
-constexpr int64_t MaxSafeInteger = 9007199254740991LL;
-constexpr int64_t ScopeLifetimeMs = 5000;
-
-bool Identifier(std::string const& value)
-{
-    auto alnum = [](unsigned char c)
-    { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); };
-    return !value.empty() && value.size() <= 128 && alnum(value.front()) &&
-           std::all_of(value.begin(), value.end(),
-                       [&](unsigned char c) { return alnum(c) || c == '_' || c == '.' || c == ':' || c == '-'; });
-}
-
-bool SameScope(WorldScope const& a, WorldScope const& b)
-{
-    return std::tie(a.version, a.instance, a.provider, a.epoch, a.botGuid, a.controllerGuid, a.contextId, a.channel,
-                    a.perceptionScope, a.contextRevision, a.membershipRevision, a.personaRevision) ==
-           std::tie(b.version, b.instance, b.provider, b.epoch, b.botGuid, b.controllerGuid, b.contextId, b.channel,
-                    b.perceptionScope, b.contextRevision, b.membershipRevision, b.personaRevision);
-}
 
 bool ValidDeadline(Deadline deadline, Clock now)
 {
@@ -47,59 +29,12 @@ bool Alive(Deadline deadline, Clock now)
     return now.unixMs >= 0 && now.steadyMs >= 0 && now.unixMs < deadline.unixMs && now.steadyMs < deadline.steadyMs;
 }
 
-bool Exact(Json const& value, std::initializer_list<char const*> fields)
-{
-    return value.is_object() && value.size() == fields.size() &&
-           std::all_of(fields.begin(), fields.end(), [&](char const* field) { return value.contains(field); });
-}
-
-std::string String(Json const& value)
-{
-    if (!value.is_string())
-        throw std::runtime_error("invalid");
-    return value.get<std::string>();
-}
-
-uint64_t Guid(Json const& value)
-{
-    auto const text = String(value);
-    if (text.empty() || text.size() > 20 || (text.size() > 1 && text.front() == '0'))
-        throw std::runtime_error("invalid");
-    uint64_t result = 0;
-    for (unsigned char c : text)
-    {
-        if (c < '0' || c > '9' || result > (std::numeric_limits<uint64_t>::max() - (c - '0')) / 10)
-            throw std::runtime_error("invalid");
-        result = result * 10 + c - '0';
-    }
-    if (!result)
-        throw std::runtime_error("invalid");
-    return result;
-}
-
-uint64_t Integer(Json const& value, uint64_t max)
-{
-    if (!value.is_number_integer() || (value.is_number_integer() && !value.is_number_unsigned() && value < 0))
-        throw std::runtime_error("invalid");
-    uint64_t const result = value.get<uint64_t>();
-    if (result > max)
-        throw std::runtime_error("invalid");
-    return result;
-}
-
-bool Text(std::string const& text, std::size_t max)
-{
-    return !text.empty() && text.size() <= max && text.find('\0') == std::string::npos &&
-           std::any_of(text.begin(), text.end(), [](unsigned char c) { return c > ' '; });
-}
-
 // WT18b: a place name (route query, go_to, meet_at): text of 1..64 bytes, not blank, no control characters (the
 // parser already refused invalid UTF-8). It is a value the planner looks up, never command syntax.
 std::string Place(Json const& value)
 {
     auto const text = String(value);
-    if (!Text(text, ChannelMaxPlaceName) ||
-        std::any_of(text.begin(), text.end(), [](unsigned char c) { return c < 0x20 || c == 0x7F; }))
+    if (!UsableName(text, ChannelMaxPlaceName))
         throw std::runtime_error("invalid");
     return text;
 }
@@ -117,12 +52,6 @@ InstalledAbilities& Installed()
     return installed;
 }
 
-// J5e: a standing follow/stay shape (any params) is refused with its own reason, still invalid_input on the wire.
-struct StandingShape : std::runtime_error
-{
-    StandingShape() : std::runtime_error("standing") {}
-};
-
 // LC3: a choice parameter's value, one of the act's choice words, as its index.
 uint8_t Choice(Json const& value, AbilityParam const& param)
 {
@@ -133,31 +62,11 @@ uint8_t Choice(Json const& value, AbilityParam const& param)
     return static_cast<uint8_t>(found - param.choices.begin());
 }
 
-// LC3: a position's spot "x,y,z,map": three finite decimal numbers and a map id, comma-separated, nothing else.
-ChannelPosition Spot(Json const& value)
-{
-    auto const text = Place(value);
-    ChannelPosition spot;
-    char const* at = text.data();
-    char const* const end = text.data() + text.size();
-    for (double* coordinate : {&spot.x, &spot.y, &spot.z})
-    {
-        auto const [next, error] = std::from_chars(at, end, *coordinate);
-        if (error != std::errc() || next == end || *next != ',' || !std::isfinite(*coordinate))
-            throw std::runtime_error("invalid");
-        at = next + 1;
-    }
-    auto const [next, error] = std::from_chars(at, end, spot.mapId);
-    if (error != std::errc() || next != end)
-        throw std::runtime_error("invalid");
-    return spot;
-}
-
 // LC3: the steps of a stepped command, 1..maxSteps acts of the installed catalogue. Each is {act, params} with exactly
 // the act's parameters by their catalogue names: a unit as `name` (its name) or `nameGuid`, a quest as `name` (its
 // title) or `nameId`, exactly one of the two; names and places have Place's text rules. LC16c: an item or a spell as
-// its name (Place's rules), a choice as one of its words, a count 1..ChannelMaxCount. A topic, a verb without a row
-// and an unknown word are no act; an act the old form lacks is a row like any other.
+// its name (Place's rules), a choice as one of its words, a count 1..ChannelMaxCount. A topic and an unknown word are
+// no act.
 std::vector<ChannelStep> Steps(Json const& value)
 {
     auto const& index = Installed().index;
@@ -175,7 +84,7 @@ std::vector<ChannelStep> Steps(Json const& value)
             throw std::runtime_error("invalid");
         auto const& params = entry.at("params");
         ChannelStep step;
-        step.intent = static_cast<ChannelIntent>(row->code);
+        step.intent = static_cast<PlayerbotBridge::Intent>(row->code);
         for (auto const& param : row->params)
         {
             std::string const id = param.field == AbilityField::Target    ? param.name + "Guid"
@@ -201,9 +110,6 @@ std::vector<ChannelStep> Steps(Json const& value)
                     break;
                 case AbilityField::PlaceName:
                     step.place = Place(given);
-                    break;
-                case AbilityField::Position:
-                    step.position = Spot(given);
                     break;
                 case AbilityField::Icon:
                     step.icon = Choice(given, param);
@@ -240,133 +146,18 @@ std::vector<ChannelStep> Steps(Json const& value)
 
 ChannelCommand Command(Json const& body)
 {
-    // LC3: a stepped command carries `steps` in place of `intent` and `params`; both forms at once is neither.
-    bool const stepped = body.contains("steps");
-    if (stepped ? !Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
-                                "commandId", "issuerGuid", "botGuid", "steps"})
-                : !Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
-                                "commandId", "issuerGuid", "botGuid", "intent", "params"}))
+    // LCB2: one command form, its acts as `steps`; a body with any other key (the old `intent` and `params`) is
+    // invalid.
+    if (!Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type", "commandId",
+                      "issuerGuid", "botGuid", "steps"}))
         throw std::runtime_error("invalid");
     ChannelCommand command;
     command.commandId = String(body.at("commandId"));
     command.issuerGuid = Guid(body.at("issuerGuid"));
     command.botGuid = Guid(body.at("botGuid"));
-    if (!Identifier(command.commandId))
+    if (!ValidIdentifier(command.commandId))
         throw std::runtime_error("invalid");
-    if (stepped)
-    {
-        command.steps = Steps(body.at("steps"));
-        return command;
-    }
-    auto const intent = String(body.at("intent"));
-    auto const& params = body.at("params");
-    // LC3: the verbs are playerbots' (the installed index), the acts' and the four without a row (refused later).
-    auto const& verbs = Installed().index.verbs;
-    auto const found =
-        std::find_if(verbs.begin(), verbs.end(), [&](AbilityVerb const& verb) { return intent == verb.name; });
-    if (found == verbs.end())
-        throw std::runtime_error("invalid");
-    command.intent = found->intent;
-    switch (command.intent)
-    {
-        case ChannelIntent::Follow:
-        case ChannelIntent::Stay:
-            // J5e: params with keys (a standing or timed shape) name their reason; any other shape stays invalid.
-            if (!Exact(params, {}))
-            {
-                if (params.is_object())
-                    throw StandingShape();
-                throw std::runtime_error("invalid");
-            }
-            break;
-        case ChannelIntent::Flee:
-        case ChannelIntent::Regroup:
-        case ChannelIntent::AttackOwnTarget:
-        case ChannelIntent::Errands:
-        case ChannelIntent::SetHearth:
-        case ChannelIntent::GrindHere:
-        case ChannelIntent::GatherHere:
-        case ChannelIntent::PausePlan:
-        case ChannelIntent::ResumePlan:
-            if (!Exact(params, {}))
-                throw std::runtime_error("invalid");
-            break;
-        case ChannelIntent::GoTo:  // WT18b: the planner looks the place up and refuses an unknown one.
-        case ChannelIntent::MeetAt:
-            if (!Exact(params, {"place"}))
-                throw std::runtime_error("invalid");
-            command.params = ChannelPlace{Place(params.at("place"))};
-            break;
-        case ChannelIntent::Quest:  // WT18b: a quest id; zero is refused by ValidIntentParams.
-            if (!Exact(params, {"questId"}))
-                throw std::runtime_error("invalid");
-            command.params = ChannelQuestId{static_cast<uint32_t>(Integer(params.at("questId"), UINT32_MAX))};
-            break;
-        case ChannelIntent::Pull:
-        case ChannelIntent::FocusHealing:
-            if (!Exact(params, {"targetGuid"}))
-                throw std::runtime_error("invalid");
-            command.params = ChannelTarget{Guid(params.at("targetGuid"))};
-            break;
-        case ChannelIntent::Mark:
-            if (!Exact(params, {"targetGuid", "icon"}))
-                throw std::runtime_error("invalid");
-            command.params =
-                ChannelMark{Guid(params.at("targetGuid")), static_cast<uint8_t>(Integer(params.at("icon"), 7))};
-            break;
-        case ChannelIntent::AssignRole:
-        {
-            if (!Exact(params, {"role"}))
-                throw std::runtime_error("invalid");
-            auto const role = String(params.at("role"));
-            if (role != "tank" && role != "healer" && role != "damage")
-                throw std::runtime_error("invalid");
-            command.params = role == "tank"     ? ChannelRole::Tank
-                             : role == "healer" ? ChannelRole::Healer
-                                                : ChannelRole::Damage;
-            break;
-        }
-        case ChannelIntent::SaveMana:
-            if (!Exact(params, {"enabled"}) || !params.at("enabled").is_boolean())
-                throw std::runtime_error("invalid");
-            command.params = params.at("enabled").get<bool>();
-            break;
-        case ChannelIntent::Formation:
-        {
-            if (!Exact(params, {"shape"}))
-                throw std::runtime_error("invalid");
-            auto const shape = String(params.at("shape"));
-            if (shape != "close" && shape != "spread" && shape != "line")
-                throw std::runtime_error("invalid");
-            command.params = shape == "close"    ? ChannelShape::Close
-                             : shape == "spread" ? ChannelShape::Spread
-                                                 : ChannelShape::Line;
-            break;
-        }
-        case ChannelIntent::Position:
-        {
-            if (!Exact(params, {"x", "y", "z", "mapId"}) || !params.at("x").is_number() ||
-                !params.at("y").is_number() || !params.at("z").is_number())
-                throw std::runtime_error("invalid");
-            ChannelPosition position{params.at("x").get<double>(), params.at("y").get<double>(),
-                                     params.at("z").get<double>(),
-                                     static_cast<uint32_t>(Integer(params.at("mapId"), UINT32_MAX))};
-            command.params = position;
-            break;
-        }
-        case ChannelIntent::DungeonClear:
-        {
-            if (!Exact(params, {"mode"}))
-                throw std::runtime_error("invalid");
-            auto const mode = String(params.at("mode"));
-            if (mode != "on" && mode != "off" && mode != "pause")
-                throw std::runtime_error("invalid");
-            command.params = mode == "on" ? ChannelMode::On : mode == "off" ? ChannelMode::Off : ChannelMode::Pause;
-            break;
-        }
-    }
-    if (!ValidIntentParams(command.intent, command.params))
-        throw std::runtime_error("invalid");
+    command.steps = Steps(body.at("steps"));
     return command;
 }
 
@@ -380,41 +171,26 @@ ChannelWatch WatchMessage(Json const& body)
     watch.commandId = String(body.at("commandId"));
     watch.botGuid = Guid(body.at("botGuid"));
     watch.untilUnixMs = static_cast<int64_t>(Integer(body.at("untilUnixMs"), MaxSafeInteger));
-    if (!Identifier(watch.commandId) || !ParseWatchCondition(String(body.at("condition")), watch.condition))
+    if (!ValidIdentifier(watch.commandId) || !ParseWatchCondition(String(body.at("condition")), watch.condition))
         throw std::runtime_error("invalid");
     return watch;
 }
 
 Json EnvelopeJson(ChannelEnvelope const& envelope, char const* type)
 {
-    return {{"version", 1},
-            {"instance", envelope.instance},
-            {"provider", envelope.provider},
-            {"epoch", envelope.epoch},
-            {"requestId", envelope.requestId},
-            {"deadlineUnixMs", envelope.deadlineUnixMs},
-            {"type", type}};
+    return Envelope(envelope.instance, envelope.provider, envelope.epoch, envelope.requestId, envelope.deadlineUnixMs,
+                    type);
 }
-// J5f-b: valid UTF-8 without control characters, cut to max bytes on a character boundary; empty when unusable.
+
+// J5f-b: a topic text on the wire; empty when unusable.
+// A topic's name or sentence on one line: dropped whole when it holds a control character (stripping would join
+// its words), else as the wire sends text.
 std::string TopicText(std::string const& text, std::size_t max)
 {
     if (std::any_of(text.begin(), text.end(), [](unsigned char c) { return c < 0x20 || c == 0x7F; }))
         return {};
-    std::size_t end = std::min(max, text.size());
-    while (end > 0 && end < text.size() && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80)
-        --end;
-    std::string result = text.substr(0, end);
-    try
-    {
-        (void)Json(result).dump();  // Throws on invalid UTF-8.
-    }
-    catch (std::exception const&)
-    {
-        return {};
-    }
-    return Text(result, max) ? result : std::string();
+    return WireText(text, max).value_or(std::string());
 }
-
 // Gameplay strategies the bot can talk about; every other playerbots strategy name is dropped.
 bool StrategyAllowed(std::string const& name)
 {
@@ -504,6 +280,9 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
                  {"text", text},
                  {"value", std::clamp<int64_t>(entry.first, 0, UINT32_MAX)},
                  {"extra", std::clamp<int64_t>(entry.second, 0, UINT32_MAX)}};
+        // LC18g: a place's side word, only when the game sent one of the three (LC.23: an absent key stays absent).
+        if (entry.side == "alliance" || entry.side == "horde" || entry.side == "neutral")
+            value["side"] = entry.side;
         return true;
     }
     switch (topic)
@@ -640,36 +419,23 @@ Json CatalogueJson(AbilityIndex const& index)
 
 static_assert(ChannelMaxCatalogueBytes + 4096 < MaxCatalogueResponseBytes, "the catalogue answer's envelope fits");
 
-// Every ChannelIntent one verb of its own; every row a word of its own. LC16c: an act's code is its playerbots Intent
-// value, one act each: one below the 22 is its verb (the same word), one past them no verb's word, and each parameter
+// Every row a word of its own. LC16c: an act's code is its playerbots Intent value, one act each, and each parameter
 // fills a field the channel knows. A topic's code is its BotStateTopic value, one topic each, with at most one
 // parameter (its argument).
 bool ValidIndex(AbilityIndex const& index)
 {
-    constexpr std::size_t intents = ChannelIntentCount;
-    if (!index.version || !index.maxSteps || index.rows.empty() || index.verbs.size() != intents)
+    if (!index.version || !index.maxSteps || index.rows.empty())
         return false;
-    std::set<std::string> verbs;
-    std::set<ChannelIntent> taken;
-    for (auto const& verb : index.verbs)
-        if (!Word(verb.name) || static_cast<std::size_t>(verb.intent) >= intents || !verbs.insert(verb.name).second ||
-            !taken.insert(verb.intent).second)
-            return false;
     std::set<std::string> names;
     std::set<uint8_t> acts;
     std::set<uint8_t> topics;
     for (auto const& row : index.rows)
     {
-        auto const verb = std::find_if(index.verbs.begin(), index.verbs.end(),
-                                       [&row](AbilityVerb const& entry) { return entry.name == row.name; });
-        bool const own = row.code < intents
-                             ? verb != index.verbs.end() && static_cast<uint8_t>(verb->intent) == row.code
-                             : verb == index.verbs.end();
         bool const fields = std::all_of(row.params.begin(), row.params.end(),
                                         [](AbilityParam const& param) { return param.field <= AbilityField::Count; });
         if (!Word(row.name) || !names.insert(row.name).second ||
             (row.topic ? row.params.size() > 1 || !topics.insert(row.code).second
-                       : !own || !fields || !acts.insert(row.code).second))
+                       : !fields || !acts.insert(row.code).second))
             return false;
     }
     return true;
@@ -682,7 +448,7 @@ std::size_t SetAbilityIndex(AbilityIndex index)
     installed = {};
     if (!ValidIndex(index))
         return 0;
-    // Only the catalogue query needs the encoded answer: one it cannot send leaves the verbs and topics standing.
+    // Only the catalogue query needs the encoded answer: one it cannot send leaves the acts and topics standing.
     std::size_t bytes = 0;
     Json catalogue;
     try
@@ -730,22 +496,17 @@ char const* ChannelErrorName(ChannelError error)
         case ChannelError::Duplicate:
             return "duplicate";
         case ChannelError::Capacity:
-            return "capacity";
+            return "overload";  // LC.38: a bound left for a real resource; the bridge reads the status (429).
         case ChannelError::Closed:
             return "closed";
         case ChannelError::Unknown:
             return "unknown_request";
-        case ChannelError::Standing:
-            return "invalid_input";
     }
     return "invalid_input";
 }
 
-ChannelPolicy::ChannelPolicy(std::size_t maxRouteIds, std::size_t maxPending)
-    : _validLimits(maxRouteIds > 0 && maxRouteIds <= ChannelMaxRouteIds && maxPending > 0 &&
-                   maxPending <= ChannelMaxPending),
-      _maxRouteIds(maxRouteIds),
-      _maxPending(maxPending)
+ChannelPolicy::ChannelPolicy(std::size_t maxRouteIds)
+    : _validLimits(maxRouteIds > 0 && maxRouteIds <= ChannelMaxRouteIds), _maxRouteIds(maxRouteIds)
 {
 }
 
@@ -753,43 +514,19 @@ void ChannelPolicy::Retire()
 {
     _identity = {};
     _observed = {};
-    _bearer.clear();
-    _scopes.clear();
     _requests.clear();
     _commands.clear();
 }
 
-bool ChannelPolicy::Bind(Identity identity, std::string localBearer)
+bool ChannelPolicy::Bind(Identity identity)
 {
     Retire();
-    if (!_validLimits || !Identifier(identity.instance) || !Identifier(identity.provider) ||
-        !Identifier(identity.epoch) || localBearer.size() < 16 || localBearer.size() > 256 ||
-        identity.epoch == _previous)
+    if (!_validLimits || !ValidIdentifier(identity.instance) || !ValidIdentifier(identity.provider) ||
+        !ValidIdentifier(identity.epoch) || identity.epoch == _previous)
         return false;
     _previous = identity.epoch;
     _identity = std::move(identity);
-    _bearer = std::move(localBearer);
     return true;
-}
-
-bool ChannelPolicy::Authenticated(std::string const& bearer) const
-{
-    if (_bearer.empty() || bearer.size() > 256)
-        return false;
-    std::size_t difference = _bearer.size() ^ bearer.size();
-    for (std::size_t i = 0; i < 256; ++i)
-        difference |= (i < _bearer.size() ? static_cast<unsigned char>(_bearer[i]) : 0) ^
-                      (i < bearer.size() ? static_cast<unsigned char>(bearer[i]) : 0);
-    return difference == 0;
-}
-
-void ChannelPolicy::RemoveScope(uint64_t botGuid, std::string const& contextId)
-{
-    std::erase_if(_scopes, [&](ScopeEntry const& entry)
-                  { return entry.scope.botGuid == botGuid && entry.scope.contextId == contextId; });
-    for (auto& [id, entry] : _requests)
-        if (entry.scope.botGuid == botGuid && entry.scope.contextId == contextId)
-            entry.invalid = true;
 }
 
 void ChannelPolicy::Expire(Clock now)
@@ -805,11 +542,8 @@ void ChannelPolicy::Expire(Clock now)
             if (entry.work == ChannelWork::Generation)
                 expired.push_back(id);
         }
-        else if (!ScopeCurrent(entry.scope, now))
-            entry.invalid = true;
     for (auto const& route : expired)
         Drop(route);
-    std::erase_if(_scopes, [&](ScopeEntry const& entry) { return !Alive(entry.until, now); });
 }
 
 void ChannelPolicy::Drop(std::string const& route)
@@ -824,52 +558,6 @@ void ChannelPolicy::Drop(std::string const& route)
     _requests.erase(found);
 }
 
-bool ChannelPolicy::ObserveScope(WorldScope scope, Clock now)
-{
-    _observed = {std::max(_observed.unixMs, now.unixMs), std::max(_observed.steadyMs, now.steadyMs)};
-    // Heartbeats run on the world tick. Scan only the bounded scopes, not every retained replay reservation.
-    // A genuine observation gap still permanently invalidates work before a matching scope can be refreshed.
-    for (std::size_t i = 0; i < _scopes.size();)
-        if (!Alive(_scopes[i].until, now) || !Alive(_scopes[i].until, _observed))
-        {
-            auto const expired = _scopes[i].scope;
-            RemoveScope(expired.botGuid, expired.contextId);
-        }
-        else
-            ++i;
-    if (_bearer.empty() || scope.version != 1 || scope.instance != _identity.instance ||
-        scope.provider != _identity.provider || scope.epoch != _identity.epoch || !scope.botGuid ||
-        !scope.controllerGuid || !Identifier(scope.contextId) || !Identifier(scope.perceptionScope) ||
-        !Identifier(scope.contextRevision) || !Identifier(scope.membershipRevision) ||
-        !Identifier(scope.personaRevision) || (scope.channel != "direct" && scope.channel != "party") ||
-        now.unixMs < 0 || now.unixMs > MaxSafeInteger - ScopeLifetimeMs || now.steadyMs < 0 ||
-        now.steadyMs > std::numeric_limits<int64_t>::max() - ScopeLifetimeMs)
-        return false;
-    auto found =
-        std::find_if(_scopes.begin(), _scopes.end(), [&](ScopeEntry const& entry)
-                     { return entry.scope.botGuid == scope.botGuid && entry.scope.contextId == scope.contextId; });
-    Deadline const until{now.unixMs + ScopeLifetimeMs, now.steadyMs + ScopeLifetimeMs};
-    if (found != _scopes.end() && SameScope(found->scope, scope))
-    {
-        found->until = until;
-        return true;
-    }
-    if (found != _scopes.end())
-        RemoveScope(scope.botGuid, scope.contextId);
-    if (_scopes.size() >= ChannelMaxScopes)
-        return false;
-    _scopes.push_back({std::move(scope), until});
-    return true;
-}
-
-bool ChannelPolicy::ScopeCurrent(WorldScope const& scope, Clock now) const
-{
-    return !_bearer.empty() &&
-           std::any_of(
-               _scopes.begin(), _scopes.end(), [&](ScopeEntry const& entry)
-               { return SameScope(entry.scope, scope) && Alive(entry.until, now) && Alive(entry.until, _observed); });
-}
-
 std::size_t ChannelPolicy::Pending() const
 {
     return std::count_if(
@@ -881,9 +569,11 @@ ChannelError ChannelPolicy::Open(WorldScope const& scope, std::string requestId,
                                  Clock now, std::string const& route)
 {
     Expire(now);
-    if (!ScopeCurrent(scope, now))
+    // The scope is the trusted ticket's; whether it is still current is WorldPolicy's question (LCB6b).
+    if (_identity.epoch.empty() || scope.instance != _identity.instance || scope.provider != _identity.provider ||
+        scope.epoch != _identity.epoch || !scope.botGuid || !scope.controllerGuid)
         return ChannelError::Stale;
-    if (!Identifier(requestId) || !ValidDeadline(deadline, now))
+    if (!ValidIdentifier(requestId) || !ValidDeadline(deadline, now))
         return ChannelError::Invalid;
     if (_requests.contains(requestId))
         return ChannelError::Duplicate;
@@ -897,7 +587,7 @@ ChannelError ChannelPolicy::Open(WorldScope const& scope, std::string requestId,
     }
     if (!Alive(deadline, _observed))
         return ChannelError::Stale;
-    if (Pending() >= _maxPending || (parent && parent->queries.size() + parent->commands.size() >= _maxRouteIds))
+    if (parent && parent->queries.size() + parent->commands.size() >= _maxRouteIds)
         return ChannelError::Capacity;
     ChannelEnvelope envelope{_identity.instance, _identity.provider, _identity.epoch, requestId, deadline.unixMs};
     if (parent)
@@ -921,38 +611,28 @@ bool ChannelPolicy::Current(ChannelEnvelope const& envelope, WorldScope const& c
     auto const& entry = found->second;
     return !entry.invalid && (!requireOpen || !entry.terminal) && envelope.instance == _identity.instance &&
            envelope.provider == _identity.provider && envelope.epoch == _identity.epoch &&
-           envelope.deadlineUnixMs == entry.envelope.deadlineUnixMs && SameScope(entry.scope, current) &&
-           ScopeCurrent(current, now) && Alive(entry.until, now) && Alive(entry.until, _observed);
+           envelope.deadlineUnixMs == entry.envelope.deadlineUnixMs && entry.scope.botGuid == current.botGuid &&
+           entry.scope.controllerGuid == current.controllerGuid && entry.scope.contextId == current.contextId &&
+           Alive(entry.until, now) && Alive(entry.until, _observed);
 }
 
-ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string const& body, WorldScope const& current,
-                                    Clock now, ChannelMessage& message, std::string const& expectedRequestId)
+ChannelError ChannelPolicy::Receive(std::string const& body, WorldScope const& current, Clock now,
+                                    ChannelMessage& message, std::string const& expectedRequestId)
 {
     message = {};
-    if (!Authenticated(localBearer))
-        return ChannelError::Unauthorized;
+    if (_identity.epoch.empty())
+        return ChannelError::Inactive;
     if (body.size() > MaxRequestBytes)
         return ChannelError::TooLarge;
     try
     {
-        std::map<int, std::set<std::string>> keys;
-        auto callback = [&](int depth, Json::parse_event_t event, Json& value)
-        {
-            if (depth > 16)
-                throw std::runtime_error("invalid");
-            if (event == Json::parse_event_t::object_start)
-                keys[depth + 1].clear();
-            if (event == Json::parse_event_t::key && !keys[depth].insert(value.get<std::string>()).second)
-                throw std::runtime_error("invalid");
-            return true;
-        };
-        auto const json = Json::parse(body, callback);
+        auto const json = StrictParse(body);
         if (!json.is_object() || Integer(json.at("version"), 1) != 1)
             return ChannelError::Invalid;
         ChannelEnvelope envelope{String(json.at("instance")), String(json.at("provider")), String(json.at("epoch")),
                                  String(json.at("requestId")),
                                  static_cast<int64_t>(Integer(json.at("deadlineUnixMs"), MaxSafeInteger))};
-        if (!Identifier(envelope.requestId))
+        if (!ValidIdentifier(envelope.requestId))
             return ChannelError::Invalid;
         if (envelope.instance != _identity.instance || envelope.provider != _identity.provider ||
             envelope.epoch != _identity.epoch)
@@ -1008,34 +688,12 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
         }
         if (envelope.requestId != expectedRequestId)
             return ChannelError::Invalid;
-        // Fully validate syntax before reserving any replay id or closing a request.
+        // Fully validate syntax before reserving any replay id. LCB6a: query, command and watch are the only inbound
+        // types; a generation's reply returns in its HTTP response, and its route ends here only by the game.
         if (type == "command")
             payload = Command(json);
         else if (type == "watch")
             payload = WatchMessage(json);
-        else if (type == "generation.result")
-        {
-            if (!Exact(json,
-                       {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type", "text"}))
-                return ChannelError::Invalid;
-            auto text = String(json.at("text"));
-            if (!Text(text, MaxTextBytes))
-                return ChannelError::Invalid;
-            payload = ChannelText{std::move(text)};
-        }
-        else if (type == "failure")
-        {
-            if (!Exact(json,
-                       {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type", "code"}))
-                return ChannelError::Invalid;
-            auto const code = String(json.at("code"));
-            if (code != "unavailable" && code != "timeout" && code != "invalid_input" && code != "cancelled")
-                return ChannelError::Invalid;
-            payload = code == "unavailable"     ? ChannelFailure::Unavailable
-                      : code == "timeout"       ? ChannelFailure::Timeout
-                      : code == "invalid_input" ? ChannelFailure::InvalidInput
-                                                : ChannelFailure::Cancelled;
-        }
         else
             return ChannelError::Invalid;
         Expire(now);
@@ -1059,34 +717,21 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
             _commands.emplace(command->commandId, CommandEntry{envelope.requestId});
             entry.commands.push_back(command->commandId);
         }
-        else if (auto const* watch = std::get_if<ChannelWatch>(&payload))
+        else
         {
             // J6e-c: only on an open generation (or wake) route and for its own bot; the id is a command id.
-            if (entry.work != ChannelWork::Generation || watch->botGuid != entry.scope.botGuid)
+            auto const& watch = std::get<ChannelWatch>(payload);
+            if (entry.work != ChannelWork::Generation || watch.botGuid != entry.scope.botGuid)
                 return ChannelError::Invalid;
-            if (_commands.contains(watch->commandId))
+            if (_commands.contains(watch.commandId))
                 return ChannelError::Duplicate;
             if (entry.queries.size() + entry.commands.size() >= _maxRouteIds)
                 return ChannelError::Capacity;
-            _commands.emplace(watch->commandId, CommandEntry{envelope.requestId});
-            entry.commands.push_back(watch->commandId);
-        }
-        else
-        {
-            if (type == "generation.result" && entry.work != ChannelWork::Generation)
-                return ChannelError::Invalid;
-            // LC.35: a generation's terminal forgets its route; a late replay then finds none (Unknown).
-            if (entry.work == ChannelWork::Generation)
-                Drop(envelope.requestId);
-            else
-                entry.terminal = true;
+            _commands.emplace(watch.commandId, CommandEntry{envelope.requestId});
+            entry.commands.push_back(watch.commandId);
         }
         message = {std::move(envelope), std::move(payload)};
         return ChannelError::None;
-    }
-    catch (StandingShape const&)
-    {
-        return ChannelError::Standing;
     }
     catch (std::exception const&)
     {
@@ -1106,7 +751,7 @@ ChannelError ChannelPolicy::FinishQuery(ChannelEnvelope const& envelope, WorldSc
     std::set<uint64_t> seen;
     for (auto const& unit : observedUnits)
     {
-        if (!unit.guid || !seen.insert(unit.guid).second || !Text(unit.name, 128) || unit.healthPercent < -1 ||
+        if (!unit.guid || !seen.insert(unit.guid).second || !UsableText(unit.name, 128) || unit.healthPercent < -1 ||
             unit.healthPercent > 100 ||
             (!unit.role.empty() && unit.role != "tank" && unit.role != "healer" && unit.role != "damage"))
             return ChannelError::Invalid;
@@ -1270,7 +915,7 @@ ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::
     {
         return value == ChannelOutcome::Applied ? "applied" : value == ChannelOutcome::Rejected ? "rejected" : "failed";
     };
-    // A step's reason as the executor worded it; one it left unworded reads as the old form's cannot_now or failed.
+    // A step's reason as the executor worded it; one it left unworded reads as cannot_now or failed.
     auto const reason = [](Json& json, ChannelStepResult const& step)
     {
         auto const words = DescribeRefusal(step.outcome == ChannelOutcome::Failed ? CommandRefusal::Failed
@@ -1294,7 +939,7 @@ ChannelError ChannelPolicy::FinishCommand(ChannelEnvelope const& envelope, std::
     if (!steps.empty())
     {
         Json list = Json::array();
-        auto const& rows = Installed().index.rows;  // LC16c: the act's row, an act the old form lacks included.
+        auto const& rows = Installed().index.rows;  // LC16c: the act's row.
         for (std::size_t index = 0; index < steps.size(); ++index)
         {
             auto const code = static_cast<uint8_t>(steps[index].intent);

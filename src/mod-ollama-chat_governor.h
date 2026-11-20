@@ -87,10 +87,6 @@ float Governor_Similarity(const std::string& a, const std::string& b);
 
 bool Governor_TryConsumeEmoteReaction(ObjectGuid botGuid, ObjectGuid playerGuid);
 
-// Replaces the old raw-Player*-keyed event cooldown map. Only consumes the
-// cooldown when the event is actually committed.
-bool Governor_TryConsumeEventCooldown(ObjectGuid botGuid);
-
 // --- maintenance ----------------------------------------------------------
 
 void Governor_OnPlayerLogout(ObjectGuid guid);

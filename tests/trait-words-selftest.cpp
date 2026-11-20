@@ -14,7 +14,6 @@
 #include "TraitRules.h"
 #include "mod-ollama-chat_trait_words.h"
 
-using OllamaTraitWords::FormatCardTraits;
 using OllamaTraitWords::FormatPersonalityPrompt;
 using Words = std::vector<std::string>;
 
@@ -70,16 +69,6 @@ void CheckFormatters()
     Check(FormatPersonalityPrompt({}, {}).empty(), "empty input");
     Check(FormatPersonalityPrompt({"very  careful\n", " "}, {}) == "very careful", "controls and double spaces");
 
-    Check(FormatCardTraits(words) == "careful, devout, bookish", "three words without adverbs");
-    Check(FormatCardTraits({"a loner", "fiercely loyal"}) == "loner, loyal", "article and adverb stripped");
-    Check(FormatCardTraits({"careful"}) == "careful", "one word");
-    Check(FormatCardTraits({"deeply devout", "an old campaigner"}) == "devout, old campaigner",
-          "adverbs and articles stripped");
-    Check(FormatCardTraits({}).empty(), "empty card words");
-    std::string const longWord(30, 'x');
-    std::string const cut = FormatCardTraits({"deeply " + longWord, "deeply " + longWord, "deeply " + longWord});
-    Check(cut == longWord + ", " + longWord, "cut at a word boundary under 64 bytes");
-    Check(cut.size() <= 64, "64 bytes");
 }
 
 struct SampleBot
@@ -101,20 +90,14 @@ std::string Sample()
 {
     std::ostringstream out;
     out << "WT11b sample: 20 personalities as the LLM sees them (guids 1001-1020, trait version 1)\n"
-           "format: #guid race class | {bot_personality} | card traits\n\n";
+           "format: #guid race class | {bot_personality}\n\n";
     uint32_t guid = 1001;
     for (SampleBot const& bot : SAMPLE)
     {
-        TraitRules::BotTraits const traits = TraitRules::Roll(guid, 1, bot.Race, bot.Class);
         std::string const prompt = PromptOf(guid, bot);
-        std::string const card = FormatCardTraits(TraitRules::Describe(traits));
-        Check(!HasDigit(prompt) && !HasDigit(card), "no digits in a sample bot");
-        Check(prompt.find("  ") == std::string::npos && card.size() <= 64, "clean sample bot");
-        Check(card.find("fiercely") == std::string::npos && card.find("deeply ") == std::string::npos &&
-                  card.find("stiffly") == std::string::npos,
-              "card traits without adverbs");
-        out << "#" << guid << " " << RaceName(bot.Race) << " " << ClassName(bot.Class) << " | " << prompt << " | "
-            << card << "\n";
+        Check(!HasDigit(prompt), "no digits in a sample bot");
+        Check(prompt.find("  ") == std::string::npos, "clean sample bot");
+        out << "#" << guid << " " << RaceName(bot.Race) << " " << ClassName(bot.Class) << " | " << prompt << "\n";
         ++guid;
     }
 

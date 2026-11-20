@@ -8,28 +8,24 @@
 #include <map>
 #include <nlohmann/json.hpp>
 #include <set>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <variant>
+
+#include "mod-ollama-chat_bridge_json.h"
 
 namespace OllamaBridge
 {
 namespace
 {
-bool AsciiLetterOrDigit(unsigned char c)
-{
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
-}
-
 bool ValidContext(Context const& input)
 {
     if (!input.speakerGuid || input.channel.empty() || input.channel.size() > 128 || input.text.empty() ||
-        input.text.size() > MaxTextBytes || input.systemPrompt.size() > 8192 || input.persona.size() > 8192 ||
-        input.memory.size() > 8192 || input.groupScope.size() > 128 || input.observations.size() > 32 ||
-        input.party.size() > 40 ||
-        (input.card.offered ? !input.card.stamp || (input.card.accepted && !input.card.revision)
-                            : input.card.revision || input.card.stamp || input.card.accepted))
+        input.text.size() > MaxTextBytes || input.memory.size() > 8192 || input.groupScope.size() > 128 ||
+        input.observations.size() > 32 || input.party.size() > 40)
         return false;
 
     for (auto const& observation : input.observations)
@@ -54,46 +50,6 @@ bool ValidRequest(Settings const& settings, Request const& request, Clock now)
            RemainingMs(request.deadline, now) > 0;
 }
 
-bool MatchesString(nlohmann::json const& body, char const* key, std::string const& expected)
-{
-    auto const it = body.find(key);
-    return it != body.end() && it->is_string() && it->get_ref<std::string const&>() == expected;
-}
-
-bool Blank(std::string const& value)
-{
-    return std::all_of(value.begin(), value.end(),
-                       [](unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
-}
-
-// One text on the wire: control characters dropped, cut to maxBytes on a character boundary; none when blank or not
-// valid UTF-8 (the envelope dump would throw).
-std::optional<std::string> WireText(std::string const& value, std::size_t maxBytes)
-{
-    std::string text;
-    for (unsigned char byte : value)
-        if (byte >= 0x20 && byte != 0x7F)
-            text.push_back(static_cast<char>(byte));
-    if (text.size() > maxBytes)
-    {
-        std::size_t cut = maxBytes;
-        while (cut && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80)
-            --cut;
-        text.resize(cut);
-    }
-    if (Blank(text))
-        return std::nullopt;
-    try
-    {
-        static_cast<void>(nlohmann::json(text).dump());
-    }
-    catch (nlohmann::json::exception const&)
-    {
-        return std::nullopt;
-    }
-    return text;
-}
-
 // A text under its key, left out when WireText gives none.
 void PutText(nlohmann::json& json, char const* key, std::string const& value, std::size_t maxBytes)
 {
@@ -101,10 +57,10 @@ void PutText(nlohmann::json& json, char const* key, std::string const& value, st
         json[key] = std::move(*text);
 }
 
-// One card fact on the wire: the text rule at MaxCardFactBytes.
-void PutCardFact(nlohmann::json& context, char const* key, std::string const& value)
+// One fact on the wire: the text rule at MaxFactBytes.
+void PutFact(nlohmann::json& context, char const* key, std::string const& value)
 {
-    PutText(context, key, value, MaxCardFactBytes);
+    PutText(context, key, value, MaxFactBytes);
 }
 
 // LC10: a list of texts in the given order, an entry without a text dropped, at most cap entries; left out when empty.
@@ -157,7 +113,7 @@ void PutPairList(nlohmann::json& json, char const* key, std::vector<std::pair<st
     {
         if (list.size() == cap)
             break;
-        auto name = WireText(first, MaxCardFactBytes);
+        auto name = WireText(first, MaxFactBytes);
         auto word = WireText(second, MaxFactWordBytes);
         if (name && word)
             list.push_back({{firstKey, std::move(*name)}, {secondKey, std::move(*word)}});
@@ -167,75 +123,147 @@ void PutPairList(nlohmann::json& json, char const* key, std::vector<std::pair<st
 }
 
 constexpr std::size_t MaxFactCrafts = 8;
-constexpr std::size_t MaxFactUseful = 12;
+constexpr std::size_t MaxFactMakes = 8;
+constexpr std::size_t MaxFactMakeItems = 4;
 constexpr std::size_t MaxFactServants = 8;
 constexpr std::size_t MaxFactStanding = 6;
 constexpr std::size_t MaxFactRelatives = 8;
+constexpr std::size_t MaxFactVisits = 24;
 
-// LC10 `input.facts`: who the bot is (the card-fact rule), how it fights, its crafts, standing and kin. False when who
+// LC18e `facts.visits`: where the bot has been, newest first: {name, kind, land, ago}; an entry missing its name or
+// kind is dropped, land is absent when the game gave none, ago is in seconds.
+void PutVisitList(nlohmann::json& json, std::vector<PlayerbotBridge::BotVisit> const& visits)
+{
+    nlohmann::json list = nlohmann::json::array();
+    for (PlayerbotBridge::BotVisit const& visit : visits)
+    {
+        if (list.size() == MaxFactVisits)
+            break;
+        auto name = WireText(visit.name, MaxFactBytes);
+        auto kind = WireText(visit.kind, MaxFactWordBytes);
+        if (!name || !kind)
+            continue;
+        nlohmann::json entry = {{"name", std::move(*name)}, {"kind", std::move(*kind)}, {"ago", visit.ago}};
+        if (auto land = WireText(visit.land, MaxFactBytes))
+            entry["land"] = std::move(*land);
+        list.push_back(std::move(entry));
+    }
+    if (!list.empty())
+        json["visits"] = std::move(list);
+}
+
+// LC18f `facts.makes`: what the bot's recipes make that is useful, by craft: {craft, items} with at most
+// MaxFactMakeItems item names; a craft without a name or without a surviving item is dropped.
+void PutMakesList(nlohmann::json& json, std::vector<PlayerbotBridge::BotMake> const& makes)
+{
+    nlohmann::json list = nlohmann::json::array();
+    for (PlayerbotBridge::BotMake const& make : makes)
+    {
+        if (list.size() == MaxFactMakes)
+            break;
+        auto craft = WireText(make.craft, MaxFactBytes);
+        nlohmann::json items = nlohmann::json::array();
+        for (std::string const& item : make.items)
+        {
+            if (items.size() == MaxFactMakeItems)
+                break;
+            if (auto text = WireText(item, MaxFactBytes))
+                items.push_back(std::move(*text));
+        }
+        if (craft && !items.empty())
+            list.push_back({{"craft", std::move(*craft)}, {"items", std::move(items)}});
+    }
+    if (!list.empty())
+        json["makes"] = std::move(list);
+}
+
+// LC10 `input.facts`: who the bot is (the fact rule), how it fights, its crafts, standing and kin. False when who
 // or the phrase does not survive the bounds; the module then leaves the whole object out.
-bool FactsJson(BotFacts const& facts, nlohmann::json& json)
+bool FactsJson(BotWho const& bot, PlayerbotBridge::BotFacts const& facts, nlohmann::json& json)
 {
     nlohmann::json who = nlohmann::json::object();
-    PutCardFact(who, "name", facts.name);
-    PutCardFact(who, "race", facts.race);
-    PutCardFact(who, "class", facts.className);
-    if (facts.gender == "male" || facts.gender == "female")
-        who["gender"] = facts.gender;
-    if (facts.level)
-        who["level"] = std::min<uint32_t>(facts.level, 255);
-    if (facts.side == "Alliance" || facts.side == "Horde")
-        who["side"] = facts.side;
+    PutFact(who, "name", bot.name);
+    PutFact(who, "race", bot.race);
+    PutFact(who, "class", bot.className);
+    if (bot.gender == "male" || bot.gender == "female")
+        who["gender"] = bot.gender;
+    if (bot.level)
+        who["level"] = std::min<uint32_t>(bot.level, 255);
+    if (bot.team <= 1)
+        who["side"] = bot.team ? "Horde" : "Alliance";
     auto phrase = WireText(facts.phrase, MaxPhraseBytes);
     if (who.size() != 6 || !phrase)
         return false;
     json = {{"who", std::move(who)}, {"phrase", std::move(*phrase)}};
     PutPairList(json, "crafts", facts.crafts, MaxFactCrafts, "name", "rank");
-    PutTextList(json, "useful", facts.useful, MaxFactUseful, MaxCardFactBytes);
-    PutTextList(json, "servants", facts.servants, MaxFactServants, MaxCardFactBytes);
+    PutMakesList(json, facts.makes);
+    PutTextList(json, "servants", facts.servants, MaxFactServants, MaxFactBytes);
     PutPairList(json, "standing", facts.standing, MaxFactStanding, "faction", "word");
-    PutCardFact(json, "guild", facts.guild);
-    PutTextList(json, "relatives", facts.relatives, MaxFactRelatives, MaxCardFactBytes);
+    PutFact(json, "guild", facts.guild);
+    PutTextList(json, "relatives", facts.relatives, MaxFactRelatives, MaxFactBytes);
+    PutVisitList(json, facts.visits);
     return true;
 }
 
-// LC10 `input.state.around`: nearest first, one entry per name (after the bounds), a known kind, count 1-255.
-nlohmann::json AroundJson(std::vector<BotState::Around> const& entries)
+// LCB4: whether an open row's key may go to the wire: [a-z][a-z_]{0,23} and not a key the envelope writes itself.
+bool OpenKey(std::string const& key, std::span<std::string_view const> shaped)
 {
-    static constexpr std::string_view kinds[] = {"hostile", "service", "task", "person", "object"};
+    return !key.empty() && key.size() <= 24 && key.front() >= 'a' && key.front() <= 'z' &&
+           std::all_of(key.begin(), key.end(), [](char c) { return (c >= 'a' && c <= 'z') || c == '_'; }) &&
+           std::find(shaped.begin(), shaped.end(), key) == shaped.end();
+}
+
+// LCB4: playerbots' open rows of one object, in their order, under the open-key rule (bridge.h); a bad row, a key
+// already written and every row past MaxOpenKeys are dropped alone.
+void PutOpenKeys(nlohmann::json& json, std::vector<PlayerbotBridge::StateKey> const& rows,
+                 std::span<std::string_view const> shaped)
+{
+    std::size_t kept = 0;
+    for (PlayerbotBridge::StateKey const& row : rows)
+    {
+        if (kept == MaxOpenKeys)
+            break;
+        if (!OpenKey(row.key, shaped) || json.contains(row.key))
+            continue;
+        if (bool const* flag = std::get_if<bool>(&row.value))
+            json[row.key] = *flag;
+        else if (int64_t const* number = std::get_if<int64_t>(&row.value))
+            json[row.key] = std::clamp(*number, -MaxOpenNumber, MaxOpenNumber);
+        else if (auto text = WireText(std::get<std::string>(row.value), MaxFactBytes))
+            json[row.key] = std::move(*text);
+        else
+            continue;
+        ++kept;
+    }
+}
+
+constexpr std::string_view AroundKeys[] = {"name", "kind", "detail", "count"};
+// "plans" names the lasting settings in force, read from the bot (LCB7b; the module keeps no plans, LC.36).
+constexpr std::string_view StateKeys[] = {"health",  "power",   "level",    "alive", "combat",   "activity", "where",
+                                          "partner", "mounted", "swimming", "group", "movement", "plans",    "bags",
+                                          "money",   "around",  "servant",  "mount", "deeds"};
+
+// LC10 `input.state.around`: nearest first, one entry per name (after the bounds), a known kind, count 1-255; LCB4:
+// each entry's open rows beside its keys.
+nlohmann::json AroundJson(std::vector<PlayerbotBridge::AroundEntry> const& entries)
+{
     nlohmann::json around = nlohmann::json::array();
-    for (BotState::Around const& entry : entries)
+    for (PlayerbotBridge::AroundEntry const& entry : entries)
     {
         if (around.size() == MaxStateAround)
             break;
-        auto name = WireText(entry.name, MaxCardFactBytes);
-        if (!name || std::find(std::begin(kinds), std::end(kinds), entry.kind) == std::end(kinds) ||
+        auto name = WireText(entry.Name, MaxFactBytes);
+        if (!name || entry.Kind > PlayerbotBridge::AroundKind::Object ||
             std::any_of(around.begin(), around.end(),
                         [&name](nlohmann::json const& listed) { return listed.at("name") == *name; }))
             continue;
-        nlohmann::json item = {{"name", std::move(*name)}, {"kind", entry.kind}};
-        PutCardFact(item, "detail", entry.detail);
-        item["count"] = std::clamp<uint32_t>(entry.count, 1, 255);
+        nlohmann::json item = {{"name", std::move(*name)}, {"kind", PlayerbotBridge::AroundKindWord(entry.Kind)}};
+        PutFact(item, "detail", entry.Detail);
+        item["count"] = std::clamp<uint32_t>(entry.Count, 1, 255);
+        PutOpenKeys(item, entry.open, AroundKeys);
         around.push_back(std::move(item));
     }
     return around;
-}
-
-// DS.12 `input.personaCard.context`: a flat object of the bot's in-world facts; absent facts are left out.
-nlohmann::json CardContextJson(CardFacts const& facts)
-{
-    nlohmann::json context = nlohmann::json::object();
-    PutCardFact(context, "name", facts.name);
-    PutCardFact(context, "race", facts.race);
-    PutCardFact(context, "class", facts.className);
-    PutCardFact(context, "gender", facts.gender);
-    if (facts.level)
-        context["level"] = facts.level;
-    PutCardFact(context, "zone", facts.zone);
-    PutCardFact(context, "faction", facts.faction);
-    PutCardFact(context, "guild", facts.guild);
-    PutCardFact(context, "traits", facts.traits);
-    return context;
 }
 
 uint32_t StatePercent(float value)
@@ -271,7 +299,7 @@ char const* StatePower(uint8_t type)
 }
 
 // The most absorbing thing the bot is doing.
-char const* StateActivity(BotState const& state)
+char const* StateActivity(PlayerbotBridge::BotStateFacts const& state)
 {
     if (!state.alive)
         return "idle";
@@ -292,7 +320,7 @@ char const* StateActivity(BotState const& state)
     return "idle";
 }
 
-char const* StateMovement(BotState const& state)
+char const* StateMovement(PlayerbotBridge::BotStateFacts const& state)
 {
     return state.stay      ? "stay"
            : state.follow  ? "follow"
@@ -302,8 +330,9 @@ char const* StateMovement(BotState const& state)
                            : "none";
 }
 
-// DS.14/J5f `input.state`: what the bot itself knows about its condition, place and doings.
-nlohmann::json StateJson(BotState const& state)
+// DS.14/J5f `input.state`: what the bot itself knows about its condition, place and doings; LCB4: playerbots' open
+// rows last.
+nlohmann::json StateJson(PlayerbotBridge::BotStateFacts const& state)
 {
     nlohmann::json json = nlohmann::json::object();
     json["health"] = StatePercent(state.healthPct);
@@ -317,7 +346,8 @@ nlohmann::json StateJson(BotState const& state)
     if (state.alive && state.inCombat && state.victim && state.victimVisible)
     {
         nlohmann::json target = nlohmann::json::object();
-        PutCardFact(target, "name", state.victimName);
+        PutFact(target, "name", state.victimName);
+        PutFact(target, "type", state.victimType);
         if (state.victimLevel)
             target["level"] = std::min<uint32_t>(state.victimLevel, 255);
         target["health"] = StatePercent(state.victimHealthPct);
@@ -326,12 +356,12 @@ nlohmann::json StateJson(BotState const& state)
     char const* activity = StateActivity(state);
     nlohmann::json doing = {{"kind", activity}};
     if (std::string_view(activity) == "questing")
-        PutCardFact(doing, "detail", state.questTitle);
+        PutFact(doing, "detail", state.questTitle);
     json["activity"] = std::move(doing);
     nlohmann::json where = nlohmann::json::object();
-    PutCardFact(where, "zone", state.zone);
+    PutFact(where, "zone", state.zone);
     if (state.area != state.zone)
-        PutCardFact(where, "area", state.area);
+        PutFact(where, "area", state.area);
     where["mapId"] = state.mapId;
     where["x"] = StateYards(state.x);
     where["y"] = StateYards(state.y);
@@ -341,7 +371,7 @@ nlohmann::json StateJson(BotState const& state)
     if (state.partnerOnline && (state.partnerInGroup || state.partnerVisible))
     {
         nlohmann::json partner = nlohmann::json::object();
-        PutCardFact(partner, "zone", state.partnerZone);
+        PutFact(partner, "zone", state.partnerZone);
         if (state.partnerSameMap)
         {
             partner["yards"] = std::max<int64_t>(StateYards(state.partnerYards), 0);
@@ -359,77 +389,38 @@ nlohmann::json StateJson(BotState const& state)
     {
         nlohmann::json group = {{"size", std::min<uint32_t>(state.groupSize, 40)}, {"leads", state.leads}};
         if (state.follow)
-            PutCardFact(group, "follows", state.masterName);
+            PutFact(group, "follows", state.masterName);
         json["group"] = std::move(group);
     }
     json["movement"] = StateMovement(state);
-    static char const* const planNames[] = {"movement", "formation", "save_mana", "focus_healing"};
+    // LC.36: a bot can revert only what it sees, so each lasting setting in force is named while it holds, in the
+    // hub's plan order (envelope.mjs PLAN_KINDS); follow and stay are the movement above.
     nlohmann::json plans = nlohmann::json::array();
-    for (std::size_t kind = 0; kind < std::size(planNames); ++kind)
-        if (state.plans & (1u << kind))
-            plans.push_back(planNames[kind]);
+    if (state.formation)
+        plans.push_back("formation");
+    if (state.saveMana)
+        plans.push_back("save_mana");
+    if (state.focusHeal)
+        plans.push_back("focus_healing");
     if (!plans.empty())
         json["plans"] = std::move(plans);
     json["bags"] = std::min<uint32_t>(state.freeBagSlots, 255);
     json["money"] = state.money;
     if (nlohmann::json around = AroundJson(state.around); !around.empty())
         json["around"] = std::move(around);
-    PutCardFact(json, "servant", state.servant);
-    PutCardFact(json, "mount", state.mount);
+    PutFact(json, "servant", state.servantName);
+    PutFact(json, "mount", state.mountName);
     // Whole record sentences (LC7's cap), never the 64-byte fact rule.
     PutTextList(json, "deeds", state.deeds, MaxStateDeeds, MaxStateDeedBytes);
+    PutOpenKeys(json, state.open, StateKeys);
     return json;
 }
 }  // namespace
-
-std::string CardTraitWord(std::string const& personalityKey)
-{
-    static std::map<std::string, std::string> const words = {
-        {"ROLEPLAYER", "dramatic"},
-        {"LOOTGOBLIN", "greedy"},
-        {"PVP_HARDCORE", "fierce"},
-        {"RAIDER", "battle-hardened"},
-        {"CASUAL", "easygoing"},
-        {"TRADER", "shrewd"},
-        {"GRUMPY_VETERAN", "gruff"},
-        {"HEROIC_LEADER", "commanding"},
-        {"TRICKSTER", "mischievous"},
-        {"LONE_WOLF", "aloof"},
-        {"FOOL", "silly"},
-        {"ANCIENT_WISE_ONE", "wise"},
-        {"BARD", "theatrical"},
-        {"CONSPIRACY_THEORIST", "suspicious"},
-        {"EDGE_LORD", "brooding"},
-        {"FANATIC", "zealous"},
-        {"HYPE_MAN", "boisterous"},
-        {"PARANOID", "wary"},
-        {"FLIRT", "charming"},
-        {"RAGER", "hot-tempered"},
-        {"YOUNG_APPRENTICE", "eager"},
-        {"MENTOR", "patient"},
-        {"SCHOLAR", "bookish"},
-        {"WANNABE_VILLAIN", "scheming"},
-        {"JOLLY_BEER_LOVER", "jolly"},
-        {"GOBLIN_MERCHANT", "shrewd"},
-        {"PIRATE", "roguish"},
-        {"CHEF", "hearty"},
-        {"POET", "poetic"},
-    };
-    auto const it = words.find(personalityKey);
-    return it == words.end() ? std::string() : it->second;
-}
 
 bool Identity::operator==(Identity const& other) const
 {
     return instance == other.instance && provider == other.provider && endpoint == other.endpoint &&
            epoch == other.epoch;
-}
-
-bool ValidIdentifier(std::string const& value)
-{
-    return !value.empty() && value.size() <= 128 && AsciiLetterOrDigit(value.front()) &&
-           std::all_of(value.begin(), value.end(), [](unsigned char c)
-                       { return AsciiLetterOrDigit(c) || c == '_' || c == '.' || c == ':' || c == '-'; });
 }
 
 bool ValidEndpoint(std::string const& value)
@@ -451,6 +442,8 @@ bool ValidEndpoint(std::string const& value)
     }
     return port > 0 && port <= 65535;
 }
+
+bool BridgeUsable(bool enabled, Settings const& settings) { return enabled && ValidSettings(settings); }
 
 bool ValidSettings(Settings const& settings)
 {
@@ -527,45 +520,29 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
                 entry["visibleTargetGuid"] = std::to_string(participant.visibleTargetGuid);
             party.push_back(std::move(entry));
         }
-        nlohmann::json envelope = {{"version", 1},
-                                   {"instance", settings.instance},
-                                   {"provider", settings.provider},
-                                   {"epoch", request.epoch},
-                                   {"requestId", request.requestId},
-                                   {"deadlineUnixMs", request.deadline.unixMs},
-                                   {"type", "generation"},
-                                   {"controllerGuid", std::to_string(request.controllerGuid)},
-                                   {"botGuid", std::to_string(request.botGuid)},
-                                   {"input",
-                                    {{"channel", input.channel},
-                                     {"text", input.text},
-                                     {"observations", input.observations},
-                                     {"speakerGuid", std::to_string(input.speakerGuid)},
-                                     {"systemPrompt", input.systemPrompt},
-                                     {"persona", input.persona},
-                                     {"memory", input.memory},
-                                     {"groupScope", input.groupScope},
-                                     {"directAddress", input.directAddress},
-                                     {"speakerControlsBot", input.speakerControlsBot},
-                                     {"party", std::move(party)}}}};
-        if (input.card.offered)
-        {
-            nlohmann::json card = {{"revision", std::to_string(input.card.revision)},
-                                   {"accepted", input.card.accepted}};
-            if (!input.card.accepted)
-                card["context"] = CardContextJson(input.card.facts);
-            envelope["input"]["personaCard"] = std::move(card);
-        }
+        auto envelope = Envelope(settings.instance, settings.provider, request.epoch, request.requestId,
+                                 request.deadline.unixMs, "generation");
+        envelope["controllerGuid"] = std::to_string(request.controllerGuid);
+        envelope["botGuid"] = std::to_string(request.botGuid);
+        envelope["input"] = {{"channel", input.channel},
+                             {"text", input.text},
+                             {"observations", input.observations},
+                             {"speakerGuid", std::to_string(input.speakerGuid)},
+                             {"memory", input.memory},
+                             {"groupScope", input.groupScope},
+                             {"directAddress", input.directAddress},
+                             {"speakerControlsBot", input.speakerControlsBot},
+                             {"party", std::move(party)}};
         // LC10: the lasting facts and the trait words, each only when there is something to say.
-        if (nlohmann::json facts; input.facts && FactsJson(*input.facts, facts))
+        if (nlohmann::json facts; input.facts && FactsJson(input.who, *input.facts, facts))
             envelope["input"]["facts"] = std::move(facts);
         nlohmann::json traits = nlohmann::json::object();
         PutTraitWords(traits, input.traits);
         PutTextList(traits, "interests", input.traits.interests, MaxTraitInterests, MaxTraitBytes);
         if (!traits.empty())
             envelope["input"]["traits"] = std::move(traits);
-        if (input.state.present)
-            envelope["input"]["state"] = StateJson(input.state);
+        if (input.state)
+            envelope["input"]["state"] = StateJson(*input.state);
         if (!input.wakeCondition.empty())  // J6e-c: a wake turn (never addressed); the watch that opened it.
             envelope["input"]["wake"] = {{"condition", input.wakeCondition}, {"watchId", input.wakeWatchId}};
         std::string encoded = envelope.dump();
@@ -593,31 +570,13 @@ Result Parse(Settings const& settings, Request const& request, std::string const
         return result;
     try
     {
-        // Reject duplicate keys before the DOM overwrites them. Bound parser nesting as well as bytes.
-        std::map<int, std::set<std::string>> keys;
-        auto callback = [&keys](int depth, nlohmann::json::parse_event_t event, nlohmann::json& value)
-        {
-            if (depth > 16)
-                throw std::runtime_error("depth");
-            if (event == nlohmann::json::parse_event_t::object_start)
-                keys[depth + 1].clear();
-            if (event == nlohmann::json::parse_event_t::key && !keys[depth].insert(value.get<std::string>()).second)
-                throw std::runtime_error("duplicate");
-            return true;
-        };
-        auto const parsed = nlohmann::json::parse(body, callback);
-        // The one optional key: a card proposal, only in a generation result for a request that offered the card.
-        bool const proposal = parsed.is_object() && parsed.contains("personaProposal");
-        if (!parsed.is_object() || parsed.size() != (proposal ? 9u : 8u) || !parsed.contains("version") ||
+        auto const parsed = StrictParse(body);
+        if (!parsed.is_object() || parsed.size() != 8u || !parsed.contains("version") ||
             !parsed["version"].is_number_integer() || parsed["version"] != 1 ||
             !MatchesString(parsed, "instance", settings.instance) ||
             !MatchesString(parsed, "provider", settings.provider) || !MatchesString(parsed, "epoch", request.epoch) ||
             !MatchesString(parsed, "requestId", request.requestId) || !parsed.contains("deadlineUnixMs") ||
             !parsed["deadlineUnixMs"].is_number_integer() || parsed["deadlineUnixMs"] != request.deadline.unixMs)
-            return result;
-        // A card is wanted only where the request carried the context (offered without an accepted card).
-        if (proposal && (!request.input.card.offered || request.input.card.accepted ||
-                         !MatchesString(parsed, "type", "generation.result")))
             return result;
 
         if (MatchesString(parsed, "type", "failure"))
@@ -627,33 +586,16 @@ Result Parse(Settings const& settings, Request const& request, std::string const
                 result.error = "bridge_terminal_failure";
             return result;
         }
-        // DS.14: exactly one of text or "silent": true (an action-only answer, which never carries a card).
+        // DS.14: exactly one of text or "silent": true (an action-only answer).
         bool const silent = parsed.contains("silent");
         if (!MatchesString(parsed, "type", "generation.result") || silent == parsed.contains("text"))
             return result;
-        if (silent ? !parsed["silent"].is_boolean() || !parsed["silent"].get<bool>() || proposal
-                   : !parsed["text"].is_string())
+        if (silent ? !parsed["silent"].is_boolean() || !parsed["silent"].get<bool>() : !parsed["text"].is_string())
             return result;
         static std::string const wordless;
         auto const& text = silent ? wordless : parsed["text"].get_ref<std::string const&>();
-        if (!silent &&
-            (text.empty() || text.size() > MaxTextBytes || Blank(text) || text.find('\0') != std::string::npos))
+        if (!silent && !UsableText(text, MaxTextBytes))
             return result;
-        if (proposal)
-        {
-            // Exactly {revision, body}: the offered revision as canonical decimal and a bounded nonblank body. The
-            // parser has already refused ill-formed UTF-8.
-            auto const& card = parsed["personaProposal"];
-            if (!card.is_object() || card.size() != 2 ||
-                !MatchesString(card, "revision", std::to_string(request.input.card.revision)) ||
-                !card.contains("body") || !card["body"].is_string())
-                return result;
-            auto const& cardBody = card["body"].get_ref<std::string const&>();
-            if (cardBody.empty() || cardBody.size() > MaxCardProposalBytes || Blank(cardBody) ||
-                cardBody.find('\0') != std::string::npos)
-                return result;
-            result.personaProposal = cardBody;
-        }
         result.ok = true;
         result.silent = silent;
         result.text = text;
@@ -666,49 +608,9 @@ Result Parse(Settings const& settings, Request const& request, std::string const
     return result;
 }
 
-void Circuit::Reset(Identity identity)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    _identity = std::move(identity);
-    ++_revision;
-    _open = false;
-    _recovering = false;
-    _retryAtMs = 0;
-}
-
-Circuit::Ticket Circuit::Acquire(Identity const& identity, int64_t steadyMs)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (_revision == 0 || !(_identity == identity) || (_open && (steadyMs < _retryAtMs || _recovering)))
-        return {};
-    if (_open)
-        _recovering = true;
-    return {_revision, true, _open};
-}
-
-void Circuit::Complete(Ticket ticket, bool success, int64_t steadyMs)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (!ticket.admitted || ticket.revision != _revision)
-        return;
-    if (!success)
-    {
-        ++_revision;
-        _open = true;
-        _recovering = false;
-        _retryAtMs = steadyMs > std::numeric_limits<int64_t>::max() - CircuitCooldownMs
-                         ? std::numeric_limits<int64_t>::max()
-                         : steadyMs + CircuitCooldownMs;
-    }
-    else if (ticket.recovery)
-    {
-        ++_revision;
-        _open = false;
-        _recovering = false;
-    }
-}
-
-Result Generate(Settings const& settings, Request const& request, Circuit& circuit, ReadClock const& readClock,
+// LCB6a: no circuit breaker. Each call is bounded by its own deadline; on 127.0.0.1 a dead bridge refuses the
+// connection at once, and one failed or malformed reply never holds back another bot's turn.
+Result Generate(Settings const& settings, Request const& request, ReadClock const& readClock,
                 Transport const& transport)
 {
     Result result;
@@ -717,12 +619,6 @@ Result Generate(Settings const& settings, Request const& request, Circuit& circu
     if (!Build(settings, request, now, body))
     {
         result.error = "bridge_expired_or_invalid_request";
-        return result;
-    }
-    auto const ticket = circuit.Acquire(MakeIdentity(settings, request), now.steadyMs);
-    if (!ticket.admitted)
-    {
-        result.error = "bridge_circuit_open_or_inactive";
         return result;
     }
     try
@@ -745,11 +641,10 @@ Result Generate(Settings const& settings, Request const& request, Circuit& circu
     {
         result.error = "bridge_unavailable";
     }
-    circuit.Complete(ticket, result.ok, readClock().steadyMs);
     return result;
 }
 
-uint8_t ActivityCode(BotState const& state)
+uint8_t ActivityCode(PlayerbotBridge::BotStateFacts const& state)
 {
     constexpr std::string_view kinds[] = {"idle",    "flying",  "fighting", "casting",
                                           "looting", "resting", "questing", "travelling"};

@@ -12,17 +12,10 @@ public:
 
     static bool HandleOllamaReloadCommand(ChatHandler* handler);
     static bool HandleOllamaLabLogoutCommand(ChatHandler* handler, Optional<std::string> botName);
-    static bool HandleOllamaSentimentViewCommand(ChatHandler* handler, Optional<std::string> botName, Optional<std::string> playerName);
-    static bool HandleOllamaSentimentSetCommand(ChatHandler* handler, std::string botName, std::string playerName, float sentimentValue);
-    static bool HandleOllamaSentimentResetCommand(ChatHandler* handler, Optional<std::string> botName, Optional<std::string> playerName);
-    static bool HandleOllamaPersonalityGetCommand(ChatHandler* handler, std::string botName);
-    static bool HandleOllamaPersonalitySetCommand(ChatHandler* handler, std::string botName, std::string personality);
-    static bool HandleOllamaPersonalityListCommand(ChatHandler* handler);
 
     // Diagnostics. Half of what was wrong with this module was invisible
     // because there was no way to ask it what it thought it was doing.
     static bool HandleOllamaStatusCommand(ChatHandler* handler);
-    static bool HandleOllamaTestCommand(ChatHandler* handler, Acore::ChatCommands::Tail prompt);
 };
 
 #endif // MOD_OLLAMA_CHAT_COMMAND_H

@@ -295,81 +295,6 @@ namespace
 
 // --------------------------------------------------------------------------
 
-namespace
-{
-    // Curated per mood, and every one of these ANIMATES.
-    //
-    // Only 76 of the 194 emotes the table understands actually play an
-    // animation. The rest have textid EMOTE_ONESHOT_NONE in EmotesText.dbc,
-    // so HandleTextEmoteOpcode broadcasts the social line ("Bot snorts.") and
-    // nothing moves -- which is exactly how they behave for a real player in
-    // 3.3.5a, but it means suggesting them produces an invisible gesture.
-    //
-    // An earlier version of this list was mostly those: two whole moods were
-    // text-only. Everything below was checked against the client's
-    // EmotesText.dbc and has a real animation.
-    //
-    // Deliberately a sample, not the whole table -- pasting 190 tags into
-    // every prompt is how bots end up talking about their emote list instead
-    // of using it.
-    const std::vector<std::vector<const char*>>& GestureSamples()
-    {
-        static const std::vector<std::vector<const char*>> samples = {
-            { "wave", "bow", "salute", "greet", "thank" },
-            { "nod", "no", "shrug", "disagree", "doubt" },
-            { "laugh", "chuckle", "giggle", "cheer", "applaud" },
-            { "cry", "mourn", "plead", "cower", "blush" },
-            { "angry", "growl", "roar", "taunt", "rude" },
-            { "ponder", "confused", "curious", "point", "gasp" },
-            { "pray", "drink", "flex", "victory", "toast" },
-        };
-        return samples;
-    }
-}
-
-std::string Expression_BuildGesturePrompt()
-{
-    if (!g_EnableBotEmotes || g_GestureChance <= 0)
-        return "";
-
-    // Not every line gets the invitation. Offering it on all of them made bots
-    // gesture almost constantly, which reads as twitchy rather than alive --
-    // and it spends prompt budget on a sentence most replies do not need.
-    // urand is inclusive at both ends, so this is 1..100 against the chance.
-    if (static_cast<int>(urand(1, 100)) > g_GestureChance)
-        return "";
-
-    const auto& samples = GestureSamples();
-
-    // Shuffle the moods, then take one tag from each of the first few, so the
-    // examples are never all the same flavour.
-    std::vector<size_t> order(samples.size());
-    for (size_t i = 0; i < order.size(); ++i)
-        order[i] = i;
-
-    for (size_t i = order.size(); i-- > 1; )
-        std::swap(order[i], order[urand(0, static_cast<uint32>(i))]);
-
-    const size_t take = std::min<size_t>(4, order.size());
-
-    std::string tags;
-    for (size_t i = 0; i < take; ++i)
-    {
-        const auto& bucket = samples[order[i]];
-        const char* name   = bucket[urand(0, static_cast<uint32>(bucket.size() - 1))];
-
-        if (!tags.empty())
-            tags += (i + 1 == take) ? " or " : ", ";
-
-        tags += "[emote:";
-        tags += name;
-        tags += "]";
-    }
-
-    return " You may end your reply with a single gesture tag such as " + tags +
-           " when one genuinely fits -- any common emote name works. Omit it otherwise.";
-}
-
 uint32_t LookupTextEmoteId(const std::string& name)
 {
     const std::string key = NormalizeEmoteWord(name);
@@ -379,21 +304,6 @@ uint32_t LookupTextEmoteId(const std::string& name)
     const auto& table = EmoteNameTable();
     auto it = table.find(key);
     return it == table.end() ? 0u : it->second;
-}
-
-std::string LookupTextEmoteName(uint32_t id)
-{
-    if (!id)
-        return "";
-
-    // The DBC carries no usable name string for text emotes, so reverse the
-    // same table the parser uses. First match wins, which is fine because the
-    // aliases all describe the same gesture.
-    for (const auto& [name, value] : EmoteNameTable())
-        if (value == id)
-            return name;
-
-    return "";
 }
 
 uint32_t ExtractEmoteTag(std::string& response)
@@ -748,49 +658,25 @@ void ChatOnEmote::OnPlayerTextEmote(Player* player, uint32 textEmote,
     if (urand(1, 100) > g_EmoteReplyChance)
         return;
 
-    // Pick a response style by configured weight.
-    const uint32_t total = g_EmoteReplyMirrorWeight + g_EmoteReplyCounterWeight +
-                           g_EmoteReplySpeakWeight;
+    // Pick a gesture style by configured weight.
+    const uint32_t total = g_EmoteReplyMirrorWeight + g_EmoteReplyCounterWeight;
     if (total == 0)
         return;
 
-    uint32_t roll = urand(0, total - 1);
-    uint32_t reactEmote = 0;
-    bool speak = false;
+    uint32_t const roll = urand(0, total - 1);
+    uint32_t reactEmote = roll < g_EmoteReplyMirrorWeight ? GetMirrorEmote(textEmote) : GetCounterEmote(textEmote);
 
-    if (roll < g_EmoteReplyMirrorWeight)
-    {
+    // Fall back to the other table if this one had nothing for this emote.
+    if (!reactEmote)
         reactEmote = GetMirrorEmote(textEmote);
-    }
-    else if (roll < g_EmoteReplyMirrorWeight + g_EmoteReplyCounterWeight)
-    {
+    if (!reactEmote)
         reactEmote = GetCounterEmote(textEmote);
-    }
-    else
-    {
-        speak = true;
-    }
-
-    // Fall back to a gesture if the table had nothing for this emote.
-    if (!speak && !reactEmote)
-        reactEmote = GetMirrorEmote(textEmote);
-    if (!speak && !reactEmote)
-        reactEmote = GetCounterEmote(textEmote);
-
-    if (reactEmote)
-    {
-        ScheduleBotExpression(bot, player->GetGUID(), reactEmote, g_BotExpressionDelayMs);
-
-        if (g_DebugEnabled)
-            LOG_INFO("module.ollamachat", "[Ollama Chat] Bot {} reacting to emote {} from {} with emote {}",
-                     bot->GetName(), textEmote, player->GetName(), reactEmote);
+    if (!reactEmote)
         return;
-    }
 
-    if (speak)
-    {
-        // Turn toward them regardless, then answer in words via the event path.
-        ScheduleBotExpression(bot, player->GetGUID(), 0, g_BotExpressionDelayMs);
-        OllamaChat_DispatchEmoteReaction(bot, player, textEmote);
-    }
+    ScheduleBotExpression(bot, player->GetGUID(), reactEmote, g_BotExpressionDelayMs);
+
+    if (g_DebugEnabled)
+        LOG_INFO("module.ollamachat", "[Ollama Chat] Bot {} reacting to emote {} from {} with emote {}",
+                 bot->GetName(), textEmote, player->GetName(), reactEmote);
 }
