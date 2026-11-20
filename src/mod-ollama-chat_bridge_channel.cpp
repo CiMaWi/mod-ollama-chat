@@ -359,6 +359,9 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
                  {"text", text},
                  {"value", std::clamp<int64_t>(entry.first, 0, UINT32_MAX)},
                  {"extra", std::clamp<int64_t>(entry.second, 0, UINT32_MAX)}};
+        // LC18g: a place's side word, only when the game sent one of the three (LC.23: an absent key stays absent).
+        if (entry.side == "alliance" || entry.side == "horde" || entry.side == "neutral")
+            value["side"] = entry.side;
         return true;
     }
     switch (topic)

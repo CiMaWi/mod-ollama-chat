@@ -190,7 +190,7 @@ bool BridgeBotStateTopic(uint64_t botGuid, OllamaBridge::StateTopic topic, std::
         // LCB1e: the game's row word as it sends it (the bridge decides what it shows); inventory, quests and
         // strategies still send a code only, so their fixed words follow it here.
         OllamaBridge::StateEntry entry{std::move(item.name), std::move(item.word), item.value, item.extra,
-                                       std::move(item.text)};
+                                       std::move(item.text), std::move(item.side)};
         if (topic == OllamaBridge::StateTopic::Inventory)
             entry.kind = item.code ? "equipped" : "bag";
         else if (topic == OllamaBridge::StateTopic::Quests)

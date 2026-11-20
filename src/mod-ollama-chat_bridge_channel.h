@@ -194,6 +194,7 @@ struct StateEntry
     int64_t first = 0;
     int64_t second = 0;
     std::string text = {};  // A default, so older brace inits stay complete.
+    std::string side = {};  // LC18g: a place row's side (alliance, horde, neutral); sent only when one of them.
 };
 
 struct ChannelQuery

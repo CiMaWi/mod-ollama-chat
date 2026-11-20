@@ -1503,6 +1503,8 @@ void OpenRows()
         };
         for (int line = 0; line < 9; ++line)
             entries.push_back({"Hogger", "deed", line, 0, "Line " + std::to_string(line)});
+        entries[5].side = "alliance";  // LC18g: Line 0 carries a place's side, Line 1 a word that is none
+        entries[6].side = "Bogus";
         std::string body;
         Check(f.policy.FinishTopic(message.envelope, f.scope, query.topic, entries, now, body) == ChannelError::None,
               "an open topic answered");
@@ -1516,6 +1518,8 @@ void OpenRows()
                                      {"extra", 4}} &&
                   list.at(2).at("text") == "Line 0" && list.at(5).at("text") == "Line 3",
               "the lines form, unusable entries dropped, cut at the row's limit");
+        Check(list.at(2).at("side") == "alliance" && !list.at(3).contains("side") && !list.at(0).contains("side"),
+              "LC18g: a place's side passes when it is one of the three words; none or another word sends no key");
         Check(list.at(1).at("row") == "deed" &&
                   list.at(1).at("text").get<std::string>().size() == ChannelMaxTopicText &&
                   list.at(1).at("value") == 0 && list.at(1).at("extra") == UINT32_MAX,
