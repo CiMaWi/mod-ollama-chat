@@ -20,7 +20,8 @@ std::array<std::atomic<bool>, ChatRowCount> g_present{};
 class OllamaChatDeleteRowsScript : public WorldScript
 {
 public:
-    OllamaChatDeleteRowsScript() : WorldScript("OllamaChatDeleteRowsScript", { WORLDHOOK_ON_LOAD_CUSTOM_DATABASE_TABLE })
+    OllamaChatDeleteRowsScript()
+        : WorldScript("OllamaChatDeleteRowsScript", { WORLDHOOK_ON_LOAD_CUSTOM_DATABASE_TABLE })
     {
     }
 
