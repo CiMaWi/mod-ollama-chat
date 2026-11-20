@@ -419,7 +419,7 @@ Facts FullFacts()
     facts.who = {"Thorgrim", "Dwarf", "Warrior", "male", 42, 0};
     facts.lasting.phrase = "fights with a great axe in both hands";
     facts.lasting.crafts = {{"Mining", "expert"}, {"Blacksmithing", "journeyman"}};
-    facts.lasting.useful = {"sharpening stones"};
+    facts.lasting.makes = {{"Blacksmithing", {"Rough Sharpening Stone"}}};
     facts.lasting.standing = {{"Ironforge", "honoured"}};
     facts.lasting.guild = "Stonehearth";
     return facts;
@@ -467,7 +467,7 @@ void FactsChecks()
         "class":"Warrior","gender":"male","level":42,"side":"Alliance"},
         "phrase":"fights with a great axe in both hands",
         "crafts":[{"name":"Mining","rank":"expert"},{"name":"Blacksmithing","rank":"journeyman"}],
-        "useful":["sharpening stones"],"standing":[{"faction":"Ironforge","word":"honoured"}],"guild":"Stonehearth"})"),
+        "makes":[{"craft":"Blacksmithing","items":["Rough Sharpening Stone"]}],"standing":[{"faction":"Ironforge","word":"honoured"}],"guild":"Stonehearth"})"),
           "lc10: facts encoded with their keys, empty lists left out");
     auto const dropped = [&request](auto&& spoil)
     {
@@ -487,7 +487,8 @@ void FactsChecks()
     facts.lasting.phrase = std::string(96, 'p');
     facts.lasting.crafts = {{"Mining", ""}, {"", "expert"}, {"Herbalism", std::string(40, 'r')}};
     facts.lasting.standing.clear();
-    facts.lasting.useful.assign(13, "torch");
+    facts.lasting.makes.assign(9, {"Cooking", {"a", "b", "c", "d", "e"}});
+    facts.lasting.makes.push_back({"", {"x"}});
     facts.lasting.servants.assign(9, "Grimtooth");
     facts.lasting.relatives = {"Brann", " "};
     PutFacts(request, facts);
@@ -496,9 +497,20 @@ void FactsChecks()
               wire["phrase"] == std::string(96, 'p') &&
               wire["crafts"] ==
                   nlohmann::json::parse(R"([{"name":"Herbalism","rank":"rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr"}])") &&
-              wire["useful"].size() == 12 && wire["servants"].size() == 8 &&
+              wire["makes"].size() == 8 && wire["makes"][0]["items"].size() == 4 && wire["servants"].size() == 8 &&
               wire["relatives"] == nlohmann::json::array({"Brann"}),
           "lc10: level capped, pairs need both texts (word cut at 32), lists at their caps, blanks dropped");
+    facts = FullFacts();
+    facts.lasting.makes.clear();
+    PutFacts(request, facts);
+    Check(InputWire(request)["facts"].contains("crafts") && !InputWire(request)["facts"].contains("makes") &&
+              !InputWire(request)["facts"].contains("useful"),
+          "lc18f: crafts known and no recipe useful: the craft without makes, and no useful key any more");
+    facts.lasting.makes = {{"Cooking", {"Boiled Clams", " "}}, {"Alchemy", {}}, {"Tailoring", {" "}}};
+    PutFacts(request, facts);
+    Check(InputWire(request)["facts"]["makes"] ==
+              nlohmann::json::parse(R"([{"craft":"Cooking","items":["Boiled Clams"]}])"),
+          "lc18f: an item without text, a craft without items are dropped");
     facts.lasting.phrase = std::string(97, 'p');
     PutFacts(request, facts);
     Check(InputWire(request)["facts"]["phrase"] == std::string(96, 'p'), "lc10: phrase cut at 96 bytes");
@@ -607,7 +619,7 @@ void FactsChecks()
     cap.lasting.guild = std::string(64, 'x');
     cap.lasting.phrase = std::string(96, 'p');
     cap.lasting.crafts.assign(8, {std::string(64, 'c'), std::string(32, 'r')});
-    cap.lasting.useful.assign(12, std::string(64, 'u'));
+    cap.lasting.makes.assign(8, {std::string(64, 'm'), std::vector<std::string>(4, std::string(64, 'u'))});
     cap.lasting.servants.assign(8, std::string(64, 's'));
     cap.lasting.standing.assign(6, {std::string(64, 'f'), std::string(32, 'w')});
     cap.lasting.relatives.assign(8, std::string(64, 'k'));

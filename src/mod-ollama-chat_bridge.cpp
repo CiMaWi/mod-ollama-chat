@@ -166,7 +166,8 @@ void PutPairList(nlohmann::json& json, char const* key, std::vector<std::pair<st
 }
 
 constexpr std::size_t MaxFactCrafts = 8;
-constexpr std::size_t MaxFactUseful = 12;
+constexpr std::size_t MaxFactMakes = 8;
+constexpr std::size_t MaxFactMakeItems = 4;
 constexpr std::size_t MaxFactServants = 8;
 constexpr std::size_t MaxFactStanding = 6;
 constexpr std::size_t MaxFactRelatives = 8;
@@ -194,6 +195,31 @@ void PutVisitList(nlohmann::json& json, std::vector<PlayerbotBridge::BotVisit> c
         json["visits"] = std::move(list);
 }
 
+// LC18f `facts.makes`: what the bot's recipes make that is useful, by craft: {craft, items} with at most
+// MaxFactMakeItems item names; a craft without a name or without a surviving item is dropped.
+void PutMakesList(nlohmann::json& json, std::vector<PlayerbotBridge::BotMake> const& makes)
+{
+    nlohmann::json list = nlohmann::json::array();
+    for (PlayerbotBridge::BotMake const& make : makes)
+    {
+        if (list.size() == MaxFactMakes)
+            break;
+        auto craft = WireText(make.craft, MaxFactBytes);
+        nlohmann::json items = nlohmann::json::array();
+        for (std::string const& item : make.items)
+        {
+            if (items.size() == MaxFactMakeItems)
+                break;
+            if (auto text = WireText(item, MaxFactBytes))
+                items.push_back(std::move(*text));
+        }
+        if (craft && !items.empty())
+            list.push_back({{"craft", std::move(*craft)}, {"items", std::move(items)}});
+    }
+    if (!list.empty())
+        json["makes"] = std::move(list);
+}
+
 // LC10 `input.facts`: who the bot is (the fact rule), how it fights, its crafts, standing and kin. False when who
 // or the phrase does not survive the bounds; the module then leaves the whole object out.
 bool FactsJson(BotWho const& bot, PlayerbotBridge::BotFacts const& facts, nlohmann::json& json)
@@ -213,7 +239,7 @@ bool FactsJson(BotWho const& bot, PlayerbotBridge::BotFacts const& facts, nlohma
         return false;
     json = {{"who", std::move(who)}, {"phrase", std::move(*phrase)}};
     PutPairList(json, "crafts", facts.crafts, MaxFactCrafts, "name", "rank");
-    PutTextList(json, "useful", facts.useful, MaxFactUseful, MaxFactBytes);
+    PutMakesList(json, facts.makes);
     PutTextList(json, "servants", facts.servants, MaxFactServants, MaxFactBytes);
     PutPairList(json, "standing", facts.standing, MaxFactStanding, "faction", "word");
     PutFact(json, "guild", facts.guild);
