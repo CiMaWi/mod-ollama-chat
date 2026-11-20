@@ -170,6 +170,29 @@ constexpr std::size_t MaxFactUseful = 12;
 constexpr std::size_t MaxFactServants = 8;
 constexpr std::size_t MaxFactStanding = 6;
 constexpr std::size_t MaxFactRelatives = 8;
+constexpr std::size_t MaxFactVisits = 24;
+
+// LC18e `facts.visits`: where the bot has been, newest first: {name, kind, land, ago}; an entry missing its name or
+// kind is dropped, land is absent when the game gave none, ago is in seconds.
+void PutVisitList(nlohmann::json& json, std::vector<PlayerbotBridge::BotVisit> const& visits)
+{
+    nlohmann::json list = nlohmann::json::array();
+    for (PlayerbotBridge::BotVisit const& visit : visits)
+    {
+        if (list.size() == MaxFactVisits)
+            break;
+        auto name = WireText(visit.name, MaxFactBytes);
+        auto kind = WireText(visit.kind, MaxFactWordBytes);
+        if (!name || !kind)
+            continue;
+        nlohmann::json entry = {{"name", std::move(*name)}, {"kind", std::move(*kind)}, {"ago", visit.ago}};
+        if (auto land = WireText(visit.land, MaxFactBytes))
+            entry["land"] = std::move(*land);
+        list.push_back(std::move(entry));
+    }
+    if (!list.empty())
+        json["visits"] = std::move(list);
+}
 
 // LC10 `input.facts`: who the bot is (the fact rule), how it fights, its crafts, standing and kin. False when who
 // or the phrase does not survive the bounds; the module then leaves the whole object out.
@@ -195,6 +218,7 @@ bool FactsJson(BotWho const& bot, PlayerbotBridge::BotFacts const& facts, nlohma
     PutPairList(json, "standing", facts.standing, MaxFactStanding, "faction", "word");
     PutFact(json, "guild", facts.guild);
     PutTextList(json, "relatives", facts.relatives, MaxFactRelatives, MaxFactBytes);
+    PutVisitList(json, facts.visits);
     return true;
 }
 

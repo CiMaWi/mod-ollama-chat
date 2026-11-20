@@ -503,6 +503,27 @@ void FactsChecks()
     PutFacts(request, facts);
     Check(InputWire(request)["facts"]["phrase"] == std::string(96, 'p'), "lc10: phrase cut at 96 bytes");
 
+    // LC18e: visits in the reader's order, land only when given, an entry without its name or kind dropped, at most 24.
+    facts = FullFacts();
+    facts.lasting.visits = {{"The Deadmines", "dungeon", "Eastern Kingdoms", 60},
+                            {"Eastern Kingdoms", "continent", "", 3600},
+                            {"", "zone", "Kalimdor", 1},
+                            {"Elwynn Forest", " ", "Eastern Kingdoms", 1}};
+    PutFacts(request, facts);
+    Check(InputWire(request)["facts"]["visits"] == nlohmann::json::parse(R"([
+        {"name":"The Deadmines","kind":"dungeon","land":"Eastern Kingdoms","ago":60},
+        {"name":"Eastern Kingdoms","kind":"continent","ago":3600}])"),
+          "lc18e: visits with name, kind, land when given and ago; an entry without name or kind dropped");
+    facts.lasting.visits.assign(25, {"Westfall", "zone", std::string(65, 'l'), 4294967295u});
+    PutFacts(request, facts);
+    wire = InputWire(request)["facts"];
+    Check(wire["visits"].size() == 24 && wire["visits"][0]["land"] == std::string(64, 'l') &&
+              wire["visits"][0]["ago"] == 4294967295u,
+          "lc18e: visits at most 24, land cut at 64 bytes, ago whole");
+    facts.lasting.visits.assign(2, {" ", "zone", "", 5});
+    PutFacts(request, facts);
+    Check(!InputWire(request)["facts"].contains("visits"), "lc18e: no visits key without a valid entry");
+
     // Traits: each word whole within 1024 bytes (never cut at 64), 32 words, 3 interests; one list alone is fine.
     request = Request();
     std::string const longWord = std::string(1023, 'w') + "\xC3\xA9";  // 1025 bytes, byte 1024 inside a character.
@@ -590,6 +611,7 @@ void FactsChecks()
     cap.lasting.servants.assign(8, std::string(64, 's'));
     cap.lasting.standing.assign(6, {std::string(64, 'f'), std::string(32, 'w')});
     cap.lasting.relatives.assign(8, std::string(64, 'k'));
+    cap.lasting.visits.assign(24, {std::string(64, 'n'), "continent", std::string(64, 'l'), 4294967295u});
     PutFacts(request, cap);
     request.input.traits.words.assign(32, "extremely careful");
     request.input.traits.interests.assign(3, "inns and ale");
@@ -613,6 +635,7 @@ void FactsChecks()
     std::size_t const realistic = body.size();
     auto const capped = nlohmann::json::parse(body)["input"];
     Check(capped["state"]["around"].size() == 12 && capped["facts"]["crafts"].size() == 8 &&
+              capped["facts"]["visits"].size() == 24 &&
               capped["state"]["deeds"].size() == 3 && capped["state"].contains(std::string(24, 'h')) &&
               capped["state"]["around"][11].contains(std::string(24, 'h')),
           "lc10: every list at its cap is sent whole");
