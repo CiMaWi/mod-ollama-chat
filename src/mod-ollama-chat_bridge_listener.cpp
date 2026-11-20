@@ -9,6 +9,7 @@
 #include <thread>
 
 #include "./httplib.h"
+#include "mod-ollama-chat_bridge_json.h"
 
 namespace OllamaBridge
 {
@@ -21,7 +22,6 @@ static_assert(std::string_view{CPPHTTPLIB_VERSION} == "0.23.1",
 
 constexpr std::string_view RoutePrefix = "/v1/channel/";
 constexpr std::size_t MaxRouteBytes = 128;
-constexpr std::size_t MaxBearerBytes = 256;  // WorldChannel::Authenticated never accepts a longer bearer.
 constexpr time_t IoTimeoutSec = 2;
 // One handler per mailbox slot: a handler blocks while the world answers, so fewer would cap the world's TickBudget.
 constexpr std::size_t Workers = WorldChannel::MaxPackets;
@@ -45,7 +45,7 @@ constexpr std::array<StatusEntry, 10> StatusTable{{
     {ChannelError::Duplicate, 409},
     {ChannelError::Capacity, 429},
     {ChannelError::Closed, 410},
-    {ChannelError::Unknown, 400},  // A packet type with no reverse adapter (e.g. a generation result) is bad input.
+    {ChannelError::Unknown, 400},  // A route or receipt the mailbox does not know is bad input.
 }};
 
 bool JsonSpace(char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; }
@@ -93,31 +93,16 @@ bool ListenerPortValid(uint32_t port) { return port >= 1024 && port <= 65535; }
 
 bool ListenerTokenValid(std::string_view token)
 {
-    // ValidSettings' minimum; Authenticated's maximum (a longer token could never be presented successfully).
+    // ValidSettings' minimum; BearerMatches' maximum (a longer token could never be presented successfully).
     return token.size() >= 22 && token.size() <= MaxBearerBytes;
 }
 
 bool ListenerPeerAllowed(std::string_view remoteAddr) { return remoteAddr == ListenerHost; }
 
-bool ListenerBearerMatches(std::string_view authorization, std::string_view token)
-{
-    constexpr std::string_view scheme = "Bearer ";
-    // The scheme and the length bound are public; only the secret bytes are compared in constant time.
-    if (token.empty() || token.size() > MaxBearerBytes || authorization.size() < scheme.size() ||
-        authorization.size() > scheme.size() + MaxBearerBytes || authorization.substr(0, scheme.size()) != scheme)
-        return false;
-    std::string_view const bearer = authorization.substr(scheme.size());
-    std::size_t difference = token.size() ^ bearer.size();
-    for (std::size_t i = 0; i < MaxBearerBytes; ++i)
-        difference |= (i < token.size() ? static_cast<unsigned char>(token[i]) : 0) ^
-                      (i < bearer.size() ? static_cast<unsigned char>(bearer[i]) : 0);
-    return difference == 0;
-}
-
 bool ListenerRouteValid(std::string_view route)
 {
     // The module's identifier rule; percent-encoding, '/' and '?' never pass it.
-    return route.size() <= MaxRouteBytes && ValidIdentifier(std::string(route));
+    return route.size() <= MaxRouteBytes && ValidIdentifier(route);
 }
 
 bool ListenerBodyShape(std::string_view body)
@@ -263,7 +248,7 @@ bool ChannelListener::StartLocked(uint32_t port, std::string token)
             Reply(res, 403, "forbidden");
             return false;
         }
-        if (!ListenerBearerMatches(req.get_header_value("Authorization"), current->token))
+        if (!BearerMatches(req.get_header_value("Authorization"), current->token))
         {
             ++_unauthorized;
             Reply(res, ChannelError::Unauthorized);
@@ -325,7 +310,7 @@ bool ChannelListener::StartLocked(uint32_t port, std::string token)
                     auto const until = std::chrono::steady_clock::now() +
                                        std::chrono::milliseconds(ListenerWaitMs(req.body, UnixMs()));
                     uint64_t receipt = 0;
-                    ChannelError const received = _receive(current->token, route, req.body, receipt);
+                    ChannelError const received = _receive(route, req.body, receipt);
                     if (received != ChannelError::None)
                     {
                         Reply(res, received);
@@ -337,7 +322,7 @@ bool ChannelListener::StartLocked(uint32_t port, std::string token)
                     std::unique_ptr<ChannelPacket> packet;
                     while (true)
                     {
-                        ChannelError const taken = _take(current->token, receipt, packet);
+                        ChannelError const taken = _take(receipt, packet);
                         if (taken == ChannelError::None && packet)
                             break;
                         if (taken != ChannelError::None && taken != ChannelError::Unknown)

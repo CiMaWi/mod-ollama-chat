@@ -33,8 +33,6 @@ struct ListenerStats
 bool ListenerPortValid(uint32_t port);
 bool ListenerTokenValid(std::string_view token);
 bool ListenerPeerAllowed(std::string_view remoteAddr);
-// Exactly "Bearer " + token, compared in constant time over a fixed 256 bytes like WorldChannel::Authenticated.
-bool ListenerBearerMatches(std::string_view authorization, std::string_view token);
 bool ListenerRouteValid(std::string_view route);
 // A cheap shape gate (one JSON object) so plain junk never takes a mailbox slot; the mailbox decodes strictly.
 bool ListenerBodyShape(std::string_view body);
@@ -47,10 +45,9 @@ int ListenerStatus(ChannelError error);
 class ChannelListener
 {
 public:
-    using Receive = std::function<ChannelError(std::string_view bearer, std::string_view route, std::string_view body,
-                                               uint64_t& receipt)>;
-    using Take =
-        std::function<ChannelError(std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)>;
+    // Called only after BearerMatches passed (LCB6a: the one bearer check).
+    using Receive = std::function<ChannelError(std::string_view route, std::string_view body, uint64_t& receipt)>;
+    using Take = std::function<ChannelError(uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)>;
     // Lines hold fixed text and the port only: no token, header, route or body ever reaches the log.
     using Log = std::function<void(bool warning, std::string const& line)>;
 

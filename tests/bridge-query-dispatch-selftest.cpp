@@ -224,7 +224,6 @@ const char* ChatChannelSourceLocalStr[] = {"Undefined", "Say", "Party", "Raid", 
 
 OllamaEndpointSettings OllamaConfig_Snapshot() { return {}; }
 OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const&, OllamaBridge::Request const&) { return {}; }
-void OllamaBridge_SetActivation(OllamaBridge::Identity) {}
 std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t) { return text; }
 std::string Roleplay_FilterMetaTerms(std::string const& text) { return text; }
 bool OllamaIsBotPlayer(Player* player) { return !player->human; }
@@ -359,16 +358,14 @@ struct Fixture
     uint64_t Receive()
     {
         uint64_t receipt = 0;
-        Check(OllamaDispatch_ChannelReceive(settings.token, ticket.request.requestId, Query(), receipt) ==
-                  ChannelError::None,
+        Check(OllamaDispatch_ChannelReceive(ticket.request.requestId, Query(), receipt) == ChannelError::None,
               "actual dispatcher receive");
         return receipt;
     }
     std::unique_ptr<ChannelPacket> Take(uint64_t receipt)
     {
         std::unique_ptr<ChannelPacket> packet;
-        Check(OllamaDispatch_ChannelTake(settings.token, receipt, packet) == ChannelError::None && packet,
-              "actual dispatcher take");
+        Check(OllamaDispatch_ChannelTake(receipt, packet) == ChannelError::None && packet, "actual dispatcher take");
         return packet;
     }
 };
@@ -433,7 +430,7 @@ void Queries()
         };
         Check(g_bridgeChannel.Update() == 1 && resolutions >= 7, "reach post-serialization world validation");
         std::unique_ptr<ChannelPacket> packet;
-        Check(OllamaDispatch_ChannelTake(settings.token, receipt, packet) == ChannelError::Unknown && !packet &&
+        Check(OllamaDispatch_ChannelTake(receipt, packet) == ChannelError::Unknown && !packet &&
                   g_bridgeChannel.Drained(),
               "stale serialized query never becomes consumable");
     }
@@ -496,7 +493,7 @@ void Lifetimes()
         channel.Configure(true);
         Check(channel.Activate() && channel.Register(f.ticket, f.guard), "controlled-clock production channel");
         uint64_t receipt = 0;
-        Check(channel.Receive(settings.token, f.ticket.request.requestId, f.Query(), receipt) == ChannelError::None,
+        Check(channel.Receive(f.ticket.request.requestId, f.Query(), receipt) == ChannelError::None,
               "capture bounded query packet age");
         if (clock == 0)
             clockNow.unixMs += WorldLivenessMs;
@@ -509,7 +506,7 @@ void Lifetimes()
         Check(g_bridgeWorld.ObserveScope(f.guard.scope, clockNow), "heartbeat cannot renew packet age");
         Check(channel.Update() == 1 && channel.Drained(), "either clock expires at equality, including rollback");
         std::unique_ptr<ChannelPacket> packet;
-        Check(channel.Take(settings.token, receipt, packet) == ChannelError::Unknown && !packet,
+        Check(channel.Take(receipt, packet) == ChannelError::Unknown && !packet,
               "expired query never enters publication map");
     }
     {
@@ -517,8 +514,8 @@ void Lifetimes()
         for (unsigned i = 0; i < 12; ++i)
         {
             uint64_t receipt = 0;
-            Check(OllamaDispatch_ChannelReceive(settings.token, f.ticket.request.requestId,
-                                                f.Query("query-" + std::to_string(i)), receipt) == ChannelError::None,
+            Check(OllamaDispatch_ChannelReceive(f.ticket.request.requestId, f.Query("query-" + std::to_string(i)),
+                                                receipt) == ChannelError::None,
                   "admit bounded receive batch");
         }
         Check(g_bridgeChannel.Update() == WorldChannel::TickBudget, "eight dequeues per world tick");
@@ -527,9 +524,8 @@ void Lifetimes()
         Check(g_bridgeChannel.Drained(), "reload disposes both receive and completion payloads");
         Check(!g_bridgeChannel.Activate(), "reconnect cannot reuse retired epoch");
         uint64_t receipt = 0;
-        Check(OllamaDispatch_ChannelReceive(settings.token, f.ticket.request.requestId, f.Query(), receipt) ==
-                  ChannelError::Unauthorized,
-              "retired bearer cannot admit old routes");
+        Check(OllamaDispatch_ChannelReceive(f.ticket.request.requestId, f.Query(), receipt) == ChannelError::Inactive,
+              "a retired channel cannot admit old routes");
     }
     {
         Fixture f;
@@ -538,8 +534,7 @@ void Lifetimes()
         Check(g_bridgeChannel.Update() == 0, "reload invalidates selection before world work");
         g_bridgeChannel.Retire();
         std::unique_ptr<ChannelPacket> packet;
-        Check(OllamaDispatch_ChannelTake(settings.token, receipt, packet) == ChannelError::Unauthorized &&
-                  g_bridgeChannel.Drained(),
+        Check(OllamaDispatch_ChannelTake(receipt, packet) == ChannelError::Inactive && g_bridgeChannel.Drained(),
               "reload failure disposes old queued payload");
     }
 }

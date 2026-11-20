@@ -37,7 +37,6 @@ enum class WorldOutcome : uint8_t
     Filtered,
     Malformed,
     Timeout,
-    CircuitOpen,
     QueueFull,
     Cancelled
 };
@@ -241,8 +240,9 @@ public:
     // J6e-c: the bots' watches, armed through Update and scanned by the post-map-join dispatcher; world only.
     WatchTable& Watches() { return _watches; }
     WatchTable const& Watches() const { return _watches; }
-    ChannelError Receive(std::string_view bearer, std::string_view route, std::string_view body, uint64_t& receipt);
-    ChannelError Take(std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet);
+    // Unbound, both answer Inactive; the listener checked the bearer before it calls them (LCB6a).
+    ChannelError Receive(std::string_view route, std::string_view body, uint64_t& receipt);
+    ChannelError Take(uint64_t receipt, std::unique_ptr<ChannelPacket>& packet);
 
 private:
     struct Binding
@@ -251,7 +251,6 @@ private:
         DispatchGuard guard;
         bool acted = false;  // An authorized effect attempt on this route, its receipt published or not (DS.14).
     };
-    bool Authenticated(std::string_view bearer) const;  // Caller holds _mutex.
     bool Fresh(Binding const& binding, Clock now) const;
     // Finishes one admitted command exactly once; attempted reports an authorized effect attempt.
     ChannelError Command(Binding const& binding, ChannelEnvelope const& envelope, ChannelCommand const& command,
@@ -278,7 +277,7 @@ private:
     std::unordered_map<std::string, Binding> _bindings;
     std::shared_ptr<std::atomic<std::size_t>> _used = std::make_shared<std::atomic<std::size_t>>(0);
     mutable std::mutex _mutex;
-    std::string _bearer;
+    bool _bound = false;  // Bound to the selected epoch; guarded by _mutex.
     uint64_t _serial = 0;
     uint64_t _sequence = 0;
     std::deque<std::unique_ptr<ChannelPacket>> _receive;

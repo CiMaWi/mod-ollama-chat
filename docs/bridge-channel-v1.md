@@ -11,8 +11,11 @@ J6 owns execution; J9C/X owns live proof. The transport is J5d's `src/mod-ollama
 bounds bytes and hands each envelope to `Receive`/`Take` (wire: HUB `bridge/game/README.md`). J11C/X owns the tools.
 
 The semantic source is HUB `bridge/game/README.md`, `boundary.js` and `examples.json` (frozen J2 v1).
-`Receive` authenticates the local game-link bearer before checking body size or parsing JSON. Subscription
-credentials never belong here. The helper returns fixed `ChannelErrorName` strings, never payloads, tokens or
+The listener's `BearerMatches` is the one check of the local game-link bearer, made before any body byte is read;
+`Receive`/`Take` take no bearer. A channel that is not bound (never bound, retired, or after a refused rebind)
+answers `inactive` (503) before checking body size or parsing JSON. Subscription credentials never belong here.
+`src/mod-ollama-chat_bridge_json.h` is the one home of the wire checks the bridge files share: the strict parse,
+identifiers, received and sent text, the envelope and the bearer compare (LCB6a). The helper returns fixed `ChannelErrorName` strings, never payloads, tokens or
 exception text. The transport must bound bytes while receiving, authenticate every operation and bind literal
 127.0.0.1. A received body is limited to 65536 bytes before JSON parsing, nesting to 16, with duplicate keys refused.
 All JSON objects have exact fields; numeric integer fields reject floating-point JSON representations.
@@ -27,8 +30,7 @@ work replies must preserve the original wall deadline exactly. Wall-clock rollba
 | --- | --- | --- |
 | query | controllerGuid, botGuid, query:"observable_group" or "catalogue", or query:"bot_state" with topic (route: and place) | Authenticated native to game |
 | command | commandId, issuerGuid, botGuid, steps (LC3b; LCB2: the only form) | Authenticated native to game; staged typed proposal |
-| generation.result | text (1..4096 bytes, usable text, no NUL) | Authenticated native to game |
-| failure | code: unavailable/timeout/invalid_input/cancelled | Authenticated native to game, or game FinishFailure; terminal |
+| failure | code: unavailable/timeout/invalid_input/cancelled | Game-created by FinishFailure (a query the game cannot answer, a route the game cancels); never inbound |
 | query.result | units; a catalogue query: catalogue | Game-created by FinishQuery, FinishCatalogue |
 | command.result | commandId, outcome: applied/rejected/failed; a stepped command: steps | Game-created by FinishCommand |
 
@@ -121,14 +123,15 @@ activation/currentness guards before acceptance and publication; this in-process
 Generations must be registered by the game. Inbound queries may create a new request reservation only under a live
 generation route, against an already registered current scope and matching controller/bot. Queries share the
 request-id replay namespace but can never authorize commands. Commands need an open generation request and matching
-controller/bot/deadline. Only one terminal generation result or failure is accepted; commands must precede it. A
+controller/bot/deadline. The route ends by the game (`Close`/`Cancel`) or at its deadline; an inbound
+`generation.result` or `failure` (like any other type) is `invalid_input` and closes nothing (LCB6a). A
 command's result is terminal once and is reported only while its route is open: `WorldChannel` finishes every
 command in the tick that received it, and the route's terminal drops its ids (LC.35). `Current(...,
 requireOpen=true)` rejects closed requests. Duplicate/stale/malformed input yields no output message; output bodies
 clear before refused operations.
 
 The ledger holds live routes only (LC.35). A generation route keeps its own id and the query and command ids opened
-under it, at most 64 of those per route, until its terminal (generation result or failure, received or local), its
+under it, at most 64 of those per route, until its terminal (the game's Close or failure), its
 deadline (at most 120000 ms) or `WorldChannel::Close`; then all of them are dropped together. Within a live route a
 repeated id stays refused (duplicate, or closed for a finished query); once the route is gone every one of its ids,
 a command id included, finds no route and is refused as `unknown_request`, so a late replay can never land on the

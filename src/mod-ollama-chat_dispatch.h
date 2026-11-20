@@ -131,11 +131,11 @@ void OllamaDispatch_BridgeConfigured(bool channelEnabled = false);
 void OllamaDispatch_BridgeListen(bool channelEnabled, uint32_t port);
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld();
 
-// Shared native-adapter boundary; every I/O operation authenticates the local game-link bearer.
+// Shared native-adapter boundary; the listener checked the local game-link bearer before it calls these (LCB6a).
 // route is an existing game-issued generation request id, never a wire-authored world scope.
-OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer, std::string_view route,
-                                                         std::string_view body, uint64_t& receipt);
-OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, uint64_t receipt,
+OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view route, std::string_view body,
+                                                         uint64_t& receipt);
+OllamaBridge::ChannelError OllamaDispatch_ChannelTake(uint64_t receipt,
                                                       std::unique_ptr<OllamaBridge::ChannelPacket>& packet);
 
 struct OllamaDispatchStats

@@ -15,15 +15,12 @@
 #include <utility>
 #include <variant>
 
+#include "mod-ollama-chat_bridge_json.h"
+
 namespace OllamaBridge
 {
 namespace
 {
-bool AsciiLetterOrDigit(unsigned char c)
-{
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
-}
-
 bool ValidContext(Context const& input)
 {
     if (!input.speakerGuid || input.channel.empty() || input.channel.size() > 128 || input.text.empty() ||
@@ -51,46 +48,6 @@ bool ValidRequest(Settings const& settings, Request const& request, Clock now)
     return ValidSettings(settings) && ValidIdentifier(request.epoch) && ValidIdentifier(request.requestId) &&
            request.controllerGuid && request.botGuid && ValidContext(request.input) &&
            RemainingMs(request.deadline, now) > 0;
-}
-
-bool MatchesString(nlohmann::json const& body, char const* key, std::string const& expected)
-{
-    auto const it = body.find(key);
-    return it != body.end() && it->is_string() && it->get_ref<std::string const&>() == expected;
-}
-
-bool Blank(std::string const& value)
-{
-    return std::all_of(value.begin(), value.end(),
-                       [](unsigned char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
-}
-
-// One text on the wire: control characters dropped, cut to maxBytes on a character boundary; none when blank or not
-// valid UTF-8 (the envelope dump would throw).
-std::optional<std::string> WireText(std::string const& value, std::size_t maxBytes)
-{
-    std::string text;
-    for (unsigned char byte : value)
-        if (byte >= 0x20 && byte != 0x7F)
-            text.push_back(static_cast<char>(byte));
-    if (text.size() > maxBytes)
-    {
-        std::size_t cut = maxBytes;
-        while (cut && (static_cast<unsigned char>(text[cut]) & 0xC0) == 0x80)
-            --cut;
-        text.resize(cut);
-    }
-    if (Blank(text))
-        return std::nullopt;
-    try
-    {
-        static_cast<void>(nlohmann::json(text).dump());
-    }
-    catch (nlohmann::json::exception const&)
-    {
-        return std::nullopt;
-    }
-    return text;
 }
 
 // A text under its key, left out when WireText gives none.
@@ -466,13 +423,6 @@ bool Identity::operator==(Identity const& other) const
            epoch == other.epoch;
 }
 
-bool ValidIdentifier(std::string const& value)
-{
-    return !value.empty() && value.size() <= 128 && AsciiLetterOrDigit(value.front()) &&
-           std::all_of(value.begin(), value.end(), [](unsigned char c)
-                       { return AsciiLetterOrDigit(c) || c == '_' || c == '.' || c == ':' || c == '-'; });
-}
-
 bool ValidEndpoint(std::string const& value)
 {
     std::string const prefix = "http://127.0.0.1";
@@ -570,25 +520,19 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
                 entry["visibleTargetGuid"] = std::to_string(participant.visibleTargetGuid);
             party.push_back(std::move(entry));
         }
-        nlohmann::json envelope = {{"version", 1},
-                                   {"instance", settings.instance},
-                                   {"provider", settings.provider},
-                                   {"epoch", request.epoch},
-                                   {"requestId", request.requestId},
-                                   {"deadlineUnixMs", request.deadline.unixMs},
-                                   {"type", "generation"},
-                                   {"controllerGuid", std::to_string(request.controllerGuid)},
-                                   {"botGuid", std::to_string(request.botGuid)},
-                                   {"input",
-                                    {{"channel", input.channel},
-                                     {"text", input.text},
-                                     {"observations", input.observations},
-                                     {"speakerGuid", std::to_string(input.speakerGuid)},
-                                     {"memory", input.memory},
-                                     {"groupScope", input.groupScope},
-                                     {"directAddress", input.directAddress},
-                                     {"speakerControlsBot", input.speakerControlsBot},
-                                     {"party", std::move(party)}}}};
+        auto envelope = Envelope(settings.instance, settings.provider, request.epoch, request.requestId,
+                                 request.deadline.unixMs, "generation");
+        envelope["controllerGuid"] = std::to_string(request.controllerGuid);
+        envelope["botGuid"] = std::to_string(request.botGuid);
+        envelope["input"] = {{"channel", input.channel},
+                             {"text", input.text},
+                             {"observations", input.observations},
+                             {"speakerGuid", std::to_string(input.speakerGuid)},
+                             {"memory", input.memory},
+                             {"groupScope", input.groupScope},
+                             {"directAddress", input.directAddress},
+                             {"speakerControlsBot", input.speakerControlsBot},
+                             {"party", std::move(party)}};
         // LC10: the lasting facts and the trait words, each only when there is something to say.
         if (nlohmann::json facts; input.facts && FactsJson(input.who, *input.facts, facts))
             envelope["input"]["facts"] = std::move(facts);
@@ -626,19 +570,7 @@ Result Parse(Settings const& settings, Request const& request, std::string const
         return result;
     try
     {
-        // Reject duplicate keys before the DOM overwrites them. Bound parser nesting as well as bytes.
-        std::map<int, std::set<std::string>> keys;
-        auto callback = [&keys](int depth, nlohmann::json::parse_event_t event, nlohmann::json& value)
-        {
-            if (depth > 16)
-                throw std::runtime_error("depth");
-            if (event == nlohmann::json::parse_event_t::object_start)
-                keys[depth + 1].clear();
-            if (event == nlohmann::json::parse_event_t::key && !keys[depth].insert(value.get<std::string>()).second)
-                throw std::runtime_error("duplicate");
-            return true;
-        };
-        auto const parsed = nlohmann::json::parse(body, callback);
+        auto const parsed = StrictParse(body);
         if (!parsed.is_object() || parsed.size() != 8u || !parsed.contains("version") ||
             !parsed["version"].is_number_integer() || parsed["version"] != 1 ||
             !MatchesString(parsed, "instance", settings.instance) ||
@@ -662,8 +594,7 @@ Result Parse(Settings const& settings, Request const& request, std::string const
             return result;
         static std::string const wordless;
         auto const& text = silent ? wordless : parsed["text"].get_ref<std::string const&>();
-        if (!silent &&
-            (text.empty() || text.size() > MaxTextBytes || Blank(text) || text.find('\0') != std::string::npos))
+        if (!silent && !UsableText(text, MaxTextBytes))
             return result;
         result.ok = true;
         result.silent = silent;
@@ -677,49 +608,9 @@ Result Parse(Settings const& settings, Request const& request, std::string const
     return result;
 }
 
-void Circuit::Reset(Identity identity)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    _identity = std::move(identity);
-    ++_revision;
-    _open = false;
-    _recovering = false;
-    _retryAtMs = 0;
-}
-
-Circuit::Ticket Circuit::Acquire(Identity const& identity, int64_t steadyMs)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (_revision == 0 || !(_identity == identity) || (_open && (steadyMs < _retryAtMs || _recovering)))
-        return {};
-    if (_open)
-        _recovering = true;
-    return {_revision, true, _open};
-}
-
-void Circuit::Complete(Ticket ticket, bool success, int64_t steadyMs)
-{
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (!ticket.admitted || ticket.revision != _revision)
-        return;
-    if (!success)
-    {
-        ++_revision;
-        _open = true;
-        _recovering = false;
-        _retryAtMs = steadyMs > std::numeric_limits<int64_t>::max() - CircuitCooldownMs
-                         ? std::numeric_limits<int64_t>::max()
-                         : steadyMs + CircuitCooldownMs;
-    }
-    else if (ticket.recovery)
-    {
-        ++_revision;
-        _open = false;
-        _recovering = false;
-    }
-}
-
-Result Generate(Settings const& settings, Request const& request, Circuit& circuit, ReadClock const& readClock,
+// LCB6a: no circuit breaker. Each call is bounded by its own deadline; on 127.0.0.1 a dead bridge refuses the
+// connection at once, and one failed or malformed reply never holds back another bot's turn.
+Result Generate(Settings const& settings, Request const& request, ReadClock const& readClock,
                 Transport const& transport)
 {
     Result result;
@@ -728,12 +619,6 @@ Result Generate(Settings const& settings, Request const& request, Circuit& circu
     if (!Build(settings, request, now, body))
     {
         result.error = "bridge_expired_or_invalid_request";
-        return result;
-    }
-    auto const ticket = circuit.Acquire(MakeIdentity(settings, request), now.steadyMs);
-    if (!ticket.admitted)
-    {
-        result.error = "bridge_circuit_open_or_inactive";
         return result;
     }
     try
@@ -756,7 +641,6 @@ Result Generate(Settings const& settings, Request const& request, Circuit& circu
     {
         result.error = "bridge_unavailable";
     }
-    circuit.Complete(ticket, result.ok, readClock().steadyMs);
     return result;
 }
 

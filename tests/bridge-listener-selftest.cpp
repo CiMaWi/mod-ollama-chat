@@ -24,6 +24,7 @@
 #include <tuple>
 #include <vector>
 
+#include "mod-ollama-chat_bridge_json.h"
 #include "mod-ollama-chat_bridge_listener.h"
 #include "mod-ollama-chat_bridge_query.h"
 
@@ -256,7 +257,6 @@ bool WaitFor(Condition condition, int64_t deadlineMs = 2000)
 struct FakeMailbox
 {
     std::mutex mutex;
-    std::string expected = Token;
     unsigned receives = 0;
     std::vector<std::thread::id> threads;
     ChannelError receiveResult = ChannelError::None;
@@ -264,23 +264,20 @@ struct FakeMailbox
     uint64_t sequence = 0;
     std::map<uint64_t, std::unique_ptr<ChannelPacket>> done;
 
-    ChannelError Receive(std::string_view bearer, std::string_view, std::string_view, uint64_t& receipt)
+    // LCB6a: the listener's BearerMatches is the one bearer check; the mailbox sees only admitted posts.
+    ChannelError Receive(std::string_view, std::string_view, uint64_t& receipt)
     {
         std::lock_guard<std::mutex> lock(mutex);
         ++receives;
         threads.push_back(std::this_thread::get_id());
-        if (bearer != expected)
-            return ChannelError::Unauthorized;
         if (receiveResult != ChannelError::None)
             return receiveResult;
         receipt = ++sequence;
         return ChannelError::None;
     }
-    ChannelError Take(std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
+    ChannelError Take(uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
     {
         std::lock_guard<std::mutex> lock(mutex);
-        if (bearer != expected)
-            return ChannelError::Unauthorized;
         auto it = done.find(receipt);
         if (it == done.end())
             return pendingTake;
@@ -315,10 +312,10 @@ struct Harness
     FakeMailbox mailbox;
     std::mutex logMutex;
     std::vector<std::string> logs;
-    ChannelListener listener{[this](std::string_view bearer, std::string_view route, std::string_view body,
-                                    uint64_t& receipt) { return mailbox.Receive(bearer, route, body, receipt); },
-                             [this](std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
-                             { return mailbox.Take(bearer, receipt, packet); },
+    ChannelListener listener{[this](std::string_view route, std::string_view body, uint64_t& receipt)
+                             { return mailbox.Receive(route, body, receipt); },
+                             [this](uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
+                             { return mailbox.Take(receipt, packet); },
                              [this](bool, std::string const& line)
                              {
                                  std::lock_guard<std::mutex> lock(logMutex);
@@ -359,13 +356,12 @@ void PureRules()
               !ListenerPeerAllowed("::ffff:127.0.0.1") && !ListenerPeerAllowed("192.168.1.5") &&
               !ListenerPeerAllowed("") && !ListenerPeerAllowed("127.0.0.10"),
           "peer must be literal 127.0.0.1");
-    Check(ListenerBearerMatches("Bearer " + Token, Token), "exact bearer matches");
+    Check(BearerMatches("Bearer " + Token, Token), "exact bearer matches");
     for (std::string const& header :
          {std::string(), Token, "bearer " + Token, "Bearer  " + Token, "Bearer" + Token, "Basic " + Token,
           "Bearer " + Token + "x", "Bearer " + Token.substr(1), "Bearer " + Token2, std::string("Bearer ")})
-        Check(!ListenerBearerMatches(header, Token), "miswritten, short, long or other bearer refused");
-    Check(!ListenerBearerMatches("Bearer ", "") &&
-              !ListenerBearerMatches("Bearer " + std::string(257, 'a'), std::string(257, 'a')),
+        Check(!BearerMatches(header, Token), "miswritten, short, long or other bearer refused");
+    Check(!BearerMatches("Bearer ", "") && !BearerMatches("Bearer " + std::string(257, 'a'), std::string(257, 'a')),
           "empty or over-256 token never authenticates");
     Check(ListenerRouteValid("gen-1") && ListenerRouteValid("a.b:c_d-e") && ListenerRouteValid(std::string(128, 'r')),
           "identifier routes pass");
@@ -416,7 +412,6 @@ void Configuration()
           "the old port is closed after the move");
     Check(Error(Exchange(moved, Http("GET", "/v1/channel/x", "")), 401, "unauthorized"), "moved listener answers");
     Check(h.listener.Configure(true, moved, Token2) && h.listener.Starts() == 3, "a token change restarts");
-    h.mailbox.expected = Token2;
     h.mailbox.Set(ChannelError::Duplicate);
     Check(Error(Refused(moved, Token), 401, "unauthorized") && h.mailbox.Receives() == 0,
           "the old token is refused before the mailbox");
@@ -726,10 +721,10 @@ struct RealFixture
 void RealChannel()
 {
     RealFixture f;
-    ChannelListener listener([&](std::string_view bearer, std::string_view route, std::string_view body,
-                                 uint64_t& receipt) { return f.channel.Receive(bearer, route, body, receipt); },
-                             [&](std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
-                             { return f.channel.Take(bearer, receipt, packet); });
+    ChannelListener listener([&](std::string_view route, std::string_view body, uint64_t& receipt)
+                             { return f.channel.Receive(route, body, receipt); },
+                             [&](uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
+                             { return f.channel.Take(receipt, packet); });
     uint16_t const port = FreePort();
     Check(listener.Configure(true, port, Token), "listener over the production mailbox");
     std::string const route = f.ticket.request.requestId;

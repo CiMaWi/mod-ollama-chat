@@ -9,22 +9,14 @@
 #include <tuple>
 #include <utility>
 
+#include "mod-ollama-chat_bridge_json.h"
+
 namespace OllamaBridge
 {
 namespace
 {
 using Json = nlohmann::json;
-constexpr int64_t MaxSafeInteger = 9007199254740991LL;
 constexpr int64_t ScopeLifetimeMs = 5000;
-
-bool Identifier(std::string const& value)
-{
-    auto alnum = [](unsigned char c)
-    { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); };
-    return !value.empty() && value.size() <= 128 && alnum(value.front()) &&
-           std::all_of(value.begin(), value.end(),
-                       [&](unsigned char c) { return alnum(c) || c == '_' || c == '.' || c == ':' || c == '-'; });
-}
 
 bool SameScope(WorldScope const& a, WorldScope const& b)
 {
@@ -46,59 +38,12 @@ bool Alive(Deadline deadline, Clock now)
     return now.unixMs >= 0 && now.steadyMs >= 0 && now.unixMs < deadline.unixMs && now.steadyMs < deadline.steadyMs;
 }
 
-bool Exact(Json const& value, std::initializer_list<char const*> fields)
-{
-    return value.is_object() && value.size() == fields.size() &&
-           std::all_of(fields.begin(), fields.end(), [&](char const* field) { return value.contains(field); });
-}
-
-std::string String(Json const& value)
-{
-    if (!value.is_string())
-        throw std::runtime_error("invalid");
-    return value.get<std::string>();
-}
-
-uint64_t Guid(Json const& value)
-{
-    auto const text = String(value);
-    if (text.empty() || text.size() > 20 || (text.size() > 1 && text.front() == '0'))
-        throw std::runtime_error("invalid");
-    uint64_t result = 0;
-    for (unsigned char c : text)
-    {
-        if (c < '0' || c > '9' || result > (std::numeric_limits<uint64_t>::max() - (c - '0')) / 10)
-            throw std::runtime_error("invalid");
-        result = result * 10 + c - '0';
-    }
-    if (!result)
-        throw std::runtime_error("invalid");
-    return result;
-}
-
-uint64_t Integer(Json const& value, uint64_t max)
-{
-    if (!value.is_number_integer() || (value.is_number_integer() && !value.is_number_unsigned() && value < 0))
-        throw std::runtime_error("invalid");
-    uint64_t const result = value.get<uint64_t>();
-    if (result > max)
-        throw std::runtime_error("invalid");
-    return result;
-}
-
-bool Text(std::string const& text, std::size_t max)
-{
-    return !text.empty() && text.size() <= max && text.find('\0') == std::string::npos &&
-           std::any_of(text.begin(), text.end(), [](unsigned char c) { return c > ' '; });
-}
-
 // WT18b: a place name (route query, go_to, meet_at): text of 1..64 bytes, not blank, no control characters (the
 // parser already refused invalid UTF-8). It is a value the planner looks up, never command syntax.
 std::string Place(Json const& value)
 {
     auto const text = String(value);
-    if (!Text(text, ChannelMaxPlaceName) ||
-        std::any_of(text.begin(), text.end(), [](unsigned char c) { return c < 0x20 || c == 0x7F; }))
+    if (!UsableName(text, ChannelMaxPlaceName))
         throw std::runtime_error("invalid");
     return text;
 }
@@ -219,7 +164,7 @@ ChannelCommand Command(Json const& body)
     command.commandId = String(body.at("commandId"));
     command.issuerGuid = Guid(body.at("issuerGuid"));
     command.botGuid = Guid(body.at("botGuid"));
-    if (!Identifier(command.commandId))
+    if (!ValidIdentifier(command.commandId))
         throw std::runtime_error("invalid");
     command.steps = Steps(body.at("steps"));
     return command;
@@ -235,41 +180,26 @@ ChannelWatch WatchMessage(Json const& body)
     watch.commandId = String(body.at("commandId"));
     watch.botGuid = Guid(body.at("botGuid"));
     watch.untilUnixMs = static_cast<int64_t>(Integer(body.at("untilUnixMs"), MaxSafeInteger));
-    if (!Identifier(watch.commandId) || !ParseWatchCondition(String(body.at("condition")), watch.condition))
+    if (!ValidIdentifier(watch.commandId) || !ParseWatchCondition(String(body.at("condition")), watch.condition))
         throw std::runtime_error("invalid");
     return watch;
 }
 
 Json EnvelopeJson(ChannelEnvelope const& envelope, char const* type)
 {
-    return {{"version", 1},
-            {"instance", envelope.instance},
-            {"provider", envelope.provider},
-            {"epoch", envelope.epoch},
-            {"requestId", envelope.requestId},
-            {"deadlineUnixMs", envelope.deadlineUnixMs},
-            {"type", type}};
+    return Envelope(envelope.instance, envelope.provider, envelope.epoch, envelope.requestId, envelope.deadlineUnixMs,
+                    type);
 }
-// J5f-b: valid UTF-8 without control characters, cut to max bytes on a character boundary; empty when unusable.
+
+// J5f-b: a topic text on the wire; empty when unusable.
+// A topic's name or sentence on one line: dropped whole when it holds a control character (stripping would join
+// its words), else as the wire sends text.
 std::string TopicText(std::string const& text, std::size_t max)
 {
     if (std::any_of(text.begin(), text.end(), [](unsigned char c) { return c < 0x20 || c == 0x7F; }))
         return {};
-    std::size_t end = std::min(max, text.size());
-    while (end > 0 && end < text.size() && (static_cast<unsigned char>(text[end]) & 0xC0) == 0x80)
-        --end;
-    std::string result = text.substr(0, end);
-    try
-    {
-        (void)Json(result).dump();  // Throws on invalid UTF-8.
-    }
-    catch (std::exception const&)
-    {
-        return {};
-    }
-    return Text(result, max) ? result : std::string();
+    return WireText(text, max).value_or(std::string());
 }
-
 // Gameplay strategies the bot can talk about; every other playerbots strategy name is dropped.
 bool StrategyAllowed(std::string const& name)
 {
@@ -596,34 +526,20 @@ void ChannelPolicy::Retire()
 {
     _identity = {};
     _observed = {};
-    _bearer.clear();
     _scopes.clear();
     _requests.clear();
     _commands.clear();
 }
 
-bool ChannelPolicy::Bind(Identity identity, std::string localBearer)
+bool ChannelPolicy::Bind(Identity identity)
 {
     Retire();
-    if (!_validLimits || !Identifier(identity.instance) || !Identifier(identity.provider) ||
-        !Identifier(identity.epoch) || localBearer.size() < 16 || localBearer.size() > 256 ||
-        identity.epoch == _previous)
+    if (!_validLimits || !ValidIdentifier(identity.instance) || !ValidIdentifier(identity.provider) ||
+        !ValidIdentifier(identity.epoch) || identity.epoch == _previous)
         return false;
     _previous = identity.epoch;
     _identity = std::move(identity);
-    _bearer = std::move(localBearer);
     return true;
-}
-
-bool ChannelPolicy::Authenticated(std::string const& bearer) const
-{
-    if (_bearer.empty() || bearer.size() > 256)
-        return false;
-    std::size_t difference = _bearer.size() ^ bearer.size();
-    for (std::size_t i = 0; i < 256; ++i)
-        difference |= (i < _bearer.size() ? static_cast<unsigned char>(_bearer[i]) : 0) ^
-                      (i < bearer.size() ? static_cast<unsigned char>(bearer[i]) : 0);
-    return difference == 0;
 }
 
 void ChannelPolicy::RemoveScope(uint64_t botGuid, std::string const& contextId)
@@ -680,10 +596,10 @@ bool ChannelPolicy::ObserveScope(WorldScope scope, Clock now)
         }
         else
             ++i;
-    if (_bearer.empty() || scope.version != 1 || scope.instance != _identity.instance ||
+    if (_identity.epoch.empty() || scope.version != 1 || scope.instance != _identity.instance ||
         scope.provider != _identity.provider || scope.epoch != _identity.epoch || !scope.botGuid ||
-        !scope.controllerGuid || !Identifier(scope.contextId) || !Identifier(scope.perceptionScope) ||
-        !Identifier(scope.contextRevision) || !Identifier(scope.membershipRevision) ||
+        !scope.controllerGuid || !ValidIdentifier(scope.contextId) || !ValidIdentifier(scope.perceptionScope) ||
+        !ValidIdentifier(scope.contextRevision) || !ValidIdentifier(scope.membershipRevision) ||
         (scope.channel != "direct" && scope.channel != "party") || now.unixMs < 0 ||
         now.unixMs > MaxSafeInteger - ScopeLifetimeMs || now.steadyMs < 0 ||
         now.steadyMs > std::numeric_limits<int64_t>::max() - ScopeLifetimeMs)
@@ -707,7 +623,7 @@ bool ChannelPolicy::ObserveScope(WorldScope scope, Clock now)
 
 bool ChannelPolicy::ScopeCurrent(WorldScope const& scope, Clock now) const
 {
-    return !_bearer.empty() &&
+    return !_identity.epoch.empty() &&
            std::any_of(
                _scopes.begin(), _scopes.end(), [&](ScopeEntry const& entry)
                { return SameScope(entry.scope, scope) && Alive(entry.until, now) && Alive(entry.until, _observed); });
@@ -726,7 +642,7 @@ ChannelError ChannelPolicy::Open(WorldScope const& scope, std::string requestId,
     Expire(now);
     if (!ScopeCurrent(scope, now))
         return ChannelError::Stale;
-    if (!Identifier(requestId) || !ValidDeadline(deadline, now))
+    if (!ValidIdentifier(requestId) || !ValidDeadline(deadline, now))
         return ChannelError::Invalid;
     if (_requests.contains(requestId))
         return ChannelError::Duplicate;
@@ -768,34 +684,23 @@ bool ChannelPolicy::Current(ChannelEnvelope const& envelope, WorldScope const& c
            ScopeCurrent(current, now) && Alive(entry.until, now) && Alive(entry.until, _observed);
 }
 
-ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string const& body, WorldScope const& current,
-                                    Clock now, ChannelMessage& message, std::string const& expectedRequestId)
+ChannelError ChannelPolicy::Receive(std::string const& body, WorldScope const& current, Clock now,
+                                    ChannelMessage& message, std::string const& expectedRequestId)
 {
     message = {};
-    if (!Authenticated(localBearer))
-        return ChannelError::Unauthorized;
+    if (_identity.epoch.empty())
+        return ChannelError::Inactive;
     if (body.size() > MaxRequestBytes)
         return ChannelError::TooLarge;
     try
     {
-        std::map<int, std::set<std::string>> keys;
-        auto callback = [&](int depth, Json::parse_event_t event, Json& value)
-        {
-            if (depth > 16)
-                throw std::runtime_error("invalid");
-            if (event == Json::parse_event_t::object_start)
-                keys[depth + 1].clear();
-            if (event == Json::parse_event_t::key && !keys[depth].insert(value.get<std::string>()).second)
-                throw std::runtime_error("invalid");
-            return true;
-        };
-        auto const json = Json::parse(body, callback);
+        auto const json = StrictParse(body);
         if (!json.is_object() || Integer(json.at("version"), 1) != 1)
             return ChannelError::Invalid;
         ChannelEnvelope envelope{String(json.at("instance")), String(json.at("provider")), String(json.at("epoch")),
                                  String(json.at("requestId")),
                                  static_cast<int64_t>(Integer(json.at("deadlineUnixMs"), MaxSafeInteger))};
-        if (!Identifier(envelope.requestId))
+        if (!ValidIdentifier(envelope.requestId))
             return ChannelError::Invalid;
         if (envelope.instance != _identity.instance || envelope.provider != _identity.provider ||
             envelope.epoch != _identity.epoch)
@@ -851,34 +756,12 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
         }
         if (envelope.requestId != expectedRequestId)
             return ChannelError::Invalid;
-        // Fully validate syntax before reserving any replay id or closing a request.
+        // Fully validate syntax before reserving any replay id. LCB6a: query, command and watch are the only inbound
+        // types; a generation's reply returns in its HTTP response, and its route ends here only by the game.
         if (type == "command")
             payload = Command(json);
         else if (type == "watch")
             payload = WatchMessage(json);
-        else if (type == "generation.result")
-        {
-            if (!Exact(json,
-                       {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type", "text"}))
-                return ChannelError::Invalid;
-            auto text = String(json.at("text"));
-            if (!Text(text, MaxTextBytes))
-                return ChannelError::Invalid;
-            payload = ChannelText{std::move(text)};
-        }
-        else if (type == "failure")
-        {
-            if (!Exact(json,
-                       {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type", "code"}))
-                return ChannelError::Invalid;
-            auto const code = String(json.at("code"));
-            if (code != "unavailable" && code != "timeout" && code != "invalid_input" && code != "cancelled")
-                return ChannelError::Invalid;
-            payload = code == "unavailable"     ? ChannelFailure::Unavailable
-                      : code == "timeout"       ? ChannelFailure::Timeout
-                      : code == "invalid_input" ? ChannelFailure::InvalidInput
-                                                : ChannelFailure::Cancelled;
-        }
         else
             return ChannelError::Invalid;
         Expire(now);
@@ -902,27 +785,18 @@ ChannelError ChannelPolicy::Receive(std::string const& localBearer, std::string 
             _commands.emplace(command->commandId, CommandEntry{envelope.requestId});
             entry.commands.push_back(command->commandId);
         }
-        else if (auto const* watch = std::get_if<ChannelWatch>(&payload))
+        else
         {
             // J6e-c: only on an open generation (or wake) route and for its own bot; the id is a command id.
-            if (entry.work != ChannelWork::Generation || watch->botGuid != entry.scope.botGuid)
+            auto const& watch = std::get<ChannelWatch>(payload);
+            if (entry.work != ChannelWork::Generation || watch.botGuid != entry.scope.botGuid)
                 return ChannelError::Invalid;
-            if (_commands.contains(watch->commandId))
+            if (_commands.contains(watch.commandId))
                 return ChannelError::Duplicate;
             if (entry.queries.size() + entry.commands.size() >= _maxRouteIds)
                 return ChannelError::Capacity;
-            _commands.emplace(watch->commandId, CommandEntry{envelope.requestId});
-            entry.commands.push_back(watch->commandId);
-        }
-        else
-        {
-            if (type == "generation.result" && entry.work != ChannelWork::Generation)
-                return ChannelError::Invalid;
-            // LC.35: a generation's terminal forgets its route; a late replay then finds none (Unknown).
-            if (entry.work == ChannelWork::Generation)
-                Drop(envelope.requestId);
-            else
-                entry.terminal = true;
+            _commands.emplace(watch.commandId, CommandEntry{envelope.requestId});
+            entry.commands.push_back(watch.commandId);
         }
         message = {std::move(envelope), std::move(payload)};
         return ChannelError::None;
@@ -945,7 +819,7 @@ ChannelError ChannelPolicy::FinishQuery(ChannelEnvelope const& envelope, WorldSc
     std::set<uint64_t> seen;
     for (auto const& unit : observedUnits)
     {
-        if (!unit.guid || !seen.insert(unit.guid).second || !Text(unit.name, 128) || unit.healthPercent < -1 ||
+        if (!unit.guid || !seen.insert(unit.guid).second || !UsableText(unit.name, 128) || unit.healthPercent < -1 ||
             unit.healthPercent > 100 ||
             (!unit.role.empty() && unit.role != "tank" && unit.role != "healer" && unit.role != "damage"))
             return ChannelError::Invalid;

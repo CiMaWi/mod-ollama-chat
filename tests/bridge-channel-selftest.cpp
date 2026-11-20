@@ -14,7 +14,6 @@ using namespace OllamaBridge;
 using Json = nlohmann::json;
 unsigned checks = 0;
 Clock const now{100000, 200000};
-std::string const bearer = "synthetic-local-game-link-bearer";
 Deadline const deadline{101000, 201000};
 
 void Check(bool value, char const* label)
@@ -33,7 +32,7 @@ struct Fixture
     explicit Fixture(std::size_t ids = ChannelMaxRouteIds, std::size_t pending = ChannelMaxPending)
         : policy(ids, pending)
     {
-        Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}, bearer), "trusted selected epoch binding");
+        Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}), "trusted selected epoch binding");
         Check(policy.ObserveScope(scope, now), "trusted scope registration");
     }
     void Open(std::string const& id = "work")
@@ -74,7 +73,7 @@ struct Fixture
         bool const query = json.contains("type") && json.at("type") == "query";
         std::string const route =
             !query && json.at("requestId").is_string() ? json.at("requestId").get<std::string>() : "work";
-        return policy.Receive(bearer, json.dump(), scope, clock, result, route);
+        return policy.Receive(json.dump(), scope, clock, result, route);
     }
 };
 
@@ -83,11 +82,12 @@ void IdentityAndTerminal()
     Fixture f;
     f.Open();
     ChannelMessage result;
-    Check(f.policy.Receive("wrong", "{", f.scope, now, result, "work") == ChannelError::Unauthorized,
-          "auth precedes parse");
-    Check(f.policy.Receive("wrong", std::string(MaxRequestBytes + 1, 'x'), f.scope, now, result, "work") ==
-              ChannelError::Unauthorized,
-          "auth precedes body size error");
+    // LCB6a: the listener's BearerMatches is the one bearer check; an unbound policy refuses before it parses.
+    ChannelPolicy unbound;
+    Check(unbound.Receive("{", f.scope, now, result, "work") == ChannelError::Inactive &&
+              unbound.Receive(std::string(MaxRequestBytes + 1, 'x'), f.scope, now, result, "work") ==
+                  ChannelError::Inactive,
+          "an unbound channel parses nothing");
     Check(f.Receive(f.Wire("hello")) == ChannelError::Invalid, "hello cannot register work");
     auto command = f.Command();
     for (auto const* field : {"instance", "provider", "epoch"})
@@ -99,15 +99,18 @@ void IdentityAndTerminal()
     Check(f.Receive(f.Command("other", "unknown")) == ChannelError::Unknown, "unregistered request cannot command");
     Check(f.Receive(command) == ChannelError::None, "typed proposal stages");
     Check(f.Receive(command) == ChannelError::Duplicate, "effect replay blocked");
-    auto terminal = f.Wire("generation.result");
-    terminal["text"] = "I shall wait here.";
-    Check(f.Receive(terminal) == ChannelError::None, "one terminal result");
-    // LC.35: the terminal drops the route with its ids; whatever follows finds no route.
-    Check(f.Receive(terminal) == ChannelError::Unknown, "duplicate terminal blocked");
+    // LCB6a: a generation result or failure is no inbound channel type; refusing one closes nothing.
+    for (auto const* type : {"generation.result", "failure"})
+    {
+        auto stray = f.Wire(type);
+        stray["text"] = "I shall wait here.";
+        stray["code"] = "unavailable";
+        Check(f.Receive(stray) == ChannelError::Invalid, "an inbound generation result or failure is invalid");
+    }
+    Check(f.Receive(f.Command("after-stray")) == ChannelError::None, "a stray post closes nothing");
+    // LC.35: the game ends the route with its ids; whatever follows finds no route.
+    f.policy.Drop("work");
     Check(f.Receive(f.Command("late")) == ChannelError::Unknown, "command cannot follow terminal");
-    auto failure = f.Wire("failure");
-    failure["code"] = "unavailable";
-    Check(f.Receive(failure) == ChannelError::Unknown, "failure cannot replace terminal");
     std::string body;
     ChannelEnvelope envelope{"fixture", "codex", "epoch-1", "work", deadline.unixMs};
     // WorldChannel finishes every command in the tick it arrives, so nothing is left to report after the terminal.
@@ -121,24 +124,22 @@ void IdentityAndTerminal()
 
     Fixture failed;
     failed.Open();
-    failure = failed.Wire("failure");
-    failure["code"] = "timeout";
-    Check(failed.Receive(failure) == ChannelError::None, "failure terminal accepted");
-    Check(failed.Receive(failed.Command()) == ChannelError::Unknown, "failure cannot authorize effects");
-    Check(failed.policy.Bind({"fixture", "codex", "", "epoch-2"}, bearer + "-new"), "reconnect uses new epoch");
+    failed.policy.Drop("work");
+    auto const old = failed.Command("old");
+    Check(failed.Receive(old) == ChannelError::Unknown, "a closed route cannot authorize effects");
+    Check(failed.policy.Bind({"fixture", "codex", "", "epoch-2"}), "reconnect uses new epoch");
     Check(!failed.policy.ObserveScope(failed.scope, now), "reconnect rejects old scope");
-    Check(failed.Receive(failure) == ChannelError::Unauthorized, "old bearer retired");
+    Check(failed.Receive(old) == ChannelError::Stale, "the old epoch is retired");
     failed.scope.epoch = "epoch-2";
     Check(failed.policy.ObserveScope(failed.scope, now), "fresh epoch scope");
-    Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result, "work") ==
-              ChannelError::Stale,
-          "old terminal cannot cross reconnect");
-    failure["epoch"] = "epoch-2";
-    Check(failed.policy.Receive(bearer + "-new", failure.dump(), failed.scope, now, result, "work") ==
-              ChannelError::Unknown,
+    Check(failed.policy.Receive(old.dump(), failed.scope, now, result, "work") == ChannelError::Stale,
+          "an old command cannot cross reconnect");
+    auto renewed = old;
+    renewed["epoch"] = "epoch-2";
+    Check(failed.policy.Receive(renewed.dump(), failed.scope, now, result, "work") == ChannelError::Unknown,
           "reconnect cannot reopen old work");
     // LC.35: only the previous binding's epoch is remembered (epochs are 128-bit random, never reissued).
-    Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-2"}, bearer), "retired epoch reuse fails closed");
+    Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-2"}), "retired epoch reuse fails closed");
     Check(!failed.policy.ObserveScope(failed.scope, now), "bad activation leaves inactive");
 }
 
@@ -201,23 +202,21 @@ void Schemas()
     Fixture f;
     f.Open();
     ChannelMessage result;
-    Check(f.policy.Receive(bearer, "{", f.scope, now, result, "work") == ChannelError::Invalid, "malformed JSON");
-    Check(f.policy.Receive(bearer, std::string(MaxRequestBytes + 1, ' '), f.scope, now, result, "work") ==
-              ChannelError::TooLarge,
-          "bounded body before parse");
-    Check(f.policy.Receive(bearer, std::string(MaxRequestBytes, ' '), f.scope, now, result, "work") ==
-              ChannelError::Invalid,
+    Check(f.policy.Receive("{", f.scope, now, result, "work") == ChannelError::Invalid, "malformed JSON");
+    Check(
+        f.policy.Receive(std::string(MaxRequestBytes + 1, ' '), f.scope, now, result, "work") == ChannelError::TooLarge,
+        "bounded body before parse");
+    Check(f.policy.Receive(std::string(MaxRequestBytes, ' '), f.scope, now, result, "work") == ChannelError::Invalid,
           "exact body maximum reaches parser");
     auto duplicate = f.Command().dump();
     duplicate.insert(1, "\"version\":1,");
-    Check(f.policy.Receive(bearer, duplicate, f.scope, now, result, "work") == ChannelError::Invalid,
+    Check(f.policy.Receive(duplicate, f.scope, now, result, "work") == ChannelError::Invalid,
           "duplicate key before DOM overwrite");
     duplicate = f.Command().dump();
     auto const position = duplicate.find("\"params\":{}");
     duplicate.replace(position, 11, "\"params\":{\"x\":1,\"x\":2}");
-    Check(f.policy.Receive(bearer, duplicate, f.scope, now, result, "work") == ChannelError::Invalid,
-          "nested duplicate key");
-    Check(f.policy.Receive(bearer, std::string(20, '[') + "0" + std::string(20, ']'), f.scope, now, result, "work") ==
+    Check(f.policy.Receive(duplicate, f.scope, now, result, "work") == ChannelError::Invalid, "nested duplicate key");
+    Check(f.policy.Receive(std::string(20, '[') + "0" + std::string(20, ']'), f.scope, now, result, "work") ==
               ChannelError::Invalid,
           "parser nesting bound");
     for (auto const& pair : std::vector<std::pair<std::string, Json>>{{"version", 1.0},
@@ -264,18 +263,10 @@ void Schemas()
     {
         auto good = f.Command("effect-" + std::to_string(++sequence));
         good["steps"] = Json::array({{{"act", act}, {"params", params}}});
-        Check(f.policy.Receive(bearer, good.dump(), f.scope, now, result, "work") == ChannelError::None,
+        Check(f.policy.Receive(good.dump(), f.scope, now, result, "work") == ChannelError::None,
               "the catalogue's acts decode into typed steps");
         Check(std::get<ChannelCommand>(result.payload).steps.front().intent == intent, "the act's code preserved");
     }
-    auto terminal = f.Wire("generation.result");
-    for (std::string text : {std::string(4097, 'x'), std::string("\0", 1), std::string("  \n")})
-    {
-        terminal["text"] = text;
-        Check(f.Receive(terminal) == ChannelError::Invalid, "bounded usable text");
-    }
-    terminal["text"] = std::string(4096, 'x');
-    Check(f.Receive(terminal) == ChannelError::None, "exact text byte maximum");
 }
 
 void QueriesAndCapacity()
@@ -283,7 +274,7 @@ void QueriesAndCapacity()
     Fixture f;
     f.Open();  // LC.35: queries open under a live generation route.
     ChannelMessage query;
-    Check(f.policy.Receive(bearer, f.Query().dump(), f.scope, now, query, "work") == ChannelError::None,
+    Check(f.policy.Receive(f.Query().dump(), f.scope, now, query, "work") == ChannelError::None,
           "authenticated reverse query");
     Check(f.Receive(f.Query()) == ChannelError::Duplicate, "query id replay reserved separately from effects");
     Check(f.Receive(f.Command("effect", "query")) == ChannelError::Invalid, "query ids never authorize commands");
@@ -297,8 +288,7 @@ void QueriesAndCapacity()
     Check(f.policy.FinishQuery(query.envelope, f.scope, units, now, body) == ChannelError::Stale,
           "query terminal once");
     Check(body.empty(), "no stale query output after refusal");
-    Check(f.policy.Receive(bearer, f.Query("q2").dump(), f.scope, now, query, "work") == ChannelError::None,
-          "second query");
+    Check(f.policy.Receive(f.Query("q2").dump(), f.scope, now, query, "work") == ChannelError::None, "second query");
     units.front().healthPercent = 101;
     Check(f.policy.FinishQuery(query.envelope, f.scope, units, now, body) == ChannelError::Invalid, "invalid UI field");
     units.front().healthPercent = 80;
@@ -308,7 +298,7 @@ void QueriesAndCapacity()
           "observed optional fields retained");
     parsed = Json::parse(body);
     Check(parsed.at("units").at(0).size() == 5, "exact declared unit fields");
-    Check(f.policy.Receive(bearer, f.Query("q3").dump(), f.scope, now, query, "work") == ChannelError::None,
+    Check(f.policy.Receive(f.Query("q3").dump(), f.scope, now, query, "work") == ChannelError::None,
           "query for local failure");
     Check(f.policy.FinishQuery(query.envelope, f.scope, std::vector<Participant>(41, units.front()), now, body) ==
               ChannelError::TooLarge,
@@ -330,9 +320,7 @@ void QueriesAndCapacity()
     Fixture slots(4, 1);
     slots.Open();
     Check(slots.Receive(slots.Query()) == ChannelError::Capacity, "pending work fails closed");
-    auto failure = slots.Wire("failure");
-    failure["code"] = "cancelled";
-    Check(slots.Receive(failure) == ChannelError::None, "terminal releases only logical pending work");
+    slots.policy.Drop("work");
     Check(slots.Receive(slots.Query()) == ChannelError::Unknown, "a closed route opens no query");
     slots.Open("work-2");
     Check(slots.policy.RequestReservations() == 1, "a closed route keeps no replay reservation");
@@ -354,52 +342,37 @@ void QueriesAndCapacity()
         for (std::size_t k = 0; k < 3; ++k)
         {
             ChannelMessage asked;
-            Check(full.policy.Receive(bearer, full.Query("q-" + std::to_string(i) + "-" + std::to_string(k)).dump(),
-                                      full.scope, now, asked, id) == ChannelError::None,
+            Check(full.policy.Receive(full.Query("q-" + std::to_string(i) + "-" + std::to_string(k)).dump(), full.scope,
+                                      now, asked, id) == ChannelError::None,
                   "5000: every query admitted");
         }
         Check(full.Receive(full.Command("c-" + std::to_string(i), id)) == ChannelError::None,
               "5000: every command admitted");
-        auto close = full.Wire(i % 2 ? "generation.result" : "failure", id);
-        if (i % 2)
-            close["text"] = "Done.";
-        else
-            close["code"] = "unavailable";
-        Check(full.Receive(close) == ChannelError::None, "5000: every route closes");
+        full.policy.Drop(id);
     }
     Check(
         full.policy.RequestReservations() == 0 && full.policy.CommandReservations() == 0 && full.policy.Pending() == 0,
         "closed routes leave an empty ledger");
-    auto lateFailure = full.Wire("failure", "work-0");
-    lateFailure["code"] = "unavailable";
-    auto lateText = full.Wire("generation.result", "work-1");
-    lateText["text"] = "Again.";
     ChannelMessage late;
-    Check(full.Receive(lateFailure) == ChannelError::Unknown && full.Receive(lateText) == ChannelError::Unknown &&
-              full.Receive(full.Command("c-0", "work-0")) == ChannelError::Unknown &&
-              full.policy.Receive(bearer, full.Query("q-0-0").dump(), full.scope, now, late, "work-0") ==
-                  ChannelError::Unknown,
-          "a late replay of a closed route's failure, text, command or query is unknown_request");
+    Check(full.Receive(full.Command("c-0", "work-0")) == ChannelError::Unknown &&
+              full.policy.Receive(full.Query("q-0-0").dump(), full.scope, now, late, "work-0") == ChannelError::Unknown,
+          "a late replay of a closed route's command or query is unknown_request");
     Fixture pair;
     pair.Open("route-a");
     pair.Open("route-b");
     ChannelMessage asked;
-    Check(
-        pair.policy.Receive(bearer, pair.Query("qa").dump(), pair.scope, now, asked, "route-a") == ChannelError::None &&
-            pair.policy.Receive(bearer, pair.Query("qb").dump(), pair.scope, now, asked, "route-b") ==
-                ChannelError::None &&
-            pair.Receive(pair.Command("ca", "route-a")) == ChannelError::None &&
-            pair.Receive(pair.Command("cb", "route-b")) == ChannelError::None,
-        "two routes, each with a query and a command");
-    auto closeA = pair.Wire("generation.result", "route-a");
-    closeA["text"] = "Done.";
-    Check(pair.Receive(closeA) == ChannelError::None, "route a closes");
+    Check(pair.policy.Receive(pair.Query("qa").dump(), pair.scope, now, asked, "route-a") == ChannelError::None &&
+              pair.policy.Receive(pair.Query("qb").dump(), pair.scope, now, asked, "route-b") == ChannelError::None &&
+              pair.Receive(pair.Command("ca", "route-a")) == ChannelError::None &&
+              pair.Receive(pair.Command("cb", "route-b")) == ChannelError::None,
+          "two routes, each with a query and a command");
+    pair.policy.Drop("route-a");
     Check(pair.policy.RequestReservations() == 2 && pair.policy.CommandReservations() == 1,
           "only the closed route's ids leave the ledger");
-    Check(pair.Receive(pair.Command("cb", "route-b")) == ChannelError::Duplicate &&
-              pair.policy.Receive(bearer, pair.Query("qb").dump(), pair.scope, now, asked, "route-b") ==
-                  ChannelError::Duplicate,
-          "the open route's ids stay refused as duplicates");
+    Check(
+        pair.Receive(pair.Command("cb", "route-b")) == ChannelError::Duplicate &&
+            pair.policy.Receive(pair.Query("qb").dump(), pair.scope, now, asked, "route-b") == ChannelError::Duplicate,
+        "the open route's ids stay refused as duplicates");
     Check(pair.Receive(pair.Command("ca", "route-a")) == ChannelError::Unknown,
           "a closed route's command id never lands on that route");
     // A dropped route's ids are answered nowhere: not under their own envelope and not under the open route's.
@@ -422,25 +395,21 @@ void QueriesAndCapacity()
           "the open route's command still reports once, on its own route");
     Fixture aging;
     aging.Open("old");
-    Check(aging.policy.Receive(bearer, aging.Query("old-q").dump(), aging.scope, now, asked, "old") ==
-                  ChannelError::None &&
+    Check(aging.policy.Receive(aging.Query("old-q").dump(), aging.scope, now, asked, "old") == ChannelError::None &&
               aging.Receive(aging.Command("old-c", "old")) == ChannelError::None,
           "expiry: a route with a query and a command");
     Clock const after{deadline.unixMs, deadline.steadyMs};
     aging.policy.Expire(after);
     Check(aging.policy.RequestReservations() == 0 && aging.policy.CommandReservations() == 0,
           "expiry: a route at its deadline leaves the ledger with its ids");
-    auto lateTimeout = aging.Wire("failure", "old");
-    lateTimeout["code"] = "timeout";
-    Check(aging.Receive(lateTimeout, after) == ChannelError::Unknown &&
-              aging.Receive(aging.Command("old-c", "old"), after) == ChannelError::Unknown,
+    Check(aging.Receive(aging.Command("old-c", "old"), after) == ChannelError::Unknown,
           "expiry: a late replay finds no route");
     ChannelPolicy invalid(0);
-    Check(!invalid.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "zero capacity fails closed");
+    Check(!invalid.Bind({"fixture", "codex", "", "invalid-limits"}), "zero capacity fails closed");
     ChannelPolicy tooMany(ChannelMaxRouteIds + 1);
-    Check(!tooMany.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "cannot expand id bound");
+    Check(!tooMany.Bind({"fixture", "codex", "", "invalid-limits"}), "cannot expand id bound");
     ChannelPolicy tooPending(1, ChannelMaxPending + 1);
-    Check(!tooPending.Bind({"fixture", "codex", "", "invalid-limits"}, bearer), "cannot expand pending bound");
+    Check(!tooPending.Bind({"fixture", "codex", "", "invalid-limits"}), "cannot expand pending bound");
 
     Fixture effects;
     effects.Open();
@@ -450,7 +419,7 @@ void QueriesAndCapacity()
     Check(effects.policy.CommandReservations() == ChannelMaxRouteIds, "exact route id maximum");
     Check(effects.Receive(effects.Command("overflow")) == ChannelError::Capacity, "a full route refuses another id");
     Check(effects.Receive(effects.Command("effect-0")) == ChannelError::Duplicate, "first effect never evicted");
-    Check(effects.policy.Receive(bearer, effects.Query("q-over").dump(), effects.scope, now, asked, "work") ==
+    Check(effects.policy.Receive(effects.Query("q-over").dump(), effects.scope, now, asked, "work") ==
               ChannelError::Capacity,
           "queries share the route's id bound");
     Fixture scopes;
@@ -468,11 +437,11 @@ void QueriesAndCapacity()
     // LC.35: no epoch history bound; only the previous binding's epoch is refused (epochs are 128-bit random).
     ChannelPolicy epochs;
     for (unsigned i = 0; i < 5000; ++i)
-        Check(epochs.Bind({"fixture", "codex", "", "epoch-" + std::to_string(i)}, bearer),
+        Check(epochs.Bind({"fixture", "codex", "", "epoch-" + std::to_string(i)}),
               "fresh epochs bind without a history bound");
-    Check(!epochs.Bind({"fixture", "codex", "", "epoch-4999"}, bearer), "the previous binding's epoch is refused");
+    Check(!epochs.Bind({"fixture", "codex", "", "epoch-4999"}), "the previous binding's epoch is refused");
     ChannelMessage output;
-    Check(epochs.Receive(bearer, f.Query().dump(), f.scope, now, output, "work") == ChannelError::Unauthorized,
+    Check(epochs.Receive(f.Query().dump(), f.scope, now, output, "work") == ChannelError::Inactive,
           "a refused rebind leaves inactive");
 }
 }  // namespace
@@ -494,7 +463,7 @@ Json Topic(Fixture& f, std::string const& id, StateTopic topic, std::vector<Stat
     auto wire = StateQuery(f, id, StateTopicName(topic));
     if (topic == StateTopic::Route)
         wire["place"] = "Goldshire";  // WT18b: route names its place.
-    Check(f.policy.Receive(bearer, wire.dump(), f.scope, now, message, "work") == ChannelError::None,
+    Check(f.policy.Receive(wire.dump(), f.scope, now, message, "work") == ChannelError::None,
           "bot_state query admitted");
     auto const& query = std::get<ChannelQuery>(message.payload);
     Check(query.kind == QueryKind::BotState && query.topic == topic &&
@@ -574,7 +543,7 @@ void Topics()
     auto longest = StateQuery(f, "route-64", "route");
     longest["place"] = widest;
     ChannelMessage routed;
-    Check(f.policy.Receive(bearer, longest.dump(), f.scope, now, routed, "work") == ChannelError::None &&
+    Check(f.policy.Receive(longest.dump(), f.scope, now, routed, "work") == ChannelError::None &&
               std::get<ChannelQuery>(routed.payload).place == widest,
           "a place of 64 bytes is carried as given");
     longest = StateQuery(f, "route-66", "route");
@@ -756,8 +725,7 @@ void Topics()
 
     // Terminal once, unknown topic value refused, wrong work refused.
     ChannelMessage message;
-    Check(f.policy.Receive(bearer, StateQuery(f, "once", "spells").dump(), f.scope, now, message, "work") ==
-              ChannelError::None,
+    Check(f.policy.Receive(StateQuery(f, "once", "spells").dump(), f.scope, now, message, "work") == ChannelError::None,
           "query for terminal check");
     std::string body;
     Check(f.policy.FinishTopic(message.envelope, f.scope, static_cast<StateTopic>(StateTopicCount), {}, now, body) ==
@@ -865,7 +833,7 @@ void Catalogue()
         Check(f.Receive(chase) == ChannelError::Invalid, "the old word is no act once the index renames it");
         chase["steps"][0]["act"] = "chase";
         ChannelMessage result;
-        Check(f.policy.Receive(bearer, chase.dump(), f.scope, now, result, "work") == ChannelError::None &&
+        Check(f.policy.Receive(chase.dump(), f.scope, now, result, "work") == ChannelError::None &&
                   std::get<ChannelCommand>(result.payload).steps.front().intent == PlayerbotBridge::Intent::Follow,
               "the index's word decodes to its row's code");
         Check(f.Receive(StateQuery(f, "old-topic", "plan")) == ChannelError::Invalid &&
@@ -902,8 +870,7 @@ void Catalogue()
     upper["query"] = "Catalogue";
     Check(f.Receive(upper) == ChannelError::Invalid, "an unknown query stays invalid");
     ChannelMessage message;
-    Check(f.policy.Receive(bearer, CatalogueQuery(f, "cat").dump(), f.scope, now, message, "work") ==
-                  ChannelError::None &&
+    Check(f.policy.Receive(CatalogueQuery(f, "cat").dump(), f.scope, now, message, "work") == ChannelError::None &&
               std::get<ChannelQuery>(message.payload).kind == QueryKind::Catalogue,
           "a catalogue query admitted, typed");
     Check(f.Receive(CatalogueQuery(f, "cat")) == ChannelError::Duplicate, "catalogue id replay refused");
@@ -957,7 +924,7 @@ void Catalogue()
     none.Open();
     ChannelMessage asked;
     std::string empty;
-    Check(none.policy.Receive(bearer, CatalogueQuery(none, "cat-none").dump(), none.scope, now, asked, "work") ==
+    Check(none.policy.Receive(CatalogueQuery(none, "cat-none").dump(), none.scope, now, asked, "work") ==
                   ChannelError::None &&
               none.policy.FinishCatalogue(asked.envelope, none.scope, now, empty) == ChannelError::Invalid &&
               empty.empty(),
@@ -977,8 +944,7 @@ void Watches()
     {
         ChannelMessage message;
         std::string const id = std::string("w-") + name;
-        Check(f.policy.Receive(bearer, WatchWire(f, id, name).dump(), f.scope, now, message, "work") ==
-                  ChannelError::None,
+        Check(f.policy.Receive(WatchWire(f, id, name).dump(), f.scope, now, message, "work") == ChannelError::None,
               "watch: each condition admitted");
         auto const* watch = std::get_if<ChannelWatch>(&message.payload);
         Check(watch && watch->commandId == id && watch->botGuid == f.scope.botGuid && watch->condition == condition &&
@@ -1020,7 +986,7 @@ void Watches()
               f.Receive(f.Command("w-shared")) == ChannelError::Duplicate,
           "watch: a watch id cannot be reused by a command");
     ChannelMessage query;
-    Check(f.policy.Receive(bearer, f.Query("q-watch").dump(), f.scope, now, query, "work") == ChannelError::None,
+    Check(f.policy.Receive(f.Query("q-watch").dump(), f.scope, now, query, "work") == ChannelError::None,
           "watch: a query route");
     Check(f.Receive(WatchWire(f, "on-query", "time", 160000, "q-watch")) == ChannelError::Invalid,
           "watch: never on a query route");
@@ -1073,10 +1039,8 @@ void Watches()
                   (w.text ? json.at("reasonText") == w.text : !json.at("reasonText").get<std::string>().empty()),
               "watch: rejected carries reason and in-world reasonText");
     }
-    auto terminal = f.Wire("generation.result");
-    terminal["text"] = "I will come once this is done.";
-    Check(f.Receive(terminal) == ChannelError::None && f.Receive(WatchWire(f, "late")) == ChannelError::Unknown,
-          "watch: none after the terminal result");
+    f.policy.Drop("work");
+    Check(f.Receive(WatchWire(f, "late")) == ChannelError::Unknown, "watch: none after the route closed");
 }
 
 // LC3b: a stepped command, 1..maxSteps acts of the installed catalogue, each with exactly its parameters.
@@ -1095,7 +1059,7 @@ std::vector<ChannelStep> Decoded(Json steps, char const* label)
     Fixture f;
     f.Open();
     ChannelMessage message;
-    Check(f.policy.Receive(bearer, StepWire(f, "stepped", std::move(steps)).dump(), f.scope, now, message, "work") ==
+    Check(f.policy.Receive(StepWire(f, "stepped", std::move(steps)).dump(), f.scope, now, message, "work") ==
                   ChannelError::None &&
               f.policy.CommandReservations() == 1,
           label);
@@ -1249,8 +1213,7 @@ Finished Finish(Json const& steps, ChannelOutcome outcome, std::vector<ChannelSt
     f.Open();
     ChannelMessage message;
     auto const wire = StepWire(f, "done", steps);
-    Check(f.policy.Receive(bearer, wire.dump(), f.scope, now, message, "work") == ChannelError::None,
-          "the command admitted");
+    Check(f.policy.Receive(wire.dump(), f.scope, now, message, "work") == ChannelError::None, "the command admitted");
     auto const& command = std::get<ChannelCommand>(message.payload);
     std::string body;
     auto const error =
@@ -1486,7 +1449,7 @@ void OpenRows()
                   f.Receive(routeNamed) == ChannelError::Invalid,
               "an open topic takes exactly its argument, under its own name and Place's rules");
         ChannelMessage message;
-        Check(f.policy.Receive(bearer, asking("deeds", "name", "Hogger").dump(), f.scope, now, message, "work") ==
+        Check(f.policy.Receive(asking("deeds", "name", "Hogger").dump(), f.scope, now, message, "work") ==
                   ChannelError::None,
               "an open topic's query admitted");
         auto const& query = std::get<ChannelQuery>(message.payload);
@@ -1525,7 +1488,7 @@ void OpenRows()
                   list.at(1).at("value") == 0 && list.at(1).at("extra") == UINT32_MAX,
               "any wire word as the row; the text cut to 200 bytes, value and extra clamped");
         ChannelMessage other;
-        Check(f.policy.Receive(bearer, asking("deeds-other", "name", "Hogger").dump(), f.scope, now, other, "work") ==
+        Check(f.policy.Receive(asking("deeds-other", "name", "Hogger").dump(), f.scope, now, other, "work") ==
                       ChannelError::None &&
                   f.policy.FinishTopic(other.envelope, f.scope, static_cast<StateTopic>(TestOpenTopic + 1), entries,
                                        now, body) == ChannelError::Invalid,
@@ -1542,7 +1505,7 @@ void OpenRows()
         ChannelMessage message;
         std::string body;
         Check(size > MaxResponseBytes && size <= ChannelMaxCatalogueBytes &&
-                  f.policy.Receive(bearer, CatalogueQuery(f, "cat-big").dump(), f.scope, now, message, "work") ==
+                  f.policy.Receive(CatalogueQuery(f, "cat-big").dump(), f.scope, now, message, "work") ==
                       ChannelError::None &&
                   f.policy.FinishCatalogue(message.envelope, f.scope, now, body) == ChannelError::None &&
                   body.size() > MaxResponseBytes && body.size() <= MaxCatalogueResponseBytes,

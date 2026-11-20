@@ -180,7 +180,7 @@ void QueryEncoding()
     Check(observed.units[0].role.empty() && !observed.units[0].visibleTargetGuid,
           "no AI role or selected-target provenance leak");
     ChannelPolicy policy;
-    Check(policy.Bind(f.world.Selected(), f.settings.token) && policy.ObserveScope(f.ticket.scope, f.now) &&
+    Check(policy.Bind(f.world.Selected()) && policy.ObserveScope(f.ticket.scope, f.now) &&
               policy.OpenGeneration(f.ticket.scope, f.ticket.request.requestId, f.ticket.request.deadline, f.now) ==
                   ChannelError::None,
           "real query serializer policy binding");
@@ -189,8 +189,7 @@ void QueryEncoding()
         {"requestId", "query-1"}, {"deadlineUnixMs", 104000},   {"type", "query"},     {"controllerGuid", "22"},
         {"botGuid", "11"},        {"query", "observable_group"}};
     ChannelMessage query;
-    Check(policy.Receive(f.settings.token, wire.dump(), f.ticket.scope, f.now, query, f.ticket.request.requestId) ==
-              ChannelError::None,
+    Check(policy.Receive(wire.dump(), f.ticket.scope, f.now, query, f.ticket.request.requestId) == ChannelError::None,
           "independent query id against registered scope");
     std::string body;
     Check(f.adapter.Current(observed) &&
@@ -329,11 +328,11 @@ void TopicPublication()
         if (!place.empty())
             wire["place"] = place;  // WT18b: route names its place.
         uint64_t receipt = 0;
-        Check(channel.Receive(f.settings.token, f.ticket.request.requestId, wire.dump(), receipt) == ChannelError::None,
+        Check(channel.Receive(f.ticket.request.requestId, wire.dump(), receipt) == ChannelError::None,
               "topic query received");
         channel.Update();
         std::unique_ptr<ChannelPacket> packet;
-        channel.Take(f.settings.token, receipt, packet);
+        channel.Take(receipt, packet);
         return packet;
     };
     f.source.topicEntries = {{"Hearthstone", "", 1800, 0}, {"Ready", "", 0, 0}};
@@ -387,11 +386,11 @@ void CataloguePublication()
                      {"requestId", id}, {"deadlineUnixMs", 104000}, {"type", "query"},     {"controllerGuid", "22"},
                      {"botGuid", "11"}, {"query", "catalogue"}};
         uint64_t receipt = 0;
-        Check(channel.Receive(f.settings.token, f.ticket.request.requestId, wire.dump(), receipt) == ChannelError::None,
+        Check(channel.Receive(f.ticket.request.requestId, wire.dump(), receipt) == ChannelError::None,
               "catalogue query received");
         channel.Update();
         std::unique_ptr<ChannelPacket> packet;
-        channel.Take(f.settings.token, receipt, packet);
+        channel.Take(receipt, packet);
         return packet;
     };
     auto packet = ask("catalogue-1");
@@ -449,11 +448,11 @@ void WatchArming()
                      {"condition", condition},
                      {"untilUnixMs", f.now.unixMs + 60000}};
         uint64_t receipt = 0;
-        if (channel.Receive(f.settings.token, ticket.request.requestId, wire.dump(), receipt) != ChannelError::None)
+        if (channel.Receive(ticket.request.requestId, wire.dump(), receipt) != ChannelError::None)
             return Json();
         channel.Update(with);
         std::unique_ptr<ChannelPacket> packet;
-        channel.Take(f.settings.token, receipt, packet);
+        channel.Take(receipt, packet);
         return packet && packet->error == ChannelError::None ? Json::parse(packet->body) : Json();
     };
     auto ticket = open(0);

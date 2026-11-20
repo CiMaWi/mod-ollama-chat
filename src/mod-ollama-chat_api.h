@@ -39,8 +39,4 @@ OllamaEndpointSettings OllamaConfig_Snapshot();
 // Blocking. Call from a worker thread, never from the world thread.
 OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, OllamaBridge::Request const& request);
 
-// Trusted world-owner lifecycle seam, never called by selection files or bridge input.
-// Retirement/drain/restoration checks belong to that owner before activating an identity.
-void OllamaBridge_SetActivation(OllamaBridge::Identity identity);
-
 #endif // MOD_OLLAMA_CHAT_API_H

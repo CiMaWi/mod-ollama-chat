@@ -193,7 +193,6 @@ OllamaBridge::DispatchGuard gameGuard;
 
 OllamaEndpointSettings OllamaConfig_Snapshot() { return config; }
 OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const&, OllamaBridge::Request const&) { return apiResult; }
-void OllamaBridge_SetActivation(OllamaBridge::Identity) {}
 // The legacy clamp stand-in cuts at maxLen, so a bridge path that still clamped would lose its second message.
 std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t maxLen)
 {

@@ -10,7 +10,6 @@ namespace
 {
     std::mutex             g_settingsMutex;
     OllamaEndpointSettings g_settings;
-    OllamaBridge::Circuit g_bridgeCircuit;
 }
 
 void OllamaConfig_Publish()
@@ -28,13 +27,6 @@ OllamaEndpointSettings OllamaConfig_Snapshot()
     return g_settings;
 }
 
-void OllamaBridge_SetActivation(OllamaBridge::Identity identity)
-{
-    // Trusted game owner only, after retirement/drain/restoration. Publishing config
-    // deliberately does not call this, grant authority or acknowledge selection intent.
-    g_bridgeCircuit.Reset(std::move(identity));
-}
-
 OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, OllamaBridge::Request const& request)
 {
     OllamaApiResult result;
@@ -44,7 +36,7 @@ OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, Ollama
         return result;
     }
     auto bridge = OllamaBridge::Generate(
-        settings.bridge, request, g_bridgeCircuit, OllamaBridge::Now,
+        settings.bridge, request, OllamaBridge::Now,
         [](OllamaBridge::Settings const& link, std::string const& body, int64_t remainingMs)
         { return OllamaHttp_PostBridge(link.endpoint, body, OllamaBridge::Headers(link), remainingMs); });
     result.ok = bridge.ok;

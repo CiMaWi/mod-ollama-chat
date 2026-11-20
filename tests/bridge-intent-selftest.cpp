@@ -18,7 +18,6 @@ using PlayerbotBridge::Intent;
 using Json = nlohmann::json;
 
 unsigned checks = 0;
-constexpr char Bearer[] = "synthetic-intent-selftest-link";
 constexpr Clock Now{100000, 200000};
 constexpr Deadline Until{101000, 201000};
 constexpr uint64_t Controller = 9007199254740993ULL;
@@ -42,7 +41,7 @@ struct Fixture
 
     Fixture()
     {
-        Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}, Bearer), "bind game epoch");
+        Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}), "bind game epoch");
         Check(policy.ObserveScope(scope, Now), "register scope");
         Check(policy.OpenGeneration(scope, "work", Until, Now) == ChannelError::None, "open generation");
     }
@@ -79,7 +78,7 @@ struct Fixture
 
     ChannelError Receive(Json const& wire, Clock at = Now)
     {
-        return policy.Receive(Bearer, wire.dump(), scope, at, message, "work");
+        return policy.Receive(wire.dump(), scope, at, message, "work");
     }
 
     ChannelCommand Stage(Json const& steps, std::string const& id = "order")

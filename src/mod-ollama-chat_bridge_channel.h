@@ -52,6 +52,7 @@ struct ChannelEnvelope
     int64_t deadlineUnixMs = 0;
 };
 
+// The game's own failure answer (FinishFailure); the channel takes no failure inbound (LCB6a).
 enum class ChannelFailure : uint8_t
 {
     Unavailable,
@@ -205,10 +206,6 @@ struct ChannelQuery
     StateTopic topic = StateTopic::Inventory;  // Only for QueryKind::BotState.
     std::string place;                         // WT18b: route only, the place the route goes to.
 };
-struct ChannelText
-{
-    std::string text;
-};
 // J6e-c: arm, replace or clear the route bot's watch; its id shares the command replay namespace.
 struct ChannelWatch
 {
@@ -217,7 +214,8 @@ struct ChannelWatch
     WatchCondition condition = WatchCondition::None;
     int64_t untilUnixMs = 0;
 };
-using ChannelPayload = std::variant<ChannelQuery, ChannelCommand, ChannelText, ChannelFailure, ChannelWatch>;
+// LCB6a: the channel's only inbound types; a generation's reply returns in its HTTP response.
+using ChannelPayload = std::variant<ChannelQuery, ChannelCommand, ChannelWatch>;
 
 // Owned values only. Successful decode is staging, never an effect-execution grant.
 struct ChannelMessage
@@ -236,7 +234,7 @@ public:
     ChannelPolicy(ChannelPolicy const&) = delete;
     ChannelPolicy& operator=(ChannelPolicy const&) = delete;
 
-    bool Bind(Identity identity, std::string localBearer);
+    bool Bind(Identity identity);
     void Retire();
     bool ObserveScope(WorldScope scope, Clock now);
     void RemoveScope(uint64_t botGuid, std::string const& contextId);
@@ -246,12 +244,12 @@ public:
     // then finds no route (Unknown). A generation's terminal, its expiry and WorldChannel::Close drop it.
     void Drop(std::string const& route);
 
-    // Authentication is checked before size/JSON parsing and before any replay/state mutation.
+    // Unbound, it parses nothing (Inactive); the listener checked the bearer before the body was read (LCB6a).
     // current and expectedRequestId come from the trusted game route, NEVER from this body.
     // Non-query ids must match that route before state changes; queries carry independent ids, opened under the
     // route (an unknown route refuses them as Unknown) and dropped with it.
-    ChannelError Receive(std::string const& localBearer, std::string const& body, WorldScope const& current, Clock now,
-                         ChannelMessage& message, std::string const& expectedRequestId);
+    ChannelError Receive(std::string const& body, WorldScope const& current, Clock now, ChannelMessage& message,
+                         std::string const& expectedRequestId);
     bool Current(ChannelEnvelope const& envelope, WorldScope const& current, Clock now, bool requireOpen = true) const;
     ChannelError FinishQuery(ChannelEnvelope const& envelope, WorldScope const& current,
                              std::vector<Participant> const& observedUnits, Clock now, std::string& body);
@@ -301,7 +299,6 @@ private:
         std::string requestId;
         bool terminal = false;
     };
-    bool Authenticated(std::string const& bearer) const;
     bool ScopeCurrent(WorldScope const& scope, Clock now) const;
     ChannelError Open(WorldScope const& scope, std::string requestId, Deadline deadline, ChannelWork work, Clock now,
                       std::string const& route = {});
@@ -310,7 +307,6 @@ private:
     std::size_t const _maxPending;
     Identity _identity;
     Clock _observed;  // Trusted clock high-water marks: heartbeat expiry cannot be undone by clock rollback.
-    std::string _bearer;
     // The previous binding's epoch: a reconnect with it is refused. Epochs are fresh 128-bit random values, so no
     // longer history is kept (LC.35).
     std::string _previous;

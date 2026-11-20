@@ -4,6 +4,7 @@
 #include <limits>
 #include <utility>
 
+#include "mod-ollama-chat_bridge_json.h"
 #include "mod-ollama-chat_bridge_query.h"
 
 namespace OllamaBridge
@@ -39,7 +40,7 @@ void WorldChannel::Retire()
     _bindings.clear();
     _watches.Retire();  // J6e-c: module watches end with their epoch (counted dropped).
     std::lock_guard<std::mutex> lock(_mutex);
-    _bearer.clear();
+    _bound = false;
     _receive.clear();
     _done.clear();
     if (_serial != std::numeric_limits<uint64_t>::max())
@@ -61,12 +62,11 @@ bool WorldChannel::Activate()
         return true;
     if (!Drained() || _serial == std::numeric_limits<uint64_t>::max())
         return false;
-    auto const settings = _world.Snapshot();
-    if (!_policy.Bind(selected, settings.token))
+    if (!_policy.Bind(selected))
         return false;
     _selected = selected;
     std::lock_guard<std::mutex> lock(_mutex);
-    _bearer = settings.token;
+    _bound = true;
     return true;
 }
 
@@ -120,24 +120,12 @@ bool WorldChannel::Close(WorldTicket const& ticket)
     return acted;
 }
 
-bool WorldChannel::Authenticated(std::string_view bearer) const
-{
-    if (_bearer.empty() || bearer.size() > 256)
-        return false;
-    std::size_t difference = _bearer.size() ^ bearer.size();
-    for (std::size_t i = 0; i < 256; ++i)
-        difference |= (i < _bearer.size() ? static_cast<unsigned char>(_bearer[i]) : 0) ^
-                      (i < bearer.size() ? static_cast<unsigned char>(bearer[i]) : 0);
-    return difference == 0;
-}
-
-ChannelError WorldChannel::Receive(std::string_view bearer, std::string_view route, std::string_view body,
-                                   uint64_t& receipt)
+ChannelError WorldChannel::Receive(std::string_view route, std::string_view body, uint64_t& receipt)
 {
     receipt = 0;
     std::lock_guard<std::mutex> lock(_mutex);
-    if (!Authenticated(bearer))
-        return ChannelError::Unauthorized;
+    if (!_bound)
+        return ChannelError::Inactive;
     if (body.size() > MaxRequestBytes || route.size() > 128)
         return ChannelError::TooLarge;
     if (route.empty())
@@ -156,12 +144,12 @@ ChannelError WorldChannel::Receive(std::string_view bearer, std::string_view rou
     return ChannelError::None;
 }
 
-ChannelError WorldChannel::Take(std::string_view bearer, uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
+ChannelError WorldChannel::Take(uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
 {
     packet.reset();
     std::lock_guard<std::mutex> lock(_mutex);
-    if (!Authenticated(bearer))
-        return ChannelError::Unauthorized;
+    if (!_bound)
+        return ChannelError::Inactive;
     auto it = _done.find(receipt);
     if (it == _done.end())
         return ChannelError::Unknown;
@@ -301,9 +289,7 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
         {
             auto const& binding = it->second;
             ChannelMessage message;
-            auto const settings = _world.Snapshot();
-            packet->error =
-                _policy.Receive(settings.token, packet->body, binding.ticket.scope, _clock(), message, packet->_route);
+            packet->error = _policy.Receive(packet->body, binding.ticket.scope, _clock(), message, packet->_route);
             packet->body.clear();
             if (packet->error == ChannelError::Duplicate)
                 ++_stats.duplicates;
@@ -352,10 +338,9 @@ std::size_t WorldChannel::Update(EffectPhase const* phase)
                     packet->error =
                         Command(binding, message.envelope, *staged, phase, packet->_until, attempted, packet->body);
                 }
-                else if (auto const* watch = std::get_if<ChannelWatch>(&message.payload))
-                    packet->error = Arm(binding, message.envelope, *watch, phase, armed, packet->body);
-                else
-                    packet->error = ChannelError::Unknown;  // No reverse text adapter; never fabricate delivery.
+                else  // LCB6a: query, command and watch are the channel's only types.
+                    packet->error = Arm(binding, message.envelope, std::get<ChannelWatch>(message.payload), phase,
+                                        armed, packet->body);
                 auto const until = CaptureDeadline(_clock(), message.envelope.deadlineUnixMs - _clock().unixMs);
                 packet->_until.unixMs = std::min(packet->_until.unixMs, until.unixMs);
                 packet->_until.steadyMs = std::min(packet->_until.steadyMs, until.steadyMs);
@@ -476,7 +461,6 @@ TerminalAction DispatchTerminal(WorldOutcome outcome, bool addressedHuman)
         case WorldOutcome::Filtered:
         case WorldOutcome::Malformed:
         case WorldOutcome::Timeout:
-        case WorldOutcome::CircuitOpen:
         case WorldOutcome::QueueFull:
             return addressedHuman ? TerminalAction::Outage : TerminalAction::Silence;
         default:

@@ -36,7 +36,6 @@ constexpr std::size_t MaxTraitBytes = 1024;   // Each word and interest of `inpu
 constexpr std::size_t MaxTraitWords = 32;
 constexpr std::size_t MaxTraitInterests = 3;
 constexpr int64_t MaxLifetimeMs = 120000;
-constexpr int64_t CircuitCooldownMs = 5000;
 
 struct Settings
 {
@@ -173,7 +172,6 @@ struct Result
     int status = 0;
 };
 
-bool ValidIdentifier(std::string const& value);
 bool ValidEndpoint(std::string const& value);
 bool ValidSettings(Settings const& settings);
 // The module generates only through the bridge: enabled without valid settings, it is idle (no listener, no
@@ -191,36 +189,10 @@ bool Build(Settings const& settings, Request const& request, Clock now, std::str
 uint8_t ActivityCode(PlayerbotBridge::BotStateFacts const& state);
 Result Parse(Settings const& settings, Request const& request, std::string const& body, Clock now);
 
-// Reset is called ONLY by the trusted world activation owner after its retirement
-// obligations are met. It does not acknowledge CLI intent, drain work or restore strategies.
-// Tickets prevent late failures/successes from changing a newer activation or recovery.
-class Circuit
-{
-public:
-    struct Ticket
-    {
-        uint64_t revision = 0;
-        bool admitted = false;
-        bool recovery = false;
-    };
-
-    void Reset(Identity identity);
-    Ticket Acquire(Identity const& identity, int64_t steadyMs);
-    void Complete(Ticket ticket, bool success, int64_t steadyMs);
-
-private:
-    std::mutex _mutex;
-    Identity _identity;
-    uint64_t _revision = 0;
-    int64_t _retryAtMs = 0;
-    bool _open = false;
-    bool _recovering = false;
-};
-
 // Injection is local to this call, never a callback captured in a queued task.
 using ReadClock = std::function<Clock()>;
 using Transport = std::function<OllamaHttpResult(Settings const&, std::string const&, int64_t)>;
-Result Generate(Settings const& settings, Request const& request, Circuit& circuit, ReadClock const& readClock,
+Result Generate(Settings const& settings, Request const& request, ReadClock const& readClock,
                 Transport const& transport);
 }  // namespace OllamaBridge
 

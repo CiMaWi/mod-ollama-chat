@@ -290,7 +290,6 @@ OllamaApiResult QueryOllamaBridge(OllamaEndpointSettings const& settings, Ollama
         throw std::runtime_error("synthetic failure");
     return apiResult;
 }
-void OllamaBridge_SetActivation(OllamaBridge::Identity) {}
 std::string ProcessLlmResponse(std::string const& text, std::string const&, uint32_t*, uint32_t maxLen)
 {
     ++cleanupCalls;
@@ -699,8 +698,8 @@ void ClaimedScopeTests()
 void TerminalTests()
 {
     using OllamaBridge::WorldOutcome;
-    for (auto outcome : {WorldOutcome::Unavailable, WorldOutcome::Timeout, WorldOutcome::CircuitOpen,
-                         WorldOutcome::Malformed, WorldOutcome::Empty, WorldOutcome::Filtered, WorldOutcome::QueueFull})
+    for (auto outcome : {WorldOutcome::Unavailable, WorldOutcome::Timeout, WorldOutcome::Malformed, WorldOutcome::Empty,
+                         WorldOutcome::Filtered, WorldOutcome::QueueFull})
     {
         Reset();
         Check(Submit(), "fallback admission");
@@ -846,8 +845,7 @@ void SendAct(OllamaBridge::WorldTicket const& ticket, OllamaBridge::EffectResult
         {"steps", nlohmann::json::array({{{"act", "follow"}, {"params", nlohmann::json::object()}}})}};
     uint64_t receipt = 0;
     auto const before = g_bridgeChannel.Commands();
-    Check(g_bridgeChannel.Receive(config.bridge.token, ticket.request.requestId, act.dump(), receipt) ==
-              OllamaBridge::ChannelError::None,
+    Check(g_bridgeChannel.Receive(ticket.request.requestId, act.dump(), receipt) == OllamaBridge::ChannelError::None,
           "DS.14: the act was received on the generation route");
     OllamaBotRandomChatter::Tick();  // One world tick takes the act.
     Check(g_bridgeChannel.Commands().proposed == before.proposed + 1, "DS.14: the act was decided");
@@ -855,7 +853,7 @@ void SendAct(OllamaBridge::WorldTicket const& ticket, OllamaBridge::EffectResult
     char const* const outcome = result == OllamaBridge::EffectResult::Applied  ? "applied"
                                 : result == OllamaBridge::EffectResult::Failed ? "failed"
                                                                                : "rejected";
-    Check(g_bridgeChannel.Take(config.bridge.token, receipt, packet) == OllamaBridge::ChannelError::None && packet &&
+    Check(g_bridgeChannel.Take(receipt, packet) == OllamaBridge::ChannelError::None && packet &&
               packet->error == OllamaBridge::ChannelError::None &&
               nlohmann::json::parse(packet->body).at("outcome") == outcome,
           "DS.14: the bridge sees the act's outcome");
@@ -1382,12 +1380,11 @@ nlohmann::json WakeAct(OllamaBridge::WorldTicket const& ticket, std::string cons
         {"botGuid", std::to_string(ticket.scope.botGuid)},
         {"steps", nlohmann::json::array({{{"act", "follow"}, {"params", nlohmann::json::object()}}})}};
     uint64_t receipt = 0;
-    Check(g_bridgeChannel.Receive(config.bridge.token, ticket.request.requestId, act.dump(), receipt) ==
-              OllamaBridge::ChannelError::None,
+    Check(g_bridgeChannel.Receive(ticket.request.requestId, act.dump(), receipt) == OllamaBridge::ChannelError::None,
           "wake: the act was received on the wake route");
     OllamaBotRandomChatter::Tick();  // One world tick takes the act.
     std::unique_ptr<OllamaBridge::ChannelPacket> packet;
-    Check(g_bridgeChannel.Take(config.bridge.token, receipt, packet) == OllamaBridge::ChannelError::None && packet &&
+    Check(g_bridgeChannel.Take(receipt, packet) == OllamaBridge::ChannelError::None && packet &&
               packet->error == OllamaBridge::ChannelError::None,
           "wake: the act's result is published");
     executorResult = OllamaBridge::EffectResult::Rejected;

@@ -1,6 +1,7 @@
 // Server-free game-boundary proof: production helper plus a short synthetic local HTTP peer.
 // No worldserver, game objects, native provider, authority or delivery proof is involved.
 #include "mod-ollama-chat_bridge.h"
+#include "mod-ollama-chat_bridge_json.h"
 #define httplib ollamachat_httplib
 #include <algorithm>
 #include <atomic>
@@ -226,46 +227,16 @@ void BoundaryChecks()
     Check(!Build(settings, request, now, body) && body.empty(), "encoded request byte cap");
 }
 
-void CircuitChecks()
+// LCB6a: one failure answers only its own request; the next bot's turn reaches the bridge (the circuit is gone).
+void GenerateChecks()
 {
     using namespace OllamaBridge;
     auto const settings = Settings();
-    auto request = Request();
-    auto identity = MakeIdentity(settings, request);
-    Circuit circuit;
-    Check(!circuit.Acquire(identity, 10000).admitted, "inactive circuit");
-    circuit.Reset(identity);
-    auto const first = circuit.Acquire(identity, 10000);
-    auto const late = circuit.Acquire(identity, 10000);
-    circuit.Complete(first, false, 10000);
-    circuit.Complete(late, true, 10001);
-    Check(!circuit.Acquire(identity, 14999).admitted, "failure opens; late success cannot close");
-    std::atomic<unsigned> admitted = 0;
-    std::vector<std::thread> contenders;
-    for (unsigned i = 0; i < 8; ++i)
-        contenders.emplace_back(
-            [&]
-            {
-                if (circuit.Acquire(identity, 15000).admitted)
-                    ++admitted;
-            });
-    for (auto& contender : contenders)
-        contender.join();
-    Check(admitted == 1, "one concurrent recovery");
-
-    circuit.Reset(identity);
-    auto const old = circuit.Acquire(identity, 16000);
-    identity.epoch = "fixture-epoch-b";
-    circuit.Reset(identity);
-    circuit.Complete(old, false, 16000);
-    Check(circuit.Acquire(identity, 16000).admitted, "old epoch failure ignored");
-    Check(!circuit.Acquire(MakeIdentity(settings, request), 16000).admitted, "old epoch cannot enter");
-    auto changedEndpoint = identity;
-    changedEndpoint.endpoint = "http://127.0.0.1:9";
-    Check(!circuit.Acquire(changedEndpoint, 16000).admitted, "endpoint identity isolated");
-
-    identity = MakeIdentity(settings, request);
-    circuit.Reset(identity);
+    auto const request = Request();
+    auto next = Request();
+    next.requestId = "generation-2";
+    next.botGuid = 9007199254740995ULL;
+    next.input.party = {{next.botGuid, "Second Bot", "tank", 80, next.controllerGuid}};
     Clock now{1000000, 10000};
     unsigned calls = 0;
     auto readClock = [&] { return now; };
@@ -275,31 +246,88 @@ void CircuitChecks()
         Check(remaining == 10000, "bounded generation transport budget");
         return OllamaHttpResult{0, {}, "synthetic transport failure"};
     };
-    Check(!Generate(settings, request, circuit, readClock, fail).ok && calls == 1, "one HTTP failure");
-    Check(!Generate(settings, request, circuit, readClock, fail).ok && calls == 1, "open circuit skips transport");
-    now = {1005000, 15000};
-    auto succeed = [&](OllamaBridge::Settings const&, std::string const&, int64_t remaining)
+    auto answer = [&](OllamaBridge::Request const& asked)
+    {
+        return [&, asked](OllamaBridge::Settings const&, std::string const&, int64_t)
+        {
+            ++calls;
+            return OllamaHttpResult{200, Reply(settings, asked).dump(), {}};
+        };
+    };
+    Check(!Generate(settings, request, readClock, fail).ok && calls == 1, "one HTTP failure");
+    Check(Generate(settings, next, readClock, answer(next)).ok && calls == 2,
+          "one transport failure does not stop the next bot's turn");
+    auto broken = [&](OllamaBridge::Settings const&, std::string const&, int64_t)
     {
         ++calls;
-        Check(remaining == 5000, "recovery retains original deadline");
-        return OllamaHttpResult{200, Reply(settings, request).dump(), {}};
+        return OllamaHttpResult{200, "{broken", {}};
     };
-    Check(Generate(settings, request, circuit, readClock, succeed).ok && calls == 2, "recovery closes circuit");
-    Check(circuit.Acquire(identity, 15000).admitted, "successful recovery resumes");
+    auto const malformed = Generate(settings, request, readClock, broken);
+    Check(!malformed.ok && malformed.error == "bridge_invalid_response" && calls == 3, "a malformed reply refused");
+    Check(Generate(settings, next, readClock, answer(next)).ok && calls == 4,
+          "one malformed reply does not stop the next bot's turn");
+    auto refusal = Reply(settings, request);
+    refusal.erase("text");
+    refusal["type"] = "failure";
+    refusal["code"] = "unavailable";
+    auto failed = [&](OllamaBridge::Settings const&, std::string const&, int64_t)
+    {
+        ++calls;
+        return OllamaHttpResult{200, refusal.dump(), {}};
+    };
+    Check(Generate(settings, request, readClock, failed).error == "bridge_terminal_failure" && calls == 5,
+          "a failure reply answers its own request");
+    Check(Generate(settings, next, readClock, answer(next)).ok && calls == 6,
+          "one failure reply does not stop the next bot's turn");
     now = {900000, 20000};
-    Check(!Generate(settings, request, circuit, readClock, fail).ok && calls == 2, "expired work skips transport");
+    Check(!Generate(settings, request, readClock, fail).ok && calls == 6, "expired work skips transport");
     now = {1000000, 10000};
-    circuit.Reset(identity);
     auto throws = [](OllamaBridge::Settings const&, std::string const&, int64_t) -> OllamaHttpResult
     { throw std::runtime_error("remote credential-like text"); };
-    Check(Generate(settings, request, circuit, readClock, throws).error == "bridge_unavailable", "fixed throw reason");
-    circuit.Reset(identity);
+    Check(Generate(settings, request, readClock, throws).error == "bridge_unavailable", "fixed throw reason");
     auto slow = [&](OllamaBridge::Settings const&, std::string const&, int64_t)
     {
         now = {900000, 20000};
         return OllamaHttpResult{200, Reply(settings, request).dump(), {}};
     };
-    Check(!Generate(settings, request, circuit, readClock, slow).ok, "late response rejected");
+    Check(!Generate(settings, request, readClock, slow).ok, "late response rejected");
+}
+
+// LCB6a: the wire checks every bridge file shares (mod-ollama-chat_bridge_json.h).
+void JsonChecks()
+{
+    using namespace OllamaBridge;
+    Check(StrictParse(R"({"a":[{"b":1}]})").at("a").at(0).at("b") == 1, "strict parse reads a nested document");
+    auto throwsOn = [](std::string const& body)
+    {
+        try
+        {
+            StrictParse(body);
+        }
+        catch (std::exception const&)
+        {
+            return true;
+        }
+        return false;
+    };
+    Check(throwsOn(R"({"a":1,"a":2})") && throwsOn(R"({"o":{"a":1,"a":2}})") && throwsOn("{") &&
+              throwsOn(std::string(MaxJsonDepth + 2, '[') + std::string(MaxJsonDepth + 2, ']')),
+          "strict parse refuses a repeated key, a broken document and excess depth");
+    Check(!throwsOn(R"([{"a":1},{"a":2}])"), "the same key in two objects is no repeat");
+    std::string const token = "synthetic-not-a-real-link-token";
+    Check(BearerMatches("Bearer " + token, token), "exact bearer matches");
+    Check(!BearerMatches("Bearer " + token + "x", token) && !BearerMatches("Bearer " + token.substr(1), token) &&
+              !BearerMatches("bearer " + token, token) &&
+              !BearerMatches("Bearer " + std::string(token.size(), 'x'), token) &&
+              !BearerMatches("Bearer " + std::string(MaxBearerBytes + 1, 'x'), std::string(MaxBearerBytes + 1, 'x')),
+          "another, long or miswritten bearer refused");
+    Check(UsableText("Hello.\nAgain.", 16) && !UsableText(std::string("a\0b", 3), 16) && !UsableText(" \n\t", 16) &&
+              !UsableText(std::string(17, 'x'), 16) && UsableText(std::string(16, 'x'), 16),
+          "usable text: no NUL, not blank, at most max bytes");
+    Check(!UsableName("Inn\nYard", 16) && UsableName("Inn Yard", 16), "a name holds no control character");
+    Check(
+        WireText("a\tb\x01", 16) == std::optional<std::string>("ab") && !WireText(" \x02", 16) && !WireText("\xff", 16),
+        "wire text strips controls and refuses blank or invalid UTF-8");
 }
 
 struct TestSocket
@@ -716,7 +744,8 @@ int main()
     try
     {
         BoundaryChecks();
-        CircuitChecks();
+        GenerateChecks();
+        JsonChecks();
         InterruptedConnectChecks();
         SignalSafetyChecks();
 #ifndef _WIN64

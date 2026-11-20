@@ -94,15 +94,14 @@ struct Fixture
     uint64_t Receive(std::string const& body)
     {
         uint64_t receipt = 0;
-        Check(channel.Receive(settings.token, ticket.request.requestId, body, receipt) == ChannelError::None,
+        Check(channel.Receive(ticket.request.requestId, body, receipt) == ChannelError::None,
               "authenticated producer admission");
         return receipt;
     }
     std::unique_ptr<ChannelPacket> Take(uint64_t receipt)
     {
         std::unique_ptr<ChannelPacket> packet;
-        Check(channel.Take(settings.token, receipt, packet) == ChannelError::None && packet,
-              "authenticated completion operation");
+        Check(channel.Take(receipt, packet) == ChannelError::None && packet, "authenticated completion operation");
         return packet;
     }
 };
@@ -121,8 +120,8 @@ void PhysicalAndIndependent()
             for (unsigned i = 0; i < WorldChannel::MaxPackets; ++i)
             {
                 uint64_t id = 0;
-                if (f.channel.Receive(f.settings.token, f.ticket.request.requestId, f.Query("q" + std::to_string(i)),
-                                      id) != ChannelError::None)
+                if (f.channel.Receive(f.ticket.request.requestId, f.Query("q" + std::to_string(i)), id) !=
+                    ChannelError::None)
                     accepted = false;
                 ids.push_back(id);
             }
@@ -131,17 +130,10 @@ void PhysicalAndIndependent()
     Check(accepted && f.observations == before, "producer neither blocks on inference nor reads world");
     Check(f.channel.Used() == 64, "physical receive capacity");
     uint64_t overflow = 7;
-    Check(
-        f.channel.Receive("wrong", "", std::string(MaxRequestBytes + 1, 'x'), overflow) == ChannelError::Unauthorized &&
-            !overflow,
-        "auth before capacity/size/parse");
-    Check(f.channel.Receive(f.settings.token, "route", "{", overflow) == ChannelError::Capacity,
-          "physical bound before body parse");
+    Check(f.channel.Receive("route", "{", overflow) == ChannelError::Capacity, "physical bound before body parse");
     Check(f.channel.Update() == WorldChannel::TickBudget, "exact bounded world dequeue");
     Check(f.channel.Used() == 64 && heldInference, "queued completions retain slots while inference held");
     std::unique_ptr<ChannelPacket> unauthorized;
-    Check(f.channel.Take("wrong", ids.front(), unauthorized) == ChannelError::Unauthorized,
-          "poll operation authenticates independently");
     auto reply = f.Take(ids.front());
     Check(reply->error == ChannelError::None && Json::parse(reply->body)["code"] == "unavailable",
           "missing filtered adapter fails explicitly closed");
@@ -156,7 +148,7 @@ void PhysicalAndIndependent()
     Check(f.world.ObserveDrain(f.channel.Drained()), "drained selection");
     f.channel.Configure(true);
     Check(f.channel.Activate(), "reconnect binds new selected epoch");
-    Check(f.channel.Take(f.settings.token, ids.front(), unauthorized) == ChannelError::Unknown,
+    Check(f.channel.Take(ids.front(), unauthorized) == ChannelError::Unknown,
           "old completion cannot revive across reconnect");
 }
 
@@ -233,8 +225,7 @@ void RouteCorrelation()
         auto const send = [&]
         {
             uint64_t receipt = 0;
-            Check(f.channel.Receive(f.settings.token, second.request.requestId, message.dump(), receipt) ==
-                      ChannelError::None,
+            Check(f.channel.Receive(second.request.requestId, message.dump(), receipt) == ChannelError::None,
                   "message admitted through its own route");
             f.channel.Update();
             return receipt;
@@ -242,12 +233,12 @@ void RouteCorrelation()
         auto right = f.Take(send());
         Check(type == "command"
                   ? right->error == ChannelError::None && Json::parse(right->body)["outcome"] == "rejected"
-                  : right->error == ChannelError::Unknown && right->body.empty(),
-              "a command stays refused; a terminal closes the route without fabricated delivery");
+                  : right->error == ChannelError::Invalid && right->body.empty(),
+              "a command stays refused; LCB6a: a generation result or failure is no channel type");
         right.reset();
-        // LC.35: a replay on the open binding: a command id stays reserved, a terminal's route is already gone.
+        // LC.35: a replay on the open binding: a command id stays reserved; the refused types stay refused.
         auto again = f.Take(send());
-        Check(again->error == (type == "command" ? ChannelError::Duplicate : ChannelError::Unknown),
+        Check(again->error == (type == "command" ? ChannelError::Duplicate : ChannelError::Invalid),
               "a replay on the same route is refused");
         again.reset();
         f.channel.Close(second);
@@ -256,14 +247,14 @@ void RouteCorrelation()
               "closing releases only that route");
         auto const late = send();
         std::unique_ptr<ChannelPacket> gone;
-        Check(f.channel.Take(f.settings.token, late, gone) == ChannelError::Unknown && !gone && f.channel.Drained(),
+        Check(f.channel.Take(late, gone) == ChannelError::Unknown && !gone && f.channel.Drained(),
               "a closed route answers nothing");
         Check(f.world.Current(f.ticket, f.now), "other generation authority remains current");
     }
 }
 
-// LC.35: the ledger forgets a route at its terminal, so nothing may open that route again while its binding lives: a
-// second Register of the bound ticket is refused before the policy sees it, and the route's command id stays refused.
+// LC.35: a bound route registers once, and its command id stays refused while the route lives. LCB6a: an inbound
+// failure is no channel type; refusing it closes nothing.
 void BoundRouteStaysClosed()
 {
     Fixture f;
@@ -277,14 +268,14 @@ void BoundRouteStaysClosed()
     id = f.Receive(failure.dump());
     f.channel.Update();
     reply = f.Take(id);
-    Check(reply->error == ChannelError::Unknown, "the terminal drops the route; its binding stays until Close");
+    Check(reply->error == ChannelError::Invalid && reply->body.empty(),
+          "an inbound failure is refused and closes nothing");
     reply.reset();
     Check(!f.channel.Register(f.ticket, f.guard), "a bound route registers once");
     id = f.Receive(f.Command("once"));
     f.channel.Update();
     reply = f.Take(id);
-    Check(reply->error == ChannelError::Unknown && reply->body.empty(),
-          "a second Register cannot reopen the dropped route for a replayed command id");
+    Check(reply->error == ChannelError::Duplicate, "a replayed command id stays refused on the open route");
 }
 
 // LC.35: a long-running server keeps answering: 5,000 generation routes with 3 queries each in one epoch, each closed
@@ -303,10 +294,10 @@ void LongRunRoutes()
         for (unsigned k = 0; k < 3; ++k)
         {
             uint64_t receipt = 0;
-            Check(f.channel.Receive(f.settings.token, ticket.request.requestId,
-                                    f.Query("q-" + std::to_string(i) + "-" + std::to_string(k)),
-                                    receipt) == ChannelError::None,
-                  "5000: every query received");
+            Check(
+                f.channel.Receive(ticket.request.requestId, f.Query("q-" + std::to_string(i) + "-" + std::to_string(k)),
+                                  receipt) == ChannelError::None,
+                "5000: every query received");
             f.channel.Update();
             Check(f.Take(receipt)->error == ChannelError::None, "5000: every query answered");
         }
@@ -320,10 +311,9 @@ void ExpiryReloadAndDefaults()
 {
     Fixture off(false);
     uint64_t id = 0;
-    Check(
-        off.channel.Receive(off.settings.token, off.ticket.request.requestId, "{", id) == ChannelError::Unauthorized &&
-            off.channel.Update() == 0,
-        "off has no reverse admission or tick work");
+    Check(off.channel.Receive(off.ticket.request.requestId, "{", id) == ChannelError::Inactive &&
+              off.channel.Update() == 0,
+          "off has no reverse admission or tick work");
     Fixture f;
     id = f.Receive(f.Query("expired"));
     f.now.steadyMs += WorldLivenessMs;
@@ -337,16 +327,14 @@ void ExpiryReloadAndDefaults()
     completed.now.steadyMs += WorldLivenessMs;
     Check(completed.channel.Used() == 1, "completed expiry does not pretend drain");
     std::unique_ptr<ChannelPacket> packet;
-    Check(completed.channel.Take(completed.settings.token, id, packet) == ChannelError::Stale &&
-              completed.channel.Drained(),
+    Check(completed.channel.Take(id, packet) == ChannelError::Stale && completed.channel.Drained(),
           "expired poll actually disposes completion");
     Fixture reload;
     id = reload.Receive(reload.Query("retired"));
     reload.channel.Configure(true);
     reload.world.Configured(true, reload.settings, "epoch-2");
-    Check(reload.channel.Receive(reload.settings.token, reload.ticket.request.requestId, "{", id) ==
-              ChannelError::Unauthorized,
-          "reload revokes old authenticated receiver immediately");
+    Check(reload.channel.Receive(reload.ticket.request.requestId, "{", id) == ChannelError::Inactive,
+          "reload revokes the old receiver immediately");
     Check(!reload.channel.Activate(), "reload never self acknowledges selection");
 }
 
@@ -355,7 +343,7 @@ void HeartbeatReplayLedger()
     ChannelPolicy policy;
     Clock const now{100000, 200000};
     WorldScope scope{1, "fixture", "codex", "epoch", 11, 22, "context", "party", "visible", "c1", "m1"};
-    Check(policy.Bind({"fixture", "codex", "", "epoch"}, "synthetic-local-channel-token"), "ledger bind");
+    Check(policy.Bind({"fixture", "codex", "", "epoch"}), "ledger bind");
     Check(policy.ObserveScope(scope, now), "ledger scope");
     std::string body;
     for (std::size_t i = 0; i < 5000; ++i)

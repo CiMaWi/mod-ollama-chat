@@ -122,8 +122,6 @@ OllamaBridge::WorldChannel g_bridgeChannel(g_bridgeWorld,
             return api.silent ? WorldOutcome::Silent : api.text.empty() ? WorldOutcome::Empty : WorldOutcome::Success;
         if (api.error == "bridge_expired_or_invalid_request")
             return WorldOutcome::Cancelled;
-        if (api.error == "bridge_circuit_open_or_inactive")
-            return WorldOutcome::CircuitOpen;
         if (api.error == "bridge_invalid_response")
             return WorldOutcome::Malformed;
         return WorldOutcome::Unavailable;
@@ -453,16 +451,16 @@ bool PrepareBridge(Completion& c)
 
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
 
-OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view bearer, std::string_view route,
-                                                         std::string_view body, uint64_t& receipt)
+OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view route, std::string_view body,
+                                                         uint64_t& receipt)
 {
-    return g_bridgeChannel.Receive(bearer, route, body, receipt);
+    return g_bridgeChannel.Receive(route, body, receipt);
 }
 
-OllamaBridge::ChannelError OllamaDispatch_ChannelTake(std::string_view bearer, uint64_t receipt,
+OllamaBridge::ChannelError OllamaDispatch_ChannelTake(uint64_t receipt,
                                                       std::unique_ptr<OllamaBridge::ChannelPacket>& packet)
 {
-    return g_bridgeChannel.Take(bearer, receipt, packet);
+    return g_bridgeChannel.Take(receipt, packet);
 }
 
 void OllamaDispatch_BridgeWatchLogout(uint64_t guid)
@@ -512,7 +510,6 @@ static void RetireBridgeWork()
     g_bridgeGeneration = 0;
     g_bridgeChannel.Retire();
     OllamaChat_BridgeReset();
-    OllamaBridge_SetActivation({});
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
         std::erase_if(g_queue, [](Task const& task) { return task.request.bridgeGeneration != 0; });
@@ -581,7 +578,6 @@ void OllamaDispatch_Stop()
     g_bridgeListener.Stop();  // Bounded join of the 127.0.0.1 listener before the channel it feeds is revoked.
     g_bridgeChannel.Configure(false);
     OllamaChat_BridgeReset();
-    OllamaBridge_SetActivation({});
     g_bridgeWorld.Shutdown();
     {
         std::lock_guard<std::mutex> lock(g_queueMutex);
@@ -699,7 +695,6 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
 
 static void ActivateBridge()
 {
-    OllamaBridge_SetActivation(g_bridgeWorld.Selected());
     g_bridgeGeneration = g_bridgeWorld.Generation();
 }
 

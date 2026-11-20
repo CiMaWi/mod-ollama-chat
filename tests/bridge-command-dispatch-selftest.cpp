@@ -187,7 +187,7 @@ struct Fixture
     uint64_t Receive(std::string const& body)
     {
         uint64_t receipt = 0;
-        Check(channel.Receive(settings.token, ticket.request.requestId, body, receipt) == ChannelError::None,
+        Check(channel.Receive(ticket.request.requestId, body, receipt) == ChannelError::None,
               "authenticated producer admission");
         return receipt;
     }
@@ -201,8 +201,7 @@ struct Fixture
     std::unique_ptr<ChannelPacket> Take(uint64_t receipt)
     {
         std::unique_ptr<ChannelPacket> packet;
-        Check(channel.Take(settings.token, receipt, packet) == ChannelError::None && packet,
-              "authenticated completion operation");
+        Check(channel.Take(receipt, packet) == ChannelError::None && packet, "authenticated completion operation");
         return packet;
     }
     // J5e: the last Result's refusal reason and sentence (empty when applied) and its packet error.
@@ -218,7 +217,7 @@ struct Fixture
         steps = Json();
         packetError = ChannelError::None;
         std::unique_ptr<ChannelPacket> packet;
-        auto const error = channel.Take(settings.token, receipt, packet);
+        auto const error = channel.Take(receipt, packet);
         if (error != ChannelError::None)
             return error == ChannelError::Unknown ? "absent" : ChannelErrorName(error);
         Check(packet != nullptr, "taken receipt");
@@ -472,14 +471,10 @@ void TerminalAndIds()
 
     auto result = f.Wire("generation.result", f.ticket.request.requestId);
     result["text"] = "Done.";
-    Check(f.Result(f.Send(result.dump()), "") == "unknown_request", "generation result closes the request");
+    Check(f.Result(f.Send(result.dump()), "") == "invalid_input", "LCB6a: a generation result is no channel type");
     f.Advance(CommandRate::IntervalMs);
-    // LC.35: the terminal dropped the route; a later command finds none.
-    Check(f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "unknown_request" && f.probe.calls == 2,
-          "a command after its request is terminal is refused before reservation or effect");
-    Check(f.Result(f.Send(f.Attack("after-terminal")), "after-terminal") == "unknown_request" &&
-              !f.channel.Commands().duplicates,
-          "the refused command consumed no id");
+    Check(f.Result(f.Send(f.Mark("after-stray")), "after-stray") == "applied" && f.probe.calls == 3,
+          "a stray post neither closes the route nor consumes an id");
 
     Fixture c;
     auto const id = c.Receive(c.Attack("closed-route"));
@@ -500,8 +495,7 @@ void RetirementBeforeTick()
           "retirement disposed the queued command; new epoch selected");
     Check(f.Result(id, "retired") == "absent", "no receipt from a retired epoch");
     uint64_t again = 0;
-    Check(f.channel.Receive(f.settings.token, f.ticket.request.requestId, f.Attack("retired"), again) ==
-                  ChannelError::None &&
+    Check(f.channel.Receive(f.ticket.request.requestId, f.Attack("retired"), again) == ChannelError::None &&
               f.channel.Update(&phase) == 1 && f.probe.calls == 0 && f.channel.Drained(),
           "the old route cannot carry the command into the new epoch");
 }
@@ -513,8 +507,7 @@ void QueueAndRate()
     for (unsigned i = 0; i < WorldChannel::MaxPackets; ++i)
         receipts.push_back(f.Receive(f.Attack("burst-" + std::to_string(i))));
     uint64_t overflow = 7;
-    Check(f.channel.Receive(f.settings.token, f.ticket.request.requestId, f.Attack("burst-over"), overflow) ==
-                  ChannelError::Capacity &&
+    Check(f.channel.Receive(f.ticket.request.requestId, f.Attack("burst-over"), overflow) == ChannelError::Capacity &&
               !overflow,
           "full physical queue refuses before parsing");
     for (unsigned tick = 0; tick < WorldChannel::MaxPackets / WorldChannel::TickBudget; ++tick)
@@ -653,7 +646,7 @@ void PostEffectJoin()
     Case const withheld[] = {
         {"world epoch switch after the effect", [](Fixture& f) { f.world.Configured(true, f.settings, "epoch-2"); },
          "absent", false},
-        {"channel retired inside the executor", [](Fixture& f) { f.channel.Retire(); }, "unauthorized", false},
+        {"channel retired inside the executor", [](Fixture& f) { f.channel.Retire(); }, "inactive", false},
         {"parent route closed inside the executor", [](Fixture& f) { f.channel.Close(f.ticket); }, "absent", true},
         {"receipt deadline passed during the effect",
          [](Fixture& f)
@@ -766,7 +759,7 @@ void TransportLoss()
     auto const lost = f.Send(f.Attack("lost-receipt"));
     f.Advance(WorldLivenessMs);
     std::unique_ptr<ChannelPacket> packet;
-    Check(f.channel.Take(f.settings.token, lost, packet) == ChannelError::Stale && !packet && f.channel.Drained(),
+    Check(f.channel.Take(lost, packet) == ChannelError::Stale && !packet && f.channel.Drained(),
           "an expired receipt is disposed, never resent");
     Check(f.Result(f.Send(f.Attack("lost-receipt")), "lost-receipt") == "duplicate" && f.probe.calls == 1,
           "a producer retry after receipt loss is a duplicate");
