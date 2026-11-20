@@ -2,6 +2,7 @@
 #include "mod-ollama-chat_handler.h"
 #include "mod-ollama-chat_random.h"
 #include "mod-ollama-chat_command.h"
+#include "mod-ollama-chat_delete.h"
 #include "mod-ollama-chat_expression.h"
 #include "Log.h"
 
@@ -17,4 +18,7 @@ void Addmod_ollama_chatScripts()
     new ChatOnEmote();
 
     new OllamaChatConfigCommand();
+
+    // A deleted character's rows (consolidation CS27c).
+    AddOllamaChatDeleteScripts();
 }

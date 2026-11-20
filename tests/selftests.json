@@ -222,6 +222,15 @@
             "success": "PASS \\d+ production world-policy checks"
         },
         {
+            "file": "chat-delete-selftest.cpp",
+            "includes": [
+                "src",
+                "../mod-playerbots/src/Bot",
+                "deps"
+            ],
+            "success": "PASS \\d+ chat delete checks"
+        },
+        {
             "file": "dispatch-bridge-selftest.cpp",
             "includes": [
                 "tests/doubles",
