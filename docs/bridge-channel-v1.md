@@ -182,7 +182,7 @@ older than 5 s, its binding lapsed, or the world check before the read or effect
 ledger's word for a refused envelope. `Retire` answers every queued packet `inactive`; stopping the listener answers
 every waiting handler `inactive`. The handler waits on its answer's signal (capped at 5 s), not on a poll. A command
 outcome that is not published counts as `withheld`. The listener logs a warning at the 1st, 2nd, 4th, ... overload.
-The channel accepts only query, command and watch. Its tables (world scopes, bindings, watches, command intervals)
+The channel accepts only query, command, watch and (LC20b) store. A `store` (bridge/game/README.md *The past (store)*) is parsed on the listener thread (`StoreMessage`: exact keys, 1-64 rows, its id reserved as a command id, so a replay answers `duplicate`), only on an open generation route whose bot and controller it names; `WorldChannel::Store` checks every row on the world thread (`ApplyStore`: authority and `PastRules.h` bounds, all or nothing) and writes through `BotPastMgr` (`src/mod-ollama-chat_bridge_store.cpp`), answering `store.result`. The catalogue announces `past`. Its tables (world scopes, bindings, watches, command intervals)
 hold one entry per bot in talk and have no fixed count (LC.38).
 
 The standalone `tests/bridge-query-selftest.cpp` links the actual helper, world policy, channel policy and physical

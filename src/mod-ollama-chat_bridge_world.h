@@ -292,6 +292,9 @@ private:
     // J6e-c: arms, replaces or clears the route bot's watch exactly once; armed reports a new watch (DS.14 acted).
     ChannelError Arm(Binding const& binding, ChannelEnvelope const& envelope, ChannelWatch const& watch,
                      EffectPhase const* phase, bool& armed, std::string& body);
+    // LC20b: checks and writes one store packet exactly once (ApplyStore); without a phase or a store, refused.
+    ChannelError Store(Binding const& binding, ChannelEnvelope const& envelope, ChannelStore const& store,
+                       EffectPhase const* phase, std::string& body);
     ChannelError Finish(ChannelEnvelope const& envelope, std::string const& commandId, ChannelOutcome outcome,
                         WorldScope const& scope, Clock now, std::string& body,
                         CommandRefusal refusal = CommandRefusal::None, std::span<ChannelStep const> steps = {},

@@ -248,6 +248,23 @@ struct Cell
 
 // --- the production units ---------------------------------------------------
 #include "../src/mod-ollama-chat_bridge_adapter.cpp"
+
+// LC20b: the store's world is game code (mod-ollama-chat_bridge_store.cpp); these checks send no store packet.
+OllamaBridge::StoreWorld& OllamaChat_BridgeStoreWorld()
+{
+    struct None final : OllamaBridge::StoreWorld
+    {
+        bool Known(uint64_t) override { return false; }
+        uint32_t SharedId(uint64_t, uint8_t) override { return 0; }
+        bool InEvent(uint64_t, uint32_t) override { return false; }
+        PastRules::Refusal Apply(OllamaBridge::StoreOp, uint32_t, OllamaBridge::StoreRow const&) override
+        {
+            return PastRules::Refusal::Missing;
+        }
+    };
+    static None none;
+    return none;
+}
 #include "../src/mod-ollama-chat_dispatch.cpp"
 #include "bridge-ability-double.h"
 

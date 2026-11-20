@@ -279,6 +279,17 @@ ChannelError WorldChannel::Arm(Binding const& binding, ChannelEnvelope const& en
                                ticket.scope, now, body, refusal);
 }
 
+ChannelError WorldChannel::Store(Binding const& binding, ChannelEnvelope const& envelope, ChannelStore const& store,
+                                 EffectPhase const* phase, std::string& body)
+{
+    // Receive already consumed this store id in the replay ledger; no path below writes twice. The checks and the
+    // write run here on the world thread, right after Live.
+    StoreWorld* const world = phase && _source ? _source->Store() : nullptr;
+    auto const reasons =
+        world ? ApplyStore(store, *world) : std::vector<std::string>(store.rows.size(), std::string("unavailable"));
+    return _policy.FinishStore(envelope, store, reasons, binding.ticket.scope, _clock(), body);
+}
+
 bool WorldChannel::ReceiptCurrent(WorldTicket const& ticket) const
 {
     // An attempted effect may change facts Live checks (target, combat, marks). Its receipt needs only the selected
@@ -334,6 +345,16 @@ ChannelError WorldChannel::Handle(ChannelPacket& packet, EffectPhase const* phas
         return ChannelError::Stale;
     if (auto const* query = std::get_if<ChannelQuery>(&message.payload))
         return Read(it->second, message.envelope, *query, packet.body);
+    if (auto const* store = std::get_if<ChannelStore>(&message.payload))
+    {
+        // LC20b: a write of the bots' past, no effect in the world (DS.14's acted stays); its receipt after the write
+        // needs the conversation current, as a command's.
+        error = Store(it->second, message.envelope, *store, phase, packet.body);
+        auto const route = _bindings.find(packet._route);
+        if (route == _bindings.end())
+            return ChannelError::Closed;
+        return error == ChannelError::None && !ReceiptCurrent(route->second.ticket) ? ChannelError::Stale : error;
+    }
     bool acted = false;  // An authorized effect attempt, or an armed watch: a promise to act later (DS.14, J6e-c).
     bool const command = std::holds_alternative<ChannelCommand>(message.payload);
     error = command

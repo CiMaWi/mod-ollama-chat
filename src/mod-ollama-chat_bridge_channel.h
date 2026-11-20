@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <variant>
 
+#include "PastRules.h"
 #include "mod-ollama-chat_bridge.h"
 #include "mod-ollama-chat_bridge_intent.h"
 #include "mod-ollama-chat_bridge_watch.h"
@@ -212,8 +213,55 @@ struct ChannelWatch
     WatchCondition condition = WatchCondition::None;
     int64_t untilUnixMs = 0;
 };
-// LCB6a: the channel's only inbound types; a generation's reply returns in its HTTP response.
-using ChannelPayload = std::variant<ChannelQuery, ChannelCommand, ChannelWatch>;
+// LC20b: the `store` packet, the bridge's write of bots' past (playerbots PastRules.h and BotPastMgr, LC20a). Its id
+// shares the command replay namespace. Its rows name the bots it writes: the route's own bot, and other bots only
+// inside the same write (the holders of a shared id the route bot's rows carry, or participants of an event the route
+// bot took part in). The bounds are PastRules' own.
+enum class StoreOp : uint8_t
+{
+    BackgroundSet,     // statements: botGuid, ordinal, text, version, sharedId, source
+    BackgroundRevise,  // statements: botGuid, ordinal, text, version
+    ColourSet          // eventId, lines: botGuid, text, version
+};
+struct StoreRow
+{
+    uint64_t botGuid = 0;
+    uint8_t ordinal = 0;  // Background rows only.
+    std::string text;
+    uint8_t version = 0;
+    uint32_t sharedId = 0;  // background.set: 0 = the bot's own statement.
+    PastRules::Source source = PastRules::Source::Writer;
+};
+struct ChannelStore
+{
+    std::string storeId;
+    uint64_t botGuid = 0;
+    uint64_t controllerGuid = 0;
+    StoreOp op = StoreOp::BackgroundSet;
+    uint32_t eventId = 0;  // colour.set only.
+    std::vector<StoreRow> rows;
+};
+constexpr std::size_t ChannelMaxStoreRows = 64;  // One write's rows: a raid's colour lines, a family's background.
+
+// What the store's authority rule asks of the world, and its write; the game adapter on the world thread, a double in
+// the selftests. Reads are copies of the in-memory past and record; no call queries the database.
+class StoreWorld
+{
+public:
+    virtual ~StoreWorld() = default;
+    virtual bool Known(uint64_t botGuid) = 0;                          // A bot of this realm, never a real player.
+    virtual uint32_t SharedId(uint64_t botGuid, uint8_t ordinal) = 0;  // Its statement's shared id; 0: none or own.
+    virtual bool InEvent(uint64_t botGuid, uint32_t eventId) = 0;      // It has a record row of that event id.
+    virtual PastRules::Refusal Apply(StoreOp op, uint32_t eventId, StoreRow const& row) = 0;
+};
+
+// Checks every row (known bot, PastRules' bounds, authority), then, only when every row passes, writes each through
+// world.Apply. One reason per row in order: empty when applied, skipped when another row refused the write, else
+// unknown_bot, bound, not_participant, missing or minor.
+std::vector<std::string> ApplyStore(ChannelStore const& store, StoreWorld& world);
+
+// LCB6a: the channel's only inbound types; a generation's reply returns in its HTTP response. LC20b: store.
+using ChannelPayload = std::variant<ChannelQuery, ChannelCommand, ChannelWatch, ChannelStore>;
 
 // Owned values only. Successful decode is staging, never an effect-execution grant.
 struct ChannelMessage
@@ -271,6 +319,11 @@ public:
     ChannelError FinishWatch(ChannelEnvelope const& envelope, std::string const& commandId, WatchOutcome outcome,
                              WorldScope const& current, Clock now, std::string& body,
                              CommandRefusal refusal = CommandRefusal::None);
+    // LC20b: `store.result`, outcome applied when every row applied, else refused with the first refused row's
+    // reason; `rows` gives each row's botGuid, outcome and reason. reasons: ApplyStore's, one per row.
+    ChannelError FinishStore(ChannelEnvelope const& envelope, ChannelStore const& store,
+                             std::vector<std::string> const& reasons, WorldScope const& current, Clock now,
+                             std::string& body);
     std::size_t RequestReservations() const { return _requests.size(); }
     std::size_t CommandReservations() const { return _commands.size(); }
     std::size_t Pending() const;

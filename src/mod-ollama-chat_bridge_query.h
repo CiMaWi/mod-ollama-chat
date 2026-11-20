@@ -37,6 +37,8 @@ public:
         facts = {};
         return false;
     }
+    // LC20b: the bots' past the store packet writes; null: the module has no store (every write refused unavailable).
+    virtual StoreWorld* Store() { return nullptr; }
 };
 
 // The observable_group read: the ticket's group members the bot can perceive, with UI health only. LCB6b: no

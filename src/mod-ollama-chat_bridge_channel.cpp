@@ -176,6 +176,67 @@ ChannelWatch WatchMessage(Json const& body)
     return watch;
 }
 
+// LC20b: one write of bots' past, each op with its own keys and one row per bot (and ordinal). A text over its bound
+// is not a parse error: ApplyStore refuses it as bound, so the bridge hears why.
+ChannelStore StoreMessage(Json const& body)
+{
+    ChannelStore store;
+    auto const op = String(body.at("op"));
+    if (op == "background.set")
+        store.op = StoreOp::BackgroundSet;
+    else if (op == "background.revise")
+        store.op = StoreOp::BackgroundRevise;
+    else if (op == "colour.set")
+        store.op = StoreOp::ColourSet;
+    else
+        throw std::runtime_error("invalid");
+    bool const colour = store.op == StoreOp::ColourSet;
+    bool const set = store.op == StoreOp::BackgroundSet;
+    if (colour ? !Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
+                               "storeId", "botGuid", "controllerGuid", "op", "eventId", "lines"})
+               : !Exact(body, {"version", "instance", "provider", "epoch", "requestId", "deadlineUnixMs", "type",
+                               "storeId", "botGuid", "controllerGuid", "op", "statements"}))
+        throw std::runtime_error("invalid");
+    store.storeId = String(body.at("storeId"));
+    store.botGuid = Guid(body.at("botGuid"));
+    store.controllerGuid = Guid(body.at("controllerGuid"));
+    if (!ValidIdentifier(store.storeId))
+        throw std::runtime_error("invalid");
+    if (colour)
+        store.eventId = static_cast<uint32_t>(Integer(body.at("eventId"), UINT32_MAX));
+    if (colour && !store.eventId)
+        throw std::runtime_error("invalid");
+    auto const& rows = body.at(colour ? "lines" : "statements");
+    if (!rows.is_array() || rows.empty() || rows.size() > ChannelMaxStoreRows)
+        throw std::runtime_error("invalid");
+    std::set<std::pair<uint64_t, uint8_t>> seen;
+    for (auto const& value : rows)
+    {
+        if (colour ? !Exact(value, {"botGuid", "text", "version"})
+            : set  ? !Exact(value, {"botGuid", "ordinal", "text", "version", "sharedId", "source"})
+                   : !Exact(value, {"botGuid", "ordinal", "text", "version"}))
+            throw std::runtime_error("invalid");
+        StoreRow row;
+        row.botGuid = Guid(value.at("botGuid"));
+        row.text = String(value.at("text"));
+        row.version = static_cast<uint8_t>(Integer(value.at("version"), UINT8_MAX));
+        if (!colour)
+            row.ordinal = static_cast<uint8_t>(Integer(value.at("ordinal"), UINT8_MAX));
+        if (set)
+        {
+            row.sharedId = static_cast<uint32_t>(Integer(value.at("sharedId"), UINT32_MAX));
+            auto const source = PastRules::SourceOf(std::string_view(String(value.at("source"))));
+            if (!source)
+                throw std::runtime_error("invalid");
+            row.source = *source;
+        }
+        if (!row.version || !seen.insert({row.botGuid, row.ordinal}).second)
+            throw std::runtime_error("invalid");
+        store.rows.push_back(std::move(row));
+    }
+    return store;
+}
+
 Json EnvelopeJson(ChannelEnvelope const& envelope, char const* type)
 {
     return Envelope(envelope.instance, envelope.provider, envelope.epoch, envelope.requestId, envelope.deadlineUnixMs,
@@ -361,8 +422,9 @@ bool TopicEntry(StateTopic topic, StateEntry const& entry, Json& value)
 }
 
 // LC3: what this channel takes beyond the old wire, listed in its catalogue answer (not part of the hash). LC10:
-// `facts`, the module sends input.facts, input.traits and the new state keys (around, servant, mount, deeds).
-constexpr char const* ChannelAbilities[] = {"catalogue", "names", "steps", "facts"};
+// `facts`, the module sends input.facts, input.traits and the new state keys (around, servant, mount, deeds). LC20b:
+// `past`, the channel takes the store packet (background.set, background.revise, colour.set).
+constexpr char const* ChannelAbilities[] = {"catalogue", "names", "steps", "facts", "past"};
 static_assert(MaxStateDeedBytes == ChannelMaxTopicText, "a deed on the wire is a whole record topic sentence");
 
 std::string Hex16(uint64_t value)
@@ -694,6 +756,8 @@ ChannelError ChannelPolicy::Receive(std::string const& body, WorldScope const& c
             payload = Command(json);
         else if (type == "watch")
             payload = WatchMessage(json);
+        else if (type == "store")
+            payload = StoreMessage(json);  // LC20b
         else
             return ChannelError::Invalid;
         Expire(now);
@@ -717,18 +781,32 @@ ChannelError ChannelPolicy::Receive(std::string const& body, WorldScope const& c
             _commands.emplace(command->commandId, CommandEntry{envelope.requestId});
             entry.commands.push_back(command->commandId);
         }
-        else
+        else if (auto const* watch = std::get_if<ChannelWatch>(&payload))
         {
             // J6e-c: only on an open generation (or wake) route and for its own bot; the id is a command id.
-            auto const& watch = std::get<ChannelWatch>(payload);
-            if (entry.work != ChannelWork::Generation || watch.botGuid != entry.scope.botGuid)
+            if (entry.work != ChannelWork::Generation || watch->botGuid != entry.scope.botGuid)
                 return ChannelError::Invalid;
-            if (_commands.contains(watch.commandId))
+            if (_commands.contains(watch->commandId))
                 return ChannelError::Duplicate;
             if (entry.queries.size() + entry.commands.size() >= _maxRouteIds)
                 return ChannelError::Capacity;
-            _commands.emplace(watch.commandId, CommandEntry{envelope.requestId});
-            entry.commands.push_back(watch.commandId);
+            _commands.emplace(watch->commandId, CommandEntry{envelope.requestId});
+            entry.commands.push_back(watch->commandId);
+        }
+        else
+        {
+            // LC20b: only on an open generation route, for its own bot and controller (the current talk); other bots
+            // only inside the write (ApplyStore). The id is a command id: a replay is a duplicate and stores nothing.
+            auto const& store = std::get<ChannelStore>(payload);
+            if (entry.work != ChannelWork::Generation || store.botGuid != entry.scope.botGuid ||
+                store.controllerGuid != entry.scope.controllerGuid)
+                return ChannelError::Invalid;
+            if (_commands.contains(store.storeId))
+                return ChannelError::Duplicate;
+            if (entry.queries.size() + entry.commands.size() >= _maxRouteIds)
+                return ChannelError::Capacity;
+            _commands.emplace(store.storeId, CommandEntry{envelope.requestId});
+            entry.commands.push_back(store.storeId);
         }
         message = {std::move(envelope), std::move(payload)};
         return ChannelError::None;
@@ -995,6 +1073,104 @@ ChannelError ChannelPolicy::FinishWatch(ChannelEnvelope const& envelope, std::st
         json["reason"] = words.code;
         json["reasonText"] = words.text;
     }
+    body = json.dump();
+    found->second.terminal = true;
+    return ChannelError::None;
+}
+
+std::vector<std::string> ApplyStore(ChannelStore const& store, StoreWorld& world)
+{
+    bool const colour = store.op == StoreOp::ColourSet;
+    bool const set = store.op == StoreOp::BackgroundSet;
+    std::size_t const limit = colour ? PastRules::MAX_COLOUR_BYTES : PastRules::MAX_STATEMENT_BYTES;
+    // A shared id is the route bot's when one of its own rows carries it (set) or holds it at its ordinal (revise).
+    auto const sharedOf = [&](StoreRow const& row)
+    { return set ? row.sharedId : world.SharedId(row.botGuid, row.ordinal); };
+    std::set<uint32_t> shared;
+    for (auto const& row : store.rows)
+        if (!colour && row.botGuid == store.botGuid)
+            if (uint32_t const id = sharedOf(row))
+                shared.insert(id);
+    bool const tookPart = colour && world.InEvent(store.botGuid, store.eventId);
+    std::vector<std::string> reasons;
+    reasons.reserve(store.rows.size());
+    bool admitted = true;
+    for (auto const& row : store.rows)
+    {
+        bool const own = row.botGuid == store.botGuid;
+        bool const allowed = colour ? tookPart && (own || world.InEvent(row.botGuid, store.eventId))
+                                    : own || shared.contains(sharedOf(row));
+        bool const bounded = (colour || (row.ordinal >= 1 && row.ordinal <= PastRules::MAX_STATEMENTS)) &&
+                             PastRules::TextRefusal(row.text, limit) == PastRules::Refusal::None;
+        reasons.emplace_back(!world.Known(row.botGuid) ? "unknown_bot"
+                             : !bounded                ? "bound"
+                             : !allowed                ? "not_participant"
+                                                       : "");
+        admitted = admitted && reasons.back().empty();
+    }
+    // One write: a refused row stores none of it.
+    for (std::size_t i = 0; i < store.rows.size(); ++i)
+    {
+        if (!admitted)
+        {
+            if (reasons[i].empty())
+                reasons[i] = "skipped";
+            continue;
+        }
+        switch (world.Apply(store.op, store.eventId, store.rows[i]))
+        {
+            case PastRules::Refusal::None:
+                break;
+            case PastRules::Refusal::Missing:
+                reasons[i] = "missing";
+                break;
+            case PastRules::Refusal::Minor:
+                reasons[i] = "minor";
+                break;
+            default:
+                reasons[i] = "bound";
+                break;
+        }
+    }
+    return reasons;
+}
+
+ChannelError ChannelPolicy::FinishStore(ChannelEnvelope const& envelope, ChannelStore const& store,
+                                        std::vector<std::string> const& reasons, WorldScope const& current, Clock now,
+                                        std::string& body)
+{
+    body.clear();
+    if (!Current(envelope, current, now, false))
+        return ChannelError::Stale;
+    auto found = _commands.find(store.storeId);
+    if (found == _commands.end() || found->second.requestId != envelope.requestId)
+        return ChannelError::Unknown;
+    if (found->second.terminal)
+        return ChannelError::Duplicate;
+    if (reasons.size() != store.rows.size())
+        return ChannelError::Invalid;
+    auto json = EnvelopeJson(envelope, "store.result");
+    json["storeId"] = store.storeId;
+    Json rows = Json::array();
+    std::string reason;
+    for (std::size_t i = 0; i < reasons.size(); ++i)
+    {
+        Json value = {{"botGuid", std::to_string(store.rows[i].botGuid)}};
+        if (reasons[i].empty() || reasons[i] == "skipped")
+            value["outcome"] = reasons[i].empty() ? "applied" : "skipped";
+        else
+        {
+            value["outcome"] = "refused";
+            value["reason"] = reasons[i];
+            if (reason.empty())
+                reason = reasons[i];
+        }
+        rows.push_back(std::move(value));
+    }
+    json["outcome"] = reason.empty() ? "applied" : "refused";
+    if (!reason.empty())
+        json["reason"] = reason;
+    json["rows"] = std::move(rows);
     body = json.dump();
     found->second.terminal = true;
     return ChannelError::None;

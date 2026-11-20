@@ -342,6 +342,10 @@ bool BridgeVisibleUnit(Player* bot, Unit* unit, float distance)
 class BridgeQuerySource final : public OllamaBridge::QueryWorldSource
 {
 public:
+    OllamaBridge::StoreWorld* Store() override
+    {
+        return &OllamaChat_BridgeStoreWorld();  // LC20b
+    }
 
     bool GroupMembers(OllamaBridge::WorldTicket const& ticket, uint64_t groupGuid,
                       std::vector<uint64_t>& members) override

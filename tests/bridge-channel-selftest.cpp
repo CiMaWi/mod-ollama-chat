@@ -884,7 +884,7 @@ void Catalogue()
     auto const& catalogue = json.at("catalogue");
     Check(catalogue.size() == 5 && catalogue.at("hash") == "0a1b2c3d4e5f6071" && catalogue.at("version") == 1 &&
               catalogue.at("maxSteps") == 3 &&
-              catalogue.at("abilities") == Json::array({"catalogue", "names", "steps", "facts"}) &&
+              catalogue.at("abilities") == Json::array({"catalogue", "names", "steps", "facts", "past"}) &&
               catalogue.at("rows").size() == 17,
           "hash, version, abilities, the most steps and every row");
     Check(catalogue.at("rows").at(1) == Json::parse(R"({"kind":"act","name":"mark",
@@ -927,6 +927,202 @@ void Catalogue()
               empty.empty(),
           "no catalogue without an index");
     Check(InstallTestAbilities(), "the double installs once more");
+}
+
+// LC20b: the store packet's world, a double: the route bot, bots 3 and 4 are known (4 holds no shared statement and
+// took part in no event); the route bot holds shared id 7 at ordinal 3, bot 3 at ordinal 2; the route bot and bot 3
+// took part in event 50, bot 3 alone in event 60. Every write is counted.
+struct StoreDouble : StoreWorld
+{
+    uint64_t const route;
+    std::size_t applied = 0;
+    PastRules::Refusal answer = PastRules::Refusal::None;
+    explicit StoreDouble(uint64_t routeBot) : route(routeBot) {}
+    bool Known(uint64_t bot) override { return bot == route || bot == 3 || bot == 4; }
+    uint32_t SharedId(uint64_t bot, uint8_t ordinal) override
+    {
+        return (bot == route && ordinal == 3) || (bot == 3 && ordinal == 2) ? 7 : 0;
+    }
+    bool InEvent(uint64_t bot, uint32_t eventId) override
+    {
+        return (eventId == 50 && (bot == route || bot == 3)) || (eventId == 60 && bot == 3);
+    }
+    PastRules::Refusal Apply(StoreOp, uint32_t, StoreRow const&) override
+    {
+        ++applied;
+        return answer;
+    }
+};
+
+ChannelStore StoreOf(StoreOp op, std::vector<StoreRow> rows, uint64_t route, uint32_t eventId = 0)
+{
+    ChannelStore store;
+    store.storeId = "store";
+    store.botGuid = route;
+    store.controllerGuid = 1;
+    store.op = op;
+    store.eventId = eventId;
+    store.rows = std::move(rows);
+    return store;
+}
+
+using Reasons = std::vector<std::string>;
+
+void Stores()
+{
+    Fixture f;
+    f.Open();
+    uint64_t const bot = f.scope.botGuid;
+    auto const wire = [&](std::string id, std::string const& op)
+    {
+        auto json = f.Wire("store");
+        json["storeId"] = std::move(id);
+        json["botGuid"] = std::to_string(bot);
+        json["controllerGuid"] = std::to_string(f.scope.controllerGuid);
+        json["op"] = op;
+        if (op == "colour.set")
+        {
+            json["eventId"] = 50;
+            json["lines"] =
+                Json::array({{{"botGuid", std::to_string(bot)}, {"text", "A cold night."}, {"version", 1}}});
+        }
+        else if (op == "background.set")
+            json["statements"] = Json::array({{{"botGuid", std::to_string(bot)},
+                                               {"ordinal", 1},
+                                               {"text", "Born in Goldshire."},
+                                               {"version", 1},
+                                               {"sharedId", 0},
+                                               {"source", "writer"}}});
+        else
+            json["statements"] = Json::array(
+                {{{"botGuid", std::to_string(bot)}, {"ordinal", 1}, {"text", "Born in Elwynn."}, {"version", 1}}});
+        return json;
+    };
+    // Schema: each op its own keys; a malformed store reserves no id.
+    for (auto const* op : {"background.set", "background.revise", "colour.set"})
+    {
+        auto extra = wire("bad", op);
+        extra["extra"] = 1;
+        Check(f.Receive(extra) == ChannelError::Invalid, "a store with a key its op does not take is invalid");
+    }
+    auto unknownOp = wire("bad", "background.set");
+    unknownOp["op"] = "background.erase";
+    auto twice = wire("bad", "background.set");
+    twice["statements"].push_back(twice["statements"][0]);
+    auto unversioned = wire("bad", "colour.set");
+    unversioned["lines"][0]["version"] = 0;
+    auto noEvent = wire("bad", "colour.set");
+    noEvent["eventId"] = 0;
+    auto badSource = wire("bad", "background.set");
+    badSource["statements"][0]["source"] = "player";
+    auto empty = wire("bad", "background.revise");
+    empty["statements"] = Json::array();
+    for (auto const* bad : {&unknownOp, &twice, &unversioned, &noEvent, &badSource, &empty})
+        Check(f.Receive(*bad) == ChannelError::Invalid,
+              "an unknown op, a repeated row, version 0, event 0, a source word not the store's or no row is invalid");
+    auto otherBot = wire("bad", "background.set");
+    otherBot["botGuid"] = "3";
+    auto otherController = wire("bad", "colour.set");
+    otherController["controllerGuid"] = "3";
+    Check(f.Receive(otherBot) == ChannelError::Invalid && f.Receive(otherController) == ChannelError::Invalid,
+          "a store names the route's own bot and controller");
+    Check(f.policy.CommandReservations() == 0, "a malformed store reserves no id");
+
+    // A replayed store id is a duplicate: Receive admits it once, so it is written once.
+    ChannelMessage message;
+    Check(
+        f.policy.Receive(wire("past-1", "background.set").dump(), f.scope, now, message, "work") == ChannelError::None,
+        "a store stages on its route");
+    Check(f.Receive(wire("past-1", "background.set")) == ChannelError::Duplicate &&
+              f.Receive(wire("past-1", "colour.set")) == ChannelError::Duplicate,
+          "a replayed store id stores nothing");
+    auto const& staged = std::get<ChannelStore>(message.payload);
+    Check(staged.op == StoreOp::BackgroundSet && staged.rows.size() == 1 && staged.rows[0].ordinal == 1 &&
+              staged.rows[0].text == "Born in Goldshire." && staged.rows[0].source == PastRules::Source::Writer,
+          "a store's rows preserved");
+    Check(f.Receive(f.Command("past-1")) == ChannelError::Duplicate, "a store id shares the command namespace");
+
+    // The authority rule (the invariant first): a row for a bot outside the talk and outside the write's shared id
+    // or event is refused, and then nothing of the write is stored.
+    StoreDouble world(bot);
+    auto const row = [](uint64_t guid, std::size_t ordinal, std::string text, uint32_t shared = 0)
+    { return StoreRow{guid, static_cast<uint8_t>(ordinal), std::move(text), 1, shared, PastRules::Source::Writer}; };
+    auto const set = [&](std::vector<StoreRow> rows)
+    { return ApplyStore(StoreOf(StoreOp::BackgroundSet, std::move(rows), bot), world); };
+    auto const revise = [&](std::vector<StoreRow> rows)
+    { return ApplyStore(StoreOf(StoreOp::BackgroundRevise, std::move(rows), bot), world); };
+    auto const colour = [&](std::vector<StoreRow> rows, uint32_t eventId)
+    { return ApplyStore(StoreOf(StoreOp::ColourSet, std::move(rows), bot, eventId), world); };
+    Check(set({row(bot, 1, "Born in Goldshire."), row(4, 1, "A stranger.")}) == Reasons{"skipped", "not_participant"} &&
+              world.applied == 0,
+          "a bot outside the talk and the write's shared id is refused, and the write stores nothing");
+    Check(set({row(bot, 1, "Born in Goldshire."), row(bot, 2, "Kin of Brannoc.", 7),
+               row(3, 4, "Kin of Brannoc.", 7)}) == Reasons(3) &&
+              world.applied == 3,
+          "the holders of a shared id the route bot's rows carry are written in the same write");
+    Check(set({row(bot, 1, "Born."), row(3, 4, "Kin.", 9)}) == Reasons{"skipped", "not_participant"} &&
+              world.applied == 3,
+          "a shared id the route bot's rows do not carry is refused");
+    Check(set({row(3, 4, "Kin.", 7)}) == Reasons{"not_participant"}, "another bot alone, without the route bot's row");
+    Check(set({row(bot, 1, "Born."), row(5, 1, "Born.")}) == Reasons{"skipped", "unknown_bot"},
+          "an unknown bot is unknown_bot");
+
+    // Bounds are PastRules': a statement of MAX_STATEMENT_BYTES stores, one byte more is bound; ordinals 1..10.
+    std::string const longest(PastRules::MAX_STATEMENT_BYTES, 'a');
+    Check(set({row(bot, 1, longest)}) == Reasons(1) && world.applied == 4, "a statement at its bound stores");
+    Check(set({row(bot, 1, "Born."), row(bot, 2, longest + "a")}) == Reasons{"skipped", "bound"} && world.applied == 4,
+          "an oversize statement is refused bound, and the write stores nothing");
+    for (auto const& bad : {row(bot, 0, "Born."), row(bot, PastRules::MAX_STATEMENTS + 1, "Born."), row(bot, 1, ""),
+                            row(bot, 1, "Two\nlines.")})
+        Check(set({bad}) == Reasons{"bound"}, "an ordinal outside 1..10, an empty text or a line break is bound");
+
+    // revise: another bot only at an ordinal holding a shared id the route bot's revised ordinal holds.
+    Check(revise({row(bot, 3, "Kin."), row(3, 2, "Kin.")}) == Reasons(2) && world.applied == 6,
+          "a revise of a shared statement for its holders");
+    Check(revise({row(bot, 3, "Kin."), row(3, 1, "Kin.")}) == Reasons{"skipped", "not_participant"},
+          "a revise of another bot's own statement is refused");
+
+    // colour: the route bot took part in the event, and so did every other bot of the write.
+    std::string const line(PastRules::MAX_COLOUR_BYTES, 'c');
+    Check(colour({row(bot, 0, line), row(3, 0, "We held.")}, 50) == Reasons(2) && world.applied == 8,
+          "colour for two participants of the event");
+    Check(colour({row(bot, 0, "We held."), row(4, 0, "We held.")}, 50) == Reasons{"skipped", "not_participant"},
+          "a bot not in the event is refused");
+    Check(colour({row(3, 0, "We held.")}, 60) == Reasons{"not_participant"},
+          "an event the route bot did not take part in is refused");
+    Check(colour({row(bot, 0, line + "c")}, 50) == Reasons{"bound"} && world.applied == 8,
+          "an oversize colour line is bound");
+    world.answer = PastRules::Refusal::Minor;
+    auto const minor = colour({row(bot, 0, "We held.")}, 50);
+    world.answer = PastRules::Refusal::Missing;
+    auto const missing = revise({row(bot, 3, "Kin.")});
+    Check(minor == Reasons{"minor"} && missing == Reasons{"missing"},
+          "the store's own refusals come back in its words");
+
+    // The answer: store.result, refused with the first refused row's reason, each row's outcome; then terminal.
+    ChannelStore answered = StoreOf(StoreOp::BackgroundSet, {row(bot, 1, "Born."), row(4, 1, "A stranger.")}, bot);
+    answered.storeId = "past-1";
+    Reasons const words{"skipped", "not_participant"};
+    std::string body;
+    Check(f.policy.FinishStore(message.envelope, answered, {"bound"}, f.scope, now, body) == ChannelError::Invalid,
+          "one reason per row");
+    Check(f.policy.FinishStore(message.envelope, answered, words, f.scope, now, body) == ChannelError::None,
+          "a store answered");
+    auto const json = Json::parse(body);
+    Check(json.at("type") == "store.result" && json.at("storeId") == "past-1" && json.at("outcome") == "refused" &&
+              json.at("reason") == "not_participant" &&
+              json.at("rows") == Json::parse(R"([{"botGuid":"9007199254740994","outcome":"skipped"},
+                                                {"botGuid":"4","outcome":"refused","reason":"not_participant"}])"),
+          "store.result with the write's outcome and reason and each row's");
+    Check(f.policy.FinishStore(message.envelope, answered, words, f.scope, now, body) == ChannelError::Duplicate,
+          "a store is answered once");
+    ChannelMessage applied;
+    Check(f.policy.Receive(wire("past-2", "colour.set").dump(), f.scope, now, applied, "work") == ChannelError::None,
+          "a colour store stages");
+    Check(f.policy.FinishStore(applied.envelope, std::get<ChannelStore>(applied.payload), {""}, f.scope, now, body) ==
+                  ChannelError::None &&
+              Json::parse(body).at("outcome") == "applied" && !Json::parse(body).contains("reason"),
+          "an applied store has no reason");
 }
 
 void Watches()
@@ -1526,6 +1722,7 @@ int main()
         QueriesAndCapacity();
         Topics();
         Watches();
+        Stores();
         Catalogue();
         Stepped();
         SteppedResults();
