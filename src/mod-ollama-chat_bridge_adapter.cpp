@@ -342,10 +342,6 @@ bool BridgeVisibleUnit(Player* bot, Unit* unit, float distance)
 class BridgeQuerySource final : public OllamaBridge::QueryWorldSource
 {
 public:
-    bool Observe(OllamaBridge::WorldTicket const& ticket, OllamaBridge::DispatchGuard& guard) override
-    {
-        return OllamaChat_BridgeObserve(ticket, guard);
-    }
 
     bool GroupMembers(OllamaBridge::WorldTicket const& ticket, uint64_t groupGuid,
                       std::vector<uint64_t>& members) override
@@ -609,7 +605,7 @@ bool BridgeSubmit(Player* bot, Player* speaker, ChatChannelSourceLocal source, s
         BridgeKeep(*it, std::move(view), now);
     else
     {
-        if (g_bridgeBindings.size() >= MaxWorldScopes || g_bridgeRevision == UINT64_MAX)
+        if (g_bridgeRevision == UINT64_MAX)  // LC.38: one binding per bot in talk, no fixed count.
             return false;
         auto const revision = std::to_string(++g_bridgeRevision);
         auto& scope = view.guard.scope;

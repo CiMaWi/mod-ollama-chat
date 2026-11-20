@@ -11,11 +11,9 @@
 
 namespace OllamaBridge
 {
-// LC.35: the query and command ids one route may open. A route lives at most 120 s and the 64 packet slots bound
-// the rest; the ledger holds live routes only.
+// LC.35: the query and command ids one route may open; one more is refused as overload (LC.38). A route lives at most
+// 120 s and the ledger holds live routes only, so it holds no more routes than the world has tickets.
 constexpr std::size_t ChannelMaxRouteIds = 64;
-constexpr std::size_t ChannelMaxPending = 64;
-constexpr std::size_t ChannelMaxScopes = 64;
 constexpr std::size_t ChannelMaxUnits = 40;
 constexpr std::size_t ChannelMaxTopicBytes = 8192;  // DS.14 (d): one bot_state topic's entries, encoded.
 constexpr std::size_t ChannelMaxTopicName = 64;     // Bytes of one entry's name, cut on a character boundary.
@@ -225,19 +223,17 @@ struct ChannelMessage
 };
 
 // World-thread owner; no mutex, game objects, transport, queue or activation acknowledgement.
-// J5b must bind only the actual selected/drained game epoch, authenticate EVERY transport operation,
-// own physical payload slots through disposal and revalidate live world authority before publication.
+// LCB6b: the replay ledger only (route ids, their query, command and watch ids, deadlines, terminals). Whether a
+// conversation is current is WorldPolicy's, which WorldChannel asks; the ledger keeps no scope table.
 class ChannelPolicy
 {
 public:
-    explicit ChannelPolicy(std::size_t maxRouteIds = ChannelMaxRouteIds, std::size_t maxPending = ChannelMaxPending);
+    explicit ChannelPolicy(std::size_t maxRouteIds = ChannelMaxRouteIds);
     ChannelPolicy(ChannelPolicy const&) = delete;
     ChannelPolicy& operator=(ChannelPolicy const&) = delete;
 
     bool Bind(Identity identity);
     void Retire();
-    bool ObserveScope(WorldScope scope, Clock now);
-    void RemoveScope(uint64_t botGuid, std::string const& contextId);
     void Expire(Clock now);
     ChannelError OpenGeneration(WorldScope const& scope, std::string requestId, Deadline deadline, Clock now);
     // LC.35: forgets a route, its own id and the query and command ids opened under it; a late message of any of them
@@ -247,7 +243,9 @@ public:
     // Unbound, it parses nothing (Inactive); the listener checked the bearer before the body was read (LCB6a).
     // current and expectedRequestId come from the trusted game route, NEVER from this body.
     // Non-query ids must match that route before state changes; queries carry independent ids, opened under the
-    // route (an unknown route refuses them as Unknown) and dropped with it.
+    // route (an unknown route refuses them as Unknown) and dropped with it. Current checks the ledger entry (open,
+    // identity, deadline) and that it is the same bot, controller and context; it never says whether that
+    // conversation is still current (WorldPolicy does).
     ChannelError Receive(std::string const& body, WorldScope const& current, Clock now, ChannelMessage& message,
                          std::string const& expectedRequestId);
     bool Current(ChannelEnvelope const& envelope, WorldScope const& current, Clock now, bool requireOpen = true) const;
@@ -278,11 +276,6 @@ public:
     std::size_t Pending() const;
 
 private:
-    struct ScopeEntry
-    {
-        WorldScope scope;
-        Deadline until;
-    };
     struct RequestEntry
     {
         ChannelEnvelope envelope;
@@ -299,18 +292,15 @@ private:
         std::string requestId;
         bool terminal = false;
     };
-    bool ScopeCurrent(WorldScope const& scope, Clock now) const;
     ChannelError Open(WorldScope const& scope, std::string requestId, Deadline deadline, ChannelWork work, Clock now,
                       std::string const& route = {});
     bool const _validLimits;
     std::size_t const _maxRouteIds;
-    std::size_t const _maxPending;
     Identity _identity;
     Clock _observed;  // Trusted clock high-water marks: heartbeat expiry cannot be undone by clock rollback.
     // The previous binding's epoch: a reconnect with it is refused. Epochs are fresh 128-bit random values, so no
     // longer history is kept (LC.35).
     std::string _previous;
-    std::vector<ScopeEntry> _scopes;
     std::unordered_map<std::string, RequestEntry> _requests;  // Live routes and their queries only.
     std::unordered_map<std::string, CommandEntry> _commands;  // The live routes' command and watch ids.
 };

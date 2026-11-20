@@ -49,13 +49,13 @@ public:
     virtual std::vector<ChannelStepResult> Steps() const { return {}; }
 };
 
-// Bounded per-bot gate on the game-owned lane, independent of request and command ids and of channel epochs.
-// A steady high-water mark keeps clock rollback from reopening an interval. Entries whose interval has passed
-// are evicted only when the table is full, so a scope or epoch change never reopens a bot's interval early.
+// Per-bot gate on the game-owned lane, independent of request and command ids and of channel epochs. A steady
+// high-water mark keeps clock rollback from reopening an interval. LC.38: no fixed count. Entries whose interval has
+// passed are swept when the table has doubled since the last sweep, never one by one, so a scope or epoch change
+// never reopens a bot's interval early; the table holds about the bots that commanded within one interval.
 class CommandRate
 {
 public:
-    static constexpr std::size_t MaxBots = 64;
     static constexpr int64_t IntervalMs = 2000;
 
     bool Admit(uint64_t botGuid, Clock now)
@@ -71,17 +71,20 @@ public:
             found->second = _high;
             return true;
         }
-        if (_admitted.size() >= MaxBots)
+        if (_admitted.size() >= _sweepAt)
+        {
             std::erase_if(_admitted, [&](auto const& entry) { return _high - entry.second >= IntervalMs; });
-        if (_admitted.size() >= MaxBots)
-            return false;
+            _sweepAt = std::max(MinSweep, 2 * _admitted.size());
+        }
         _admitted.emplace(botGuid, _high);
         return true;
     }
     std::size_t Size() const { return _admitted.size(); }
 
 private:
+    static constexpr std::size_t MinSweep = 64;
     int64_t _high = 0;
+    std::size_t _sweepAt = MinSweep;
     std::unordered_map<uint64_t, int64_t> _admitted;
 };
 

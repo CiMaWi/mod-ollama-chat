@@ -29,11 +29,9 @@ struct Fixture
     WorldScope scope{
         1,       "fixture",       "codex",     "epoch-1",  9007199254740994ULL, 9007199254740993ULL, "conversation",
         "party", "visible-party", "context-1", "members-1"};
-    explicit Fixture(std::size_t ids = ChannelMaxRouteIds, std::size_t pending = ChannelMaxPending)
-        : policy(ids, pending)
+    explicit Fixture(std::size_t ids = ChannelMaxRouteIds) : policy(ids)
     {
         Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}), "trusted selected epoch binding");
-        Check(policy.ObserveScope(scope, now), "trusted scope registration");
     }
     void Open(std::string const& id = "work")
     {
@@ -128,10 +126,8 @@ void IdentityAndTerminal()
     auto const old = failed.Command("old");
     Check(failed.Receive(old) == ChannelError::Unknown, "a closed route cannot authorize effects");
     Check(failed.policy.Bind({"fixture", "codex", "", "epoch-2"}), "reconnect uses new epoch");
-    Check(!failed.policy.ObserveScope(failed.scope, now), "reconnect rejects old scope");
     Check(failed.Receive(old) == ChannelError::Stale, "the old epoch is retired");
     failed.scope.epoch = "epoch-2";
-    Check(failed.policy.ObserveScope(failed.scope, now), "fresh epoch scope");
     Check(failed.policy.Receive(old.dump(), failed.scope, now, result, "work") == ChannelError::Stale,
           "an old command cannot cross reconnect");
     auto renewed = old;
@@ -140,7 +136,7 @@ void IdentityAndTerminal()
           "reconnect cannot reopen old work");
     // LC.35: only the previous binding's epoch is remembered (epochs are 128-bit random, never reissued).
     Check(!failed.policy.Bind({"fixture", "codex", "", "epoch-2"}), "retired epoch reuse fails closed");
-    Check(!failed.policy.ObserveScope(failed.scope, now), "bad activation leaves inactive");
+    Check(failed.Receive(renewed) == ChannelError::Inactive, "bad activation leaves inactive");
 }
 
 void ExpiryAndScope()
@@ -164,14 +160,17 @@ void ExpiryAndScope()
     changedDeadline["deadlineUnixMs"] = deadline.unixMs - 1;
     Check(f.Receive(changedDeadline) == ChannelError::Stale, "must preserve exact deadline");
     Check(f.Receive(f.Command(), {100999, 200999}) == ChannelError::None, "last live millisecond accepted");
-    f.policy.RemoveScope(f.scope.botGuid, f.scope.contextId);
-    Check(f.Receive(f.Command("removed")) == ChannelError::Stale, "removed context rejected");
-    Check(f.policy.ObserveScope(f.scope, now), "same scope can be observed again");
-    Check(f.Receive(f.Command("revive")) == ChannelError::Stale, "reobservation cannot revive old request");
-    for (auto const* field : {"controller", "context", "membership", "perception", "channel"})
+    // LCB6b: the ledger refuses a route of another bot, controller or context; whether the conversation is still
+    // current (a revision, a lapse) is WorldPolicy's question, which the channel asks (bridge-world-selftest).
+    for (auto const* field : {"bot", "controller", "context id", "context", "membership", "perception", "channel"})
     {
         Fixture revision;
         revision.Open();
+        std::string const name = field;
+        if (name == "bot")
+            revision.scope.botGuid += 1;
+        if (name == "context id")
+            revision.scope.contextId = "context-2";
         if (std::string(field) == "controller")
             revision.scope.controllerGuid += 1;
         if (std::string(field) == "context")
@@ -182,16 +181,17 @@ void ExpiryAndScope()
             revision.scope.perceptionScope += "-new";
         if (std::string(field) == "channel")
             revision.scope.channel = "direct";
-        Check(revision.policy.ObserveScope(revision.scope, now), "trusted scope revision");
-        Check(revision.Receive(revision.Command()) == ChannelError::Stale, "revision invalidates old work");
+        bool const owner = name == "bot" || name == "controller" || name == "context id";
+        Check(revision.Receive(revision.Command()) == (owner ? ChannelError::Stale : ChannelError::None),
+              "another route owner is stale; a scope revision is WorldPolicy's");
     }
     Fixture lapsed;
     Deadline const longDeadline{110000, 210000};
     Check(lapsed.policy.OpenGeneration(lapsed.scope, "work", longDeadline, now) == ChannelError::None, "long work");
-    Check(lapsed.policy.ObserveScope(lapsed.scope, {105000, 205000}), "refresh after scope expiry");
     auto late = lapsed.Command();
     late["deadlineUnixMs"] = longDeadline.unixMs;
-    Check(lapsed.Receive(late, {105000, 205000}) == ChannelError::Stale, "scope expiry cannot revive by refresh");
+    Check(lapsed.Receive(late, {105000, 205000}) == ChannelError::None,
+          "the ledger keeps a route to its own deadline; the conversation's liveness is WorldPolicy's");
     Check(lapsed.policy.OpenGeneration(lapsed.scope, "too-long", {225001, 325001}, {105000, 205000}) ==
               ChannelError::Invalid,
           "120 second maximum");
@@ -317,9 +317,9 @@ void QueriesAndCapacity()
     Check(f.policy.FinishFailure(query.envelope, ChannelFailure::Cancelled, f.scope, now, body) == ChannelError::Stale,
           "local failure terminal once");
     Check(f.Receive(f.Command("query-after-failure", "q3")) == ChannelError::Closed, "failed query remains closed");
-    Fixture slots(4, 1);
+    Fixture slots(4);
     slots.Open();
-    Check(slots.Receive(slots.Query()) == ChannelError::Capacity, "pending work fails closed");
+    Check(slots.Receive(slots.Query()) == ChannelError::None, "LC.38: no ledger-wide pending count refuses a query");
     slots.policy.Drop("work");
     Check(slots.Receive(slots.Query()) == ChannelError::Unknown, "a closed route opens no query");
     slots.Open("work-2");
@@ -408,8 +408,6 @@ void QueriesAndCapacity()
     Check(!invalid.Bind({"fixture", "codex", "", "invalid-limits"}), "zero capacity fails closed");
     ChannelPolicy tooMany(ChannelMaxRouteIds + 1);
     Check(!tooMany.Bind({"fixture", "codex", "", "invalid-limits"}), "cannot expand id bound");
-    ChannelPolicy tooPending(1, ChannelMaxPending + 1);
-    Check(!tooPending.Bind({"fixture", "codex", "", "invalid-limits"}), "cannot expand pending bound");
 
     Fixture effects;
     effects.Open();
@@ -422,18 +420,17 @@ void QueriesAndCapacity()
     Check(effects.policy.Receive(effects.Query("q-over").dump(), effects.scope, now, asked, "work") ==
               ChannelError::Capacity,
           "queries share the route's id bound");
-    Fixture scopes;
-    for (unsigned i = 1; i < ChannelMaxScopes; ++i)
+    // LC.38: the ledger keeps no scope table and no count of bots in talk: routes of 200 bots open.
+    Fixture bots;
+    for (unsigned i = 1; i <= 200; ++i)
     {
-        auto scope = scopes.scope;
+        auto scope = bots.scope;
+        scope.botGuid += i;
         scope.contextId = "context-" + std::to_string(i);
-        Check(scopes.policy.ObserveScope(scope, now), "scope reservation up to maximum");
+        Check(bots.policy.OpenGeneration(scope, "bot-" + std::to_string(i), deadline, now) == ChannelError::None,
+              "LC.38: a route per bot, no fixed count");
     }
-    auto extra = scopes.scope;
-    extra.contextId = "overflow";
-    Check(!scopes.policy.ObserveScope(extra, now), "scope capacity fails closed");
-    scopes.policy.RemoveScope(scopes.scope.botGuid, scopes.scope.contextId);
-    Check(scopes.policy.ObserveScope(extra, now), "removed scope frees bounded scope slot");
+    Check(bots.policy.RequestReservations() == 200, "200 bots' routes held");
     // LC.35: no epoch history bound; only the previous binding's epoch is refused (epochs are 128-bit random).
     ChannelPolicy epochs;
     for (unsigned i = 0; i < 5000; ++i)

@@ -13,6 +13,7 @@
 // After the Winsock headers, which supply its types.
 #include <iphlpapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -260,50 +261,62 @@ struct FakeMailbox
     unsigned receives = 0;
     std::vector<std::thread::id> threads;
     ChannelError receiveResult = ChannelError::None;
-    ChannelError pendingTake = ChannelError::Unknown;
-    uint64_t sequence = 0;
-    std::map<uint64_t, std::unique_ptr<ChannelPacket>> done;
+    bool instant = false;  // Answers each accepted packet at once, as a world tick would.
+    ChannelError instantError = ChannelError::None;
+    std::vector<std::shared_ptr<ChannelAnswer>> answers;  // The accepted packets' answers, in arrival order.
 
     // LCB6a: the listener's BearerMatches is the one bearer check; the mailbox sees only admitted posts.
-    ChannelError Receive(std::string_view, std::string_view, uint64_t& receipt)
+    ChannelError Receive(std::string_view, std::string_view, std::shared_ptr<ChannelAnswer> const& answer)
     {
         std::lock_guard<std::mutex> lock(mutex);
         ++receives;
         threads.push_back(std::this_thread::get_id());
         if (receiveResult != ChannelError::None)
             return receiveResult;
-        receipt = ++sequence;
+        answers.push_back(answer);
+        if (instant)
+            answer->Set(Packet(instantError, ""));
         return ChannelError::None;
     }
-    ChannelError Take(uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
-    {
-        std::lock_guard<std::mutex> lock(mutex);
-        auto it = done.find(receipt);
-        if (it == done.end())
-            return pendingTake;
-        packet = std::move(it->second);
-        done.erase(it);
-        return ChannelError::None;
-    }
-    void Publish(uint64_t receipt, ChannelError error, std::string body)
+    static std::unique_ptr<ChannelPacket> Packet(ChannelError error, std::string body)
     {
         auto packet = std::make_unique<ChannelPacket>();
-        packet->receipt = receipt;
         packet->error = error;
         packet->body = std::move(body);
-        std::lock_guard<std::mutex> lock(mutex);
-        done[receipt] = std::move(packet);
+        return packet;
+    }
+    // The world's answer to the index-th accepted packet.
+    void Publish(std::size_t index, ChannelError error, std::string body)
+    {
+        std::shared_ptr<ChannelAnswer> answer;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            answer = answers.at(index);
+        }
+        answer->Set(Packet(error, std::move(body)));
     }
     unsigned Receives()
     {
         std::lock_guard<std::mutex> lock(mutex);
         return receives;
     }
-    void Set(ChannelError receive, ChannelError take = ChannelError::Unknown)
+    std::size_t Accepted()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        return answers.size();
+    }
+    void Set(ChannelError receive)
     {
         std::lock_guard<std::mutex> lock(mutex);
         receiveResult = receive;
-        pendingTake = take;
+        instant = false;
+    }
+    void Answer(ChannelError error)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        receiveResult = ChannelError::None;
+        instant = true;
+        instantError = error;
     }
 };
 
@@ -312,15 +325,14 @@ struct Harness
     FakeMailbox mailbox;
     std::mutex logMutex;
     std::vector<std::string> logs;
-    ChannelListener listener{[this](std::string_view route, std::string_view body, uint64_t& receipt)
-                             { return mailbox.Receive(route, body, receipt); },
-                             [this](uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
-                             { return mailbox.Take(receipt, packet); },
-                             [this](bool, std::string const& line)
-                             {
-                                 std::lock_guard<std::mutex> lock(logMutex);
-                                 logs.push_back(line);
-                             }};
+    ChannelListener listener{
+        [this](std::string_view route, std::string_view body, std::shared_ptr<ChannelAnswer> const& answer)
+        { return mailbox.Receive(route, body, answer); },
+        [this](bool, std::string const& line)
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            logs.push_back(line);
+        }};
     uint16_t port = 0;
     explicit Harness(bool start = true)
     {
@@ -329,6 +341,12 @@ struct Harness
             port = FreePort();
             Check(listener.Configure(true, port, Token) && listener.Running(), "listener starts on a free port");
         }
+    }
+    bool Logged(std::string const& text)
+    {
+        std::lock_guard<std::mutex> lock(logMutex);
+        return std::any_of(logs.begin(), logs.end(),
+                           [&](std::string const& line) { return line.find(text) != std::string::npos; });
     }
     bool LogsClean()
     {
@@ -371,17 +389,9 @@ void PureRules()
     Check(ListenerBodyShape("{}") && ListenerBodyShape(" {\"a\":1} \n"), "object bodies pass the shape gate");
     for (char const* body : {"", "   ", "[1]", "null", "{", "x{}", "\"{}\""})
         Check(!ListenerBodyShape(body), "non-object body refused");
-    int64_t const now = 1700000000000;
-    Check(ListenerWaitMs("{}", now) == ListenerWaitCapMs, "no deadline waits the cap");
-    Check(ListenerWaitMs("{\"deadlineUnixMs\":" + std::to_string(now + 300) + "}", now) == 300, "deadline bounds");
-    Check(ListenerWaitMs("{\"deadlineUnixMs\" : " + std::to_string(now + 300) + "}", now) == 300, "spaces");
-    Check(ListenerWaitMs("{\"deadlineUnixMs\":" + std::to_string(now - 5) + "}", now) == 0, "past deadline is 0");
-    Check(ListenerWaitMs("{\"deadlineUnixMs\":" + std::to_string(now + 60000) + "}", now) == ListenerWaitCapMs,
-          "far deadline capped at the packet liveness");
-    Check(ListenerWaitMs("{\"deadlineUnixMs\":\"1\"}", now) == ListenerWaitCapMs &&
-              ListenerWaitMs("{\"deadlineUnixMs\":12345678901234567}", now) == ListenerWaitCapMs &&
-              ListenerWaitMs("{\"deadlineUnixMs\"}", now) == ListenerWaitCapMs,
-          "unreadable deadline waits the cap");
+    Check(std::string_view(ChannelErrorName(ChannelError::Capacity)) == "overload" &&
+              std::string_view(ChannelErrorName(ChannelError::Closed)) == "closed",
+          "LC.38: a refusal for want of room is answered overload");
     Check(ListenerStatus(ChannelError::None) == 200 && ListenerStatus(ChannelError::Unauthorized) == 401 &&
               ListenerStatus(ChannelError::Inactive) == 503 && ListenerStatus(ChannelError::Invalid) == 400 &&
               ListenerStatus(ChannelError::TooLarge) == 413 && ListenerStatus(ChannelError::Stale) == 410 &&
@@ -484,32 +494,41 @@ void TokenAndInput(Harness& h)
 
 void Deadlines(Harness& h)
 {
-    auto const quick = [&](ChannelError receive, ChannelError take, int status, char const* name)
+    auto const quick = [&](ChannelError receive, int status, char const* name)
     {
-        h.mailbox.Set(receive, take);
+        h.mailbox.Set(receive);
         Reply const reply = Post(h.port, "gen-1", Envelope(3000));
         Check(Error(reply, status, name) && reply.ms < 300, "mailbox error maps without waiting");
     };
-    quick(ChannelError::Capacity, ChannelError::Unknown, 429, "capacity");
-    quick(ChannelError::Inactive, ChannelError::Unknown, 503, "inactive");
-    quick(ChannelError::Stale, ChannelError::Unknown, 410, "stale");
-    quick(ChannelError::Closed, ChannelError::Unknown, 410, "closed");
-    quick(ChannelError::TooLarge, ChannelError::Unknown, 413, "too_large");
-    quick(ChannelError::None, ChannelError::Stale, 410, "stale");  // Terminal Take error ends the wait.
+    quick(ChannelError::Capacity, 429, "overload");
+    Check(h.listener.Stats().overloads == 1 && h.Logged("channel overload: 1 requests"),
+          "the first overload is logged");
+    quick(ChannelError::Inactive, 503, "inactive");
+    quick(ChannelError::Stale, 410, "stale");
+    quick(ChannelError::Closed, 410, "closed");
+    quick(ChannelError::TooLarge, 413, "too_large");
+    quick(ChannelError::Capacity, 429, "overload");
+    quick(ChannelError::Capacity, 429, "overload");
+    Check(h.listener.Stats().overloads == 3 && h.Logged("channel overload: 2 requests") &&
+              !h.Logged("channel overload: 3 requests"),
+          "overloads are counted and logged at counts 1, 2, 4, ...");
+    // LCB6b: the world's answer ends the wait at once; the listener never reads the envelope's deadline.
+    for (auto const& [error, name] :
+         {std::pair{ChannelError::Stale, "stale"}, std::pair{ChannelError::Closed, "closed"}})
+    {
+        h.mailbox.Answer(error);
+        Reply const answered = Post(h.port, "gen-1", Envelope(-1000));
+        Check(Error(answered, 410, name) && answered.ms < 300, "a world answer ends the wait at once");
+    }
     h.mailbox.Set(ChannelError::None);
-    Reply const short300 = Post(h.port, "gen-1", Envelope(300));
-    Check(Error(short300, 504, "timeout") && short300.ms >= 280 && short300.ms < 500,
-          "envelope deadline 300 ms ends the wait near 300 ms");
-    Reply const past = Post(h.port, "gen-1", Envelope(-1000));
-    Check(Error(past, 504, "timeout") && past.ms < 200, "a passed deadline times out at once");
-    Check(h.listener.Stats().timeouts == 2, "timeouts counted");
+    Check(h.listener.Stats().timeouts == 0, "an answered packet never times out");
 }
 
 void Handoff(Harness& h)
 {
     h.mailbox.Set(ChannelError::None);
     unsigned const before = h.mailbox.Receives();
-    uint64_t const receipt = h.mailbox.sequence + 1;
+    std::size_t const index = h.mailbox.Accepted();
     std::thread::id client;
     auto reply = std::async(std::launch::async,
                             [&]
@@ -520,7 +539,7 @@ void Handoff(Harness& h)
     Check(WaitFor([&] { return h.mailbox.Receives() == before + 1; }), "request reaches the mailbox");
     std::this_thread::sleep_for(std::chrono::milliseconds(100));  // The world tick comes later.
     std::string const result = R"({"type":"query.result","requestId":"q-1"})";
-    h.mailbox.Publish(receipt, ChannelError::None, result);
+    h.mailbox.Publish(index, ChannelError::None, result);
     Reply const answered = reply.get();
     Check(answered.status == 200 && answered.body == result && answered.ms >= 100 &&
               answered.headers.find("Connection: close") != std::string::npos &&
@@ -532,10 +551,10 @@ void Handoff(Harness& h)
          {std::tuple{ChannelError::Unknown, 400, "invalid_input"},
           std::tuple{ChannelError::Duplicate, 409, "duplicate"}, std::tuple{ChannelError::None, 400, "invalid_input"}})
     {
-        uint64_t const next = h.mailbox.sequence + 1;
-        h.mailbox.Publish(next, error, "");
+        h.mailbox.Answer(error);
         Check(Error(Post(h.port, "gen-1", Envelope(3000)), status, name), "packet error maps through the table");
     }
+    h.mailbox.Set(ChannelError::None);
 }
 
 // The bridge's calls of one world tick: every mailbox slot is filled at once, none waits for a handler or is closed.
@@ -549,8 +568,8 @@ void MailboxSlots()
                                      [&h, i] { return Post(h.port, "gen-" + std::to_string(i), Envelope(5000)); }));
     Check(WaitFor([&] { return h.mailbox.Receives() == calls; }, 3000),
           "every mailbox slot's call reaches the mailbox at once");
-    for (uint64_t receipt = 1; receipt <= calls; ++receipt)
-        h.mailbox.Publish(receipt, ChannelError::None, R"({"type":"query.result"})");
+    for (std::size_t index = 0; index < calls; ++index)
+        h.mailbox.Publish(index, ChannelError::None, R"({"type":"query.result"})");
     std::size_t answered = 0;
     for (auto& reply : replies)
         answered += reply.get().status == 200 ? 1 : 0;
@@ -603,8 +622,9 @@ void NeverTicks()
 {
     Harness h;
     Reply const reply = Post(h.port, "gen-1", "{\"type\":\"query\"}");
-    Check(Error(reply, 504, "timeout") && reply.ms >= ListenerWaitCapMs - 20 && reply.ms < ListenerWaitCapMs + 200,
-          "no world tick and no deadline: 504 at the 5000 ms cap");
+    Check(Error(reply, 504, "timeout") && reply.ms >= ListenerWaitCapMs - 20 && reply.ms < ListenerWaitCapMs + 200 &&
+              h.listener.Stats().timeouts == 1,
+          "no world tick: 504 at the 5000 ms cap");
 }
 
 void Shutdown()
@@ -646,7 +666,7 @@ struct Source : QueryWorldSource
     DispatchGuard guard;
     std::map<uint64_t, Unit> objects;
     std::vector<uint64_t> members{11, 22};
-    bool Observe(WorldTicket const&, DispatchGuard& current) override
+    bool Observe(WorldTicket const&, DispatchGuard& current)
     {
         current = guard;
         return true;
@@ -721,10 +741,9 @@ struct RealFixture
 void RealChannel()
 {
     RealFixture f;
-    ChannelListener listener([&](std::string_view route, std::string_view body, uint64_t& receipt)
-                             { return f.channel.Receive(route, body, receipt); },
-                             [&](uint64_t receipt, std::unique_ptr<ChannelPacket>& packet)
-                             { return f.channel.Take(receipt, packet); });
+    ChannelListener listener(
+        [&](std::string_view route, std::string_view body, std::shared_ptr<ChannelAnswer> const& answer)
+        { return f.channel.Receive(route, body, answer); });
     uint16_t const port = FreePort();
     Check(listener.Configure(true, port, Token), "listener over the production mailbox");
     std::string const route = f.ticket.request.requestId;
@@ -738,7 +757,9 @@ void RealChannel()
         return pending.get();
     };
     auto query = std::async(std::launch::async, [&] { return Post(port, route, f.Query("query-1")); });
+    uint64_t const checked = f.world.Checks();
     Reply const answered = tick(query);
+    Check(f.world.Checks() - checked == 1, "LCB6b: one WorldPolicy check for the query packet over HTTP");
     Json const result = Json::parse(answered.body, nullptr, false);
     Check(answered.status == 200 && result.is_object() && result.value("type", "") == "query.result" &&
               result.value("requestId", "") == "query-1",
@@ -748,11 +769,20 @@ void RealChannel()
     Check(Error(tick(replay), 409, "duplicate"), "replayed request id is 409 from the world policy");
     auto junk = std::async(std::launch::async, [&] { return Post(port, route, "{not json}"); });
     Check(Error(tick(junk), 400, "invalid_input"), "strict decode failure from the world is 400");
-    auto dropped = std::async(std::launch::async,
-                              [&] { return Post(port, "unregistered-route", f.Query("query-2", UnixNow() + 300)); });
-    Reply const gone = tick(dropped);
-    Check(Error(gone, 504, "timeout") && gone.ms >= 280 && gone.ms < 600 && f.channel.Used() == 0,
-          "a packet the world drops ends as a timeout at the envelope deadline");
+    Reply const unbound = Post(port, "unregistered-route", f.Query("query-2"));
+    Check(Error(unbound, 410, "closed") && unbound.ms < 50 && f.channel.Used() == 0,
+          "a route with no open generation is answered closed at once");
+    // LCB6b exit: a tool call waiting when its generation closes, and one after, hear closed within 50 ms.
+    auto waiting = std::async(std::launch::async, [&] { return Post(port, route, f.Query("query-3")); });
+    Check(WaitFor([&] { return f.channel.Used() == 1; }), "a tool call waits for the world");
+    auto const closing = Steady::now();
+    f.channel.Close(f.ticket);
+    Reply const closed = waiting.get();
+    Check(Error(closed, 410, "closed") && Since(closing) < 50 && f.channel.Used() == 0,
+          "a waiting tool call is answered closed within 50 ms of its generation's close");
+    Reply const late = Post(port, route, f.Query("query-4"));
+    Check(Error(late, 410, "closed") && late.ms < 50 && f.channel.Used() == 0,
+          "a tool call after its generation closed is answered closed within 50 ms");
     Check(Error(Refused(port, Token2, route), 401, "unauthorized") && f.channel.Used() == 0,
           "wrong bearer never reaches the production mailbox");
     listener.Stop();

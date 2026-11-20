@@ -74,7 +74,6 @@ namespace
 // Policy and selection are world-thread only; worker counters/tags carry no game references.
 OllamaBridge::WorldPolicy g_bridgeWorld;
 OllamaBridgeObserver g_bridgeObserver = nullptr;
-bool g_channelEnabled = false;
 OllamaBridge::CommandStats g_loggedCommands;  // World-thread: the counters in the last watchlist line.
 uint64_t g_bridgeSilent = 0;  // World-thread: delivered action-only answers (DS.14), in the commands line.
 uint64_t g_loggedSilent = 0;  // World-thread: the silent count in the last watchlist line.
@@ -452,15 +451,9 @@ bool PrepareBridge(Completion& c)
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld() { return g_bridgeWorld; }
 
 OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view route, std::string_view body,
-                                                         uint64_t& receipt)
+                                                         std::shared_ptr<OllamaBridge::ChannelAnswer> const& answer)
 {
-    return g_bridgeChannel.Receive(route, body, receipt);
-}
-
-OllamaBridge::ChannelError OllamaDispatch_ChannelTake(uint64_t receipt,
-                                                      std::unique_ptr<OllamaBridge::ChannelPacket>& packet)
-{
-    return g_bridgeChannel.Take(receipt, packet);
+    return g_bridgeChannel.Receive(route, body, answer);
 }
 
 void OllamaDispatch_BridgeWatchLogout(uint64_t guid)
@@ -479,9 +472,9 @@ void OllamaDispatch_BridgeWatchLogout(uint64_t guid)
 
 namespace
 {
-// J5d transport on 127.0.0.1: its threads call only the I/O-safe Receive/Take above (C3). Defined after the
-// channel, so static destruction stops it first.
-OllamaBridge::ChannelListener g_bridgeListener(OllamaDispatch_ChannelReceive, OllamaDispatch_ChannelTake,
+// J5d transport on 127.0.0.1: its threads call only the I/O-safe Receive above (C3). Defined after the channel, so
+// static destruction stops it first.
+OllamaBridge::ChannelListener g_bridgeListener(OllamaDispatch_ChannelReceive,
                                                [](bool warning, std::string const& line)
                                                {
                                                    if (warning)
@@ -491,17 +484,17 @@ OllamaBridge::ChannelListener g_bridgeListener(OllamaDispatch_ChannelReceive, Ol
                                                });
 }  // namespace
 
-void OllamaDispatch_BridgeListen(bool channelEnabled, uint32_t port)
+void OllamaDispatch_BridgeListen(uint32_t port)
 {
     OllamaEndpointSettings const settings = OllamaConfig_Snapshot();
-    bool const wanted = channelEnabled && OllamaBridge::BridgeUsable(g_Enable, settings.bridge);
+    bool const wanted = OllamaBridge::BridgeUsable(g_Enable, settings.bridge);
     g_bridgeListener.Configure(wanted, port, wanted ? settings.bridge.token : std::string());
 }
 
 void OllamaDispatch_SetBridgeObserver(OllamaBridgeObserver observer)
 {
     // Rebinding cannot make work captured by a previous adapter eligible.
-    OllamaDispatch_BridgeConfigured(g_channelEnabled);
+    OllamaDispatch_BridgeConfigured();
     g_bridgeObserver = observer;
 }
 
@@ -521,11 +514,10 @@ static void RetireBridgeWork()
     g_bridgeWorld.Shutdown();
 }
 
-void OllamaDispatch_BridgeConfigured(bool channelEnabled)
+void OllamaDispatch_BridgeConfigured()
 {
     RetireBridgeWork();
-    g_channelEnabled = channelEnabled;
-    g_bridgeChannel.Configure(channelEnabled);
+    g_bridgeChannel.Configure(true);  // LCB6b: the channel runs whenever the bridge does (no ChannelEnabled).
     OllamaEndpointSettings const settings = OllamaConfig_Snapshot();
     std::string epoch;
     bool const usable = OllamaBridge::BridgeUsable(g_Enable, settings.bridge);
@@ -636,8 +628,6 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
     if (settings.bridge.token != g_bridgeWorld.Snapshot().token || !(identity == g_bridgeWorld.Selected()))
         return false;
     auto slot = DispatchSlot::Acquire();
-    if (!slot)
-        return false;  // No capacity to stage even a queue-full fallback.
     auto ticket = g_bridgeWorld.Reserve(scope, std::move(input), Now(), lifetimeMs);
     if (!ticket.generation)
         return false;
@@ -655,7 +645,7 @@ bool OllamaDispatch_SubmitBridge(OllamaChatRequest request, OllamaBridge::WorldS
         g_bridgeWorld.Cancel(ticket);
         return false;
     }
-    if (g_channelEnabled && !g_bridgeChannel.Register(ticket, pending.request.bridgeGuard))
+    if (!g_bridgeChannel.Register(ticket, pending.request.bridgeGuard))
     {
         g_bridgeWorld.Cancel(ticket);
         return false;

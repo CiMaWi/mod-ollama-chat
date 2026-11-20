@@ -1,4 +1,5 @@
 // Offline production value-policy checks. No server, game objects, native observer or delivery proof.
+#include <algorithm>
 #include <functional>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -137,11 +138,14 @@ void Capacity()
     Select(policy, "world-epoch-capacity");
     auto const scope = Scope(policy);
     Check(policy.ObserveScope(scope, now), "capacity scope");
+    // LC.38: no fixed count of tickets; each lives at most its lifetime.
     std::vector<WorldTicket> pending;
-    for (std::size_t i = 0; i < MaxWorldPending; ++i)
+    for (std::size_t i = 0; i < 200; ++i)
         pending.push_back(policy.Reserve(scope, Input(), now, 1000));
-    Check(pending.back().generation != 0 && policy.Pending() == MaxWorldPending, "pending capacity reached");
-    Check(policy.Reserve(scope, Input(), now, 1000).generation == 0, "pending capacity rejects without eviction");
+    Check(
+        std::all_of(pending.begin(), pending.end(), [](WorldTicket const& ticket) { return ticket.generation != 0; }) &&
+            policy.Pending() == 200,
+        "LC.38: 200 tickets taken, no pending cap");
     for (auto const& ticket : pending)
         policy.Cancel(ticket);
     // LC.35: no epoch cap: 5,000 reservations one after another all succeed.
@@ -159,16 +163,31 @@ void Capacity()
     Check(policy.ObserveScope(Scope(policy), now), "new epoch capacity scope");
     auto const next = policy.Reserve(Scope(policy), Input(), now, 1000);
     Check(next.generation && next.request.requestId != last.request.requestId, "a fresh epoch issues fresh ids");
-    for (std::size_t i = 1; i < MaxWorldScopes; ++i)
+    // LC.38: the scope table is keyed by bot, one entry per conversation, with no fixed count: 200 conversations of
+    // 50 bots (four each) are observed and reserved, and each stays its own.
+    std::vector<WorldTicket> talks;
+    for (std::size_t i = 0; i < 200; ++i)
     {
         auto another = Scope(policy);
+        another.botGuid += i % 50;
         another.contextId = "conversation-" + std::to_string(i);
         if (!policy.ObserveScope(another, now))
-            throw std::runtime_error("premature scope capacity");
+            throw std::runtime_error("LC.38: a scope refused below 200");
+        talks.push_back(policy.Reserve(another, Input(), now, 1000));
+        if (!talks.back().generation)
+            throw std::runtime_error("LC.38: a reservation refused below 200");
     }
-    auto excess = Scope(policy);
-    excess.contextId = "excess";
-    Check(!policy.ObserveScope(excess, now), "scope capacity rejects without eviction");
+    Check(
+        std::all_of(talks.begin(), talks.end(), [&](WorldTicket const& ticket) { return policy.Current(ticket, now); }),
+        "LC.38: 200 conversations current, no scope cap");
+    policy.InvalidateScope(talks[0].scope.botGuid, talks[0].scope.contextId);
+    Check(!policy.Current(talks[0], now) && policy.Current(talks[50], now) &&
+              talks[50].scope.botGuid == talks[0].scope.botGuid,
+          "one conversation's end leaves the same bot's other conversations current");
+    auto revised = talks[100].scope;
+    revised.membershipRevision = "membership-2";
+    Check(policy.ObserveScope(revised, now) && !policy.Current(talks[100], now) && policy.Current(talks[150], now),
+          "a revision ends only that conversation's tickets");
 }
 }  // namespace
 

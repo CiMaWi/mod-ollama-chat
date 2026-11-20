@@ -1,5 +1,6 @@
 // Actual WorldChannel, WorldPolicy and ChannelPolicy with an instrumented typed effect seam; no game or PB code.
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -184,24 +185,25 @@ struct Fixture
     {
         return Command(id, "mark", {{"targetGuid", "44"}, {"icon", "triangle"}});
     }
-    uint64_t Receive(std::string const& body)
+    // LCB6b: the answer a listener thread waits on.
+    std::shared_ptr<ChannelAnswer> Receive(std::string const& body)
     {
-        uint64_t receipt = 0;
+        auto receipt = std::make_shared<ChannelAnswer>();
         Check(channel.Receive(ticket.request.requestId, body, receipt) == ChannelError::None,
               "authenticated producer admission");
         return receipt;
     }
     // One message through one world tick, with the post-map-join phase unless a test withholds it.
-    uint64_t Send(std::string const& body, bool withPhase = true)
+    std::shared_ptr<ChannelAnswer> Send(std::string const& body, bool withPhase = true)
     {
-        auto const receipt = Receive(body);
+        auto receipt = Receive(body);
         Check(channel.Update(withPhase ? &phase : nullptr) == 1, "one bounded dequeue");
         return receipt;
     }
-    std::unique_ptr<ChannelPacket> Take(uint64_t receipt)
+    static std::unique_ptr<ChannelPacket> Take(std::shared_ptr<ChannelAnswer> const& receipt)
     {
         std::unique_ptr<ChannelPacket> packet;
-        Check(channel.Take(receipt, packet) == ChannelError::None && packet, "authenticated completion operation");
+        Check(receipt->Wait(std::chrono::steady_clock::now(), packet) && packet, "authenticated completion operation");
         return packet;
     }
     // J5e: the last Result's refusal reason and sentence (empty when applied) and its packet error.
@@ -209,17 +211,17 @@ struct Fixture
     std::string reasonText;
     Json steps;  // LC3b: a result's step list (null for a fixed error).
     ChannelError packetError = ChannelError::None;
-    // The single correlated receipt: its outcome, a fixed error name, or "absent" when withheld or disposed.
-    std::string Result(uint64_t receipt, std::string const& id)
+    // The single correlated answer: its outcome, a fixed error name (a withheld receipt is stale or closed), or
+    // "absent" while the world has not answered.
+    std::string Result(std::shared_ptr<ChannelAnswer> const& receipt, std::string const& id)
     {
         reason.clear();
         reasonText.clear();
         steps = Json();
         packetError = ChannelError::None;
         std::unique_ptr<ChannelPacket> packet;
-        auto const error = channel.Take(receipt, packet);
-        if (error != ChannelError::None)
-            return error == ChannelError::Unknown ? "absent" : ChannelErrorName(error);
+        if (!receipt->Wait(std::chrono::steady_clock::now(), packet))
+            return "absent";
         Check(packet != nullptr, "taken receipt");
         if (packet->error != ChannelError::None)
         {
@@ -273,13 +275,17 @@ void PureSeam()
     Check(rate.Admit(20, {1000, s + 1000}) && !rate.Admit(20, {1000, s + 5999}) && rate.Admit(20, {1000, s + 6000}),
           "admission during rollback is recorded at the high-water mark");
 
-    CommandRate full;
-    for (uint64_t bot = 1; bot <= CommandRate::MaxBots; ++bot)
-        Check(full.Admit(bot, {1000, s}), "bounded table fill");
-    Check(!full.Admit(100, {1000, s + 1999}) && full.Size() == CommandRate::MaxBots,
-          "a full table denies a new lane without growing");
-    Check(full.Admit(100, {1000, s + 2000}) && full.Size() == 1 && !full.Admit(100, {1000, s + 2001}),
-          "only lanes whose interval passed are evicted");
+    // LC.38: no fixed count of bots; intervals that passed are swept when the table doubles, live ones never.
+    CommandRate many;
+    for (uint64_t bot = 1; bot <= 400; ++bot)
+        if (!many.Admit(bot, {1000, s + (bot <= 200 ? 0 : 1000)}))
+            throw std::runtime_error("LC.38: a bot refused below 400");
+    Check(many.Size() == 400, "LC.38: 400 bots admitted; a sweep never evicts a live interval");
+    for (uint64_t bot = 401; bot <= 513; ++bot)
+        Check(many.Admit(bot, {1000, s + 2000}), "new bots admitted while the table sweeps");
+    Check(many.Size() == 313, "the sweep evicted only the 200 intervals that passed");
+    Check(!many.Admit(300, {1000, s + 2999}) && many.Admit(1, {1000, s + 2999}),
+          "a bot is refused within its 2 s even after a sweep");
 }
 
 // LCB2: each act reaches the executor as its row's step: the act's playerbots Intent and its parameters as given.
@@ -479,9 +485,9 @@ void TerminalAndIds()
     Fixture c;
     auto const id = c.Receive(c.Attack("closed-route"));
     c.channel.Close(c.ticket);
-    Check(c.channel.Update(&phase) == 0 && c.probe.calls == 0 && c.channel.Drained() &&
-              c.Result(id, "closed-route") == "absent",
-          "a closed parent route disposes its queued command");
+    Check(c.Result(id, "closed-route") == "closed" && c.channel.Update(&phase) == 0 && c.probe.calls == 0 &&
+              c.channel.Drained(),
+          "LCB6b: a closed parent route answers its queued command closed");
 }
 
 void RetirementBeforeTick()
@@ -491,24 +497,25 @@ void RetirementBeforeTick()
     f.world.Configured(true, f.settings, "epoch-2");
     Check(f.channel.Update(&phase) == 0 && f.probe.calls == 0, "epoch switch before the tick: no world work");
     f.channel.Configure(true);
+    Check(f.Result(id, "retired") == "inactive", "LCB6b: a retired epoch answers its queued command inactive");
     Check(f.channel.Drained() && f.world.ObserveDrain(f.channel.Drained()) && f.channel.Activate(),
           "retirement disposed the queued command; new epoch selected");
-    Check(f.Result(id, "retired") == "absent", "no receipt from a retired epoch");
-    uint64_t again = 0;
-    Check(f.channel.Receive(f.ticket.request.requestId, f.Attack("retired"), again) == ChannelError::None &&
-              f.channel.Update(&phase) == 1 && f.probe.calls == 0 && f.channel.Drained(),
+    auto const again = std::make_shared<ChannelAnswer>();
+    Check(f.channel.Receive(f.ticket.request.requestId, f.Attack("retired"), again) == ChannelError::Closed &&
+              f.channel.Update(&phase) == 0 && f.probe.calls == 0 && f.channel.Drained(),
           "the old route cannot carry the command into the new epoch");
 }
 
 void QueueAndRate()
 {
     Fixture f;
-    std::vector<uint64_t> receipts;
+    std::vector<std::shared_ptr<ChannelAnswer>> receipts;
     for (unsigned i = 0; i < WorldChannel::MaxPackets; ++i)
         receipts.push_back(f.Receive(f.Attack("burst-" + std::to_string(i))));
-    uint64_t overflow = 7;
+    auto const overflow = std::make_shared<ChannelAnswer>();
+    std::unique_ptr<ChannelPacket> none;
     Check(f.channel.Receive(f.ticket.request.requestId, f.Attack("burst-over"), overflow) == ChannelError::Capacity &&
-              !overflow,
+              !overflow->Wait(std::chrono::steady_clock::now(), none),
           "full physical queue refuses before parsing");
     for (unsigned tick = 0; tick < WorldChannel::MaxPackets / WorldChannel::TickBudget; ++tick)
         Check(f.channel.Update(&phase) == WorldChannel::TickBudget, "bounded dequeue per tick");
@@ -533,7 +540,8 @@ void LostGuards()
         char const* label;
         void (*change)(Fixture&);
     };
-    // Lost between admission and the final check: the executor asks once, is denied and mutates nothing.
+    // LCB6b: lost between admission and the tick: the one check before the effect answers stale, the executor never
+    // runs, and the command id is spent.
     Case const denied[] = {
         {"lost authority", [](Fixture& f) { f.guard.authority = false; }},
         {"changed group", [](Fixture& f) { f.guard.groupGuid = 34; }},
@@ -550,30 +558,22 @@ void LostGuards()
     for (auto const& c : denied)
     {
         Fixture f;
-        f.probe.before = [&f, &c] { c.change(f); };
-        auto const receipt = f.Send(f.Attack("lost"));
-        Check(f.probe.calls == 1 && f.probe.denials == 1 && !f.probe.grants && !f.probe.mutations, c.label);
-        Check(f.Result(receipt, "lost") == "absent" && f.channel.Commands().refused == 1 &&
-                  f.channel.Commands().withheld == 1 && f.channel.Drained(),
+        auto const receipt = f.Receive(f.Attack("lost"));
+        c.change(f);
+        Check(f.channel.Update(&phase) == 1 && f.probe.calls == 0 && !f.probe.mutations, c.label);
+        Check(f.Result(receipt, "lost") == "stale" && !f.channel.Commands().proposed && f.channel.Drained(),
               "lost authority publishes no receipt");
     }
     Fixture retry;
-    retry.probe.before = [&retry] { retry.guard.authority = false; };
-    retry.Result(retry.Send(retry.Attack("lost")), "lost");
-    retry.probe.before = nullptr;
+    auto const lost = retry.Receive(retry.Attack("lost"));
+    retry.guard.authority = false;
+    retry.channel.Update(&phase);
+    Check(retry.Result(lost, "lost") == "stale", "lost authority before the tick");
     retry.guard.authority = true;
-    retry.Advance(CommandRate::IntervalMs);
-    Check(retry.Result(retry.Send(retry.Attack("lost")), "lost") == "duplicate" && retry.probe.calls == 1,
+    Check(retry.Result(retry.Send(retry.Attack("lost")), "lost") == "duplicate" && retry.probe.calls == 0,
           "authority regained never replays the refused id");
-
-    Fixture s;
-    auto const id = s.Receive(s.Attack("revised"));
-    auto revised = s.ticket.scope;
-    revised.contextRevision = "c2";
-    Check(s.world.ObserveScope(revised, s.now), "trusted revision");
-    Check(s.channel.Update(&phase) == 1 && s.probe.calls == 0 && s.channel.Drained() &&
-              s.Result(id, "revised") == "absent",
-          "a revision before the tick drops the command before admission");
+    Check(retry.Result(retry.Send(retry.Attack("again")), "again") == "applied" && retry.probe.calls == 1,
+          "a stale command spends no rate interval");
 }
 
 void RateAndClock()
@@ -604,14 +604,16 @@ void RateAndClock()
           Edge{-2000, 0, false, "wall rollback cannot extend a steady expiry"},
           Edge{0, -2000, false, "steady rollback cannot extend a wall expiry"}})
     {
-        Fixture d({.lifetimeMs = 3000});
-        d.probe.before = [&d, &e]
-        { d.now = {d.ticket.request.deadline.unixMs + e.wall, d.ticket.request.deadline.steadyMs + e.steady}; };
+        // LCB6b: the one authorization checks the packet's deadline, which is also the conversation's liveness here.
+        Fixture d;
+        Clock const start = d.now;
+        d.probe.before = [&d, &e, start]
+        { d.now = {start.unixMs + WorldLivenessMs + e.wall, start.steadyMs + WorldLivenessMs + e.steady}; };
         auto const receipt = d.Send(d.Attack("edge"));
         Check(
             d.probe.calls == 1 && d.probe.grants == (e.granted ? 1u : 0u) && d.probe.mutations == (e.granted ? 1u : 0u),
             e.label);
-        Check(d.Result(receipt, "edge") == (e.granted ? "applied" : "absent") && d.channel.Drained(), e.label);
+        Check(d.Result(receipt, "edge") == (e.granted ? "applied" : "stale") && d.channel.Drained(), e.label);
     }
 }
 
@@ -645,16 +647,16 @@ void PostEffectJoin()
     };
     Case const withheld[] = {
         {"world epoch switch after the effect", [](Fixture& f) { f.world.Configured(true, f.settings, "epoch-2"); },
-         "absent", false},
-        {"channel retired inside the executor", [](Fixture& f) { f.channel.Retire(); }, "inactive", false},
-        {"parent route closed inside the executor", [](Fixture& f) { f.channel.Close(f.ticket); }, "absent", true},
+         "stale", false},
+        {"channel retired inside the executor", [](Fixture& f) { f.channel.Retire(); }, "closed", false},
+        {"parent route closed inside the executor", [](Fixture& f) { f.channel.Close(f.ticket); }, "closed", true},
         {"receipt deadline passed during the effect",
          [](Fixture& f)
          {
              f.now.unixMs += WorldLivenessMs;
              f.now.steadyMs += WorldLivenessMs;
          },
-         "absent", true},
+         "stale", true},
     };
     for (auto const& c : withheld)
     {
@@ -725,10 +727,14 @@ void ActedRoutes()
              f.Send(f.Attack("a"));
          },
          false},
-        {"authorization denied",
+        {"authorization denied (the packet's deadline passed)",
          [](Fixture& f)
          {
-             f.probe.before = [&f] { f.guard.perceptible = false; };
+             f.probe.before = [&f]
+             {
+                 f.now.unixMs += WorldLivenessMs;
+                 f.now.steadyMs += WorldLivenessMs;
+             };
              f.Send(f.Attack("a"));
          },
          false},
@@ -756,11 +762,11 @@ void TransportLoss()
 {
     // Outcome decided, then the receipt is lost in transport: nothing re-executes.
     Fixture f;
-    auto const lost = f.Send(f.Attack("lost-receipt"));
+    auto lost = f.Send(f.Attack("lost-receipt"));
+    Check(f.channel.Used() == 1, "an answered receipt holds its slot while its waiter holds it");
+    lost.reset();
+    Check(f.channel.Drained(), "a receipt whose waiter gave up is disposed with its answer, never resent");
     f.Advance(WorldLivenessMs);
-    std::unique_ptr<ChannelPacket> packet;
-    Check(f.channel.Take(lost, packet) == ChannelError::Stale && !packet && f.channel.Drained(),
-          "an expired receipt is disposed, never resent");
     Check(f.Result(f.Send(f.Attack("lost-receipt")), "lost-receipt") == "duplicate" && f.probe.calls == 1,
           "a producer retry after receipt loss is a duplicate");
     f.Advance(CommandRate::IntervalMs);
@@ -768,17 +774,17 @@ void TransportLoss()
     Check(f.Result(f.Send(f.Mark("dropped-write")), "dropped-write") == "duplicate" && f.probe.calls == 2,
           "a taken receipt lost by the writer is not replayed");
 
-    // Lost before admission: the id was never consumed, so it runs exactly once later.
+    // LCB6b: lost at the tick: the ledger spent the id, the check before the effect answers stale and nothing ran.
     Fixture p;
     p.visible = false;
     auto const unseen = p.Receive(p.Attack("unseen"));
-    Check(p.channel.Update(&phase) == 1 && p.probe.calls == 0 && p.Result(unseen, "unseen") == "absent" &&
+    Check(p.channel.Update(&phase) == 1 && p.probe.calls == 0 && p.Result(unseen, "unseen") == "stale" &&
               !p.channel.Commands().proposed,
-          "lost perception at the tick drops before admission");
+          "lost perception at the tick answers stale before the effect");
     p.visible = true;
-    Check(p.Result(p.Send(p.Attack("unseen")), "unseen") == "applied" && p.probe.calls == 1,
-          "a never-admitted id runs once later");
-    Check(p.Result(p.Send(p.Attack("unseen")), "unseen") == "duplicate" && p.probe.calls == 1, "and only once");
+    Check(p.Result(p.Send(p.Attack("unseen")), "unseen") == "duplicate" && p.probe.calls == 0,
+          "a stale command's id never runs later");
+    Check(p.Result(p.Send(p.Attack("seen")), "seen") == "applied" && p.probe.calls == 1, "a fresh id runs once");
 }
 }  // namespace
 

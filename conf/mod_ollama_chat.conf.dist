@@ -52,23 +52,9 @@ OllamaChat.Bridge.Instance =
 OllamaChat.Bridge.Endpoint =
 OllamaChat.Bridge.Token =
 
-# OllamaChat.Bridge.ChannelEnabled
-#     Description: Opt in to the provider-neutral reverse mailbox for a selected game bridge epoch.
-#                  I/O adapters authenticate every receive/result operation with Bridge.Token; they
-#                  must bound loopback sockets/bytes and retain returned packets through actual writes.
-#                  Up to 64 physical packets and 8 world-thread dequeues per tick. Reload revokes old
-#                  work immediately; a replacement epoch waits for actual payload disposal and drain.
-#                  The shared runtime installs filtered queries and current-mark event production.
-#                  While on, the module listens on 127.0.0.1:ChannelPort for the bridge (J5d, below);
-#                  typed commands are answered by the world thread (J6).
-#                  Live delivery awaits J9C/X proof.
-#                  No raw commands, inference fallback, or model text execution is permitted.
-#     Default:     0 (existing generation behavior; reverse mailbox unavailable)
-OllamaChat.Bridge.ChannelEnabled = 0
-
 # OllamaChat.Bridge.ChannelPort
-#     Description: TCP port of the bridge channel listener (J5d). While ChannelEnabled is on and the
-#                  Bridge settings above are valid, the module listens on literal 127.0.0.1 only (never
+#     Description: TCP port of the bridge channel listener (J5d). While the Bridge settings above are
+#                  valid, the module listens on literal 127.0.0.1 only (never
 #                  another address). The local bridge posts one query or command envelope to
 #                  POST /v1/channel/{route} with "Authorization: Bearer <Bridge.Token>" and gets the
 #                  world thread's filtered result in the reply (wire: hub bridge/game/README.md).

@@ -218,11 +218,10 @@ void LoadOllamaChatConfig()
     // buffers under a worker mid-request.
     OllamaConfig_Publish();
     // Explicit world-thread load/reload notification also retires work when the module is disabled.
-    bool const channelEnabled = sConfigMgr->GetOption<bool>("OllamaChat.Bridge.ChannelEnabled", false);
-    OllamaDispatch_BridgeConfigured(channelEnabled);
+    OllamaDispatch_BridgeConfigured();
     // J5d: the mailbox's 127.0.0.1 transport; a reload restarts it only when the port or the token changed.
-    OllamaDispatch_BridgeListen(channelEnabled, sConfigMgr->GetOption<uint32_t>("OllamaChat.Bridge.ChannelPort",
-                                                                                OllamaBridge::DefaultListenerPort));
+    OllamaDispatch_BridgeListen(
+        sConfigMgr->GetOption<uint32_t>("OllamaChat.Bridge.ChannelPort", OllamaBridge::DefaultListenerPort));
     if (g_Enable && !OllamaBridge::BridgeUsable(g_Enable, g_OllamaBridgeSettings))
         LOG_INFO("module.ollamachat",
                  "[Ollama Chat] Enabled without valid bridge settings (OllamaChat.Bridge.Instance, "

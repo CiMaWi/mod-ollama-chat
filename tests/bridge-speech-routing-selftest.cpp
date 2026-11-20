@@ -221,7 +221,6 @@ OllamaBridge::QueryWorldSource& OllamaChat_BridgeQuerySource()
 {
     struct Blind final : OllamaBridge::QueryWorldSource
     {
-        bool Observe(OllamaBridge::WorldTicket const&, OllamaBridge::DispatchGuard&) override { return false; }
         bool GroupMembers(OllamaBridge::WorldTicket const&, uint64_t, std::vector<uint64_t>&) override { return false; }
         bool ResolveVisible(OllamaBridge::WorldTicket const&, uint64_t, OllamaBridge::VisibleUnit&) override
         {
@@ -366,11 +365,17 @@ void Reset()
     Check(OllamaBridge::DispatchSlot::Used() == 0, "all physical slots disposed");
     config = {};
     config.bridge = {"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-bearer-only"};
-    g_bridgeWorld.Configured(true, config.bridge, "epoch-1");
+    // LCB6b: the channel runs whenever the bridge does, so the fixture opens it as OllamaDispatch_BridgeConfigured
+    // does. ChannelPolicy never rebinds its previous epoch, so every fixture selects its own.
+    static unsigned fixtures = 0;
+    std::string const epoch = "epoch-r" + std::to_string(++fixtures);
+    g_bridgeWorld.Configured(true, config.bridge, epoch);
     Check(g_bridgeWorld.ObserveDrain(true), "selected");
+    g_bridgeChannel.Configure(true);
+    Check(g_bridgeChannel.Activate(), "channel open");
     g_bridgeGeneration = g_bridgeWorld.Generation();
     gameGuard = {};
-    gameGuard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "party", "visible", "c1", "m1"};
+    gameGuard.scope = {1, "fixture", "codex", epoch, 11, 22, "conversation", "party", "visible", "c1", "m1"};
     gameGuard.source = OllamaBridge::DispatchSource::Party;
     gameGuard.speakerGuid = 33;
     gameGuard.groupGuid = 99;

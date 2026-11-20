@@ -2,11 +2,15 @@
 #define MOD_OLLAMA_CHAT_BRIDGE_WORLD_H
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "mod-ollama-chat_bridge.h"
 #include "mod-ollama-chat_bridge_channel.h"
@@ -15,11 +19,9 @@
 
 namespace OllamaBridge
 {
-constexpr std::size_t MaxWorldPending = 64;
-constexpr std::size_t MaxWorldScopes = 64;
+// LC.38: the world's tables (scopes, tickets, bindings, rate, watches) hold one entry per bot in talk and have no
+// fixed count; their size is bounded by the bots in talk and each ticket's lifetime.
 constexpr int64_t WorldLivenessMs = 5000;
-static_assert(CommandRate::MaxBots == MaxWorldScopes, "one rate entry per live world scope");
-static_assert(MaxWatches == MaxWorldScopes, "one watch per live world scope");
 
 struct WorldTicket
 {
@@ -99,7 +101,8 @@ enum class TerminalAction : uint8_t
 TerminalAction DispatchTerminal(WorldOutcome outcome, bool addressedHuman);
 char const* DispatchOutageText();
 
-// One physical slot for the entire owned task/completion lifetime, independent of logical reservations.
+// One physical slot for the entire owned task/completion lifetime, independent of logical reservations. LC.38: counted
+// for the drain proof only, with no fixed count; the generation queue's depth bounds the work.
 // Move-only value: no game pointer, reference, callback or allocator crosses the worker boundary.
 class DispatchSlot
 {
@@ -127,7 +130,6 @@ class WorldPolicy
 {
 public:
     WorldPolicy() = default;
-    std::vector<WorldScope> Scopes(Clock now) const;
     void Configured(bool enabled, Settings settings, std::string epoch);
     void Shutdown();
     // Generation intents and effects are synchronous and nothing outlives them (LC.36), so a drained retirement is
@@ -140,7 +142,10 @@ public:
     WorldTicket Reserve(WorldScope const& scope, Context input, Clock now, int64_t lifetimeMs);
     bool MarkQueued(WorldTicket const& ticket, Clock now);
     bool Complete(WorldTicket const& ticket, WorldOutcome outcome, Clock now);
+    // LCB6b: the one answer to "is this conversation current"; the channel asks it once before a packet's read or
+    // effect and once after its executor. Checks() counts the calls (a selftest proves one per query packet).
     bool Current(WorldTicket const& ticket, Clock now) const;
+    uint64_t Checks() const { return _checks; }
     // A current reservation of exactly this scope is still in flight (reserved, queued or completed, not delivered).
     bool PendingFor(WorldScope const& scope, Clock now) const;
     // Claims once; retains current scope/deadline validation until the world caller calls Cancel on every exit.
@@ -179,14 +184,17 @@ private:
 
     uint64_t _generation = 0;
     uint64_t _sequence = 0;  // Never reset, including reload, rejection, cancellation and queue-full.
+    mutable uint64_t _checks = 0;
     bool _enabled = false;
     bool _retiring = false;
     Settings _settings;
     Identity _desired;
     Identity _selected;
-    std::vector<ScopeEntry> _scopes;
+    std::unordered_multimap<uint64_t, ScopeEntry> _scopes;  // Keyed by bot: one entry per conversation it is in.
     std::unordered_map<std::string, PendingEntry> _pending;
 };
+class ChannelAnswer;
+
 // An owned response keeps its physical slot until its body has actually been destroyed.
 // Native adapters may hold this value during asynchronous writes, but must not copy its body into untracked work.
 class ChannelPacket
@@ -200,18 +208,36 @@ class ChannelPacket
     };
     std::unique_ptr<Lease> _lease;  // Declared first: destroyed AFTER every owned payload below.
     std::string _route;
-    uint64_t _serial = 0;
     Deadline _until;
+    std::weak_ptr<ChannelAnswer> _answer;  // Weak: a wait that gave up drops the packet with its answer.
 
 public:
-    uint64_t receipt = 0;
     ChannelError error = ChannelError::None;
     std::string body;
 };
 
-// Provider-neutral reverse channel. Receive/Take are I/O-thread safe; all other methods are world-only.
+// LCB6b: one packet's answer. The listener thread that posted the packet waits on it, with no poll; the world thread
+// sets it once, with the result or the word the packet was discarded with (closed, stale, inactive, ...).
+class ChannelAnswer
+{
+public:
+    // The first call wins; a later one drops its packet. A null packet is the listener's own stop (inactive).
+    void Set(std::unique_ptr<ChannelPacket> packet);
+    // Waits until the answer is set or until; true when it is set (packet null: the listener stopped).
+    bool Wait(std::chrono::steady_clock::time_point until, std::unique_ptr<ChannelPacket>& packet);
+
+private:
+    std::mutex _mutex;
+    std::condition_variable _ready;
+    bool _set = false;
+    std::unique_ptr<ChannelPacket> _packet;
+};
+
+// Provider-neutral reverse channel. Receive is I/O-thread safe; all other methods are world-only.
 // There is no HTTP, waiting, worker callback or game pointer in these mailboxes. Native adapters bound sockets
-// and bytes before Receive; their async write owns the returned packet until disposal, including cancellation.
+// and bytes before Receive; their async write owns the answered packet until disposal, including cancellation.
+// LCB6b: every packet Receive takes is answered through its ChannelAnswer, and only WorldPolicy says whether its
+// conversation is current.
 class QueryWorldSource;
 
 class WorldChannel
@@ -229,7 +255,7 @@ public:
     bool Register(WorldTicket const& ticket, DispatchGuard const& guard);
     // Returns whether the closed route made an authorized effect attempt (Applied or Failed): the DS.14 rule for a
     // silent answer. Nothing else reads the flag, and a second Close reports false. The route leaves the replay
-    // ledger with its query and command ids (LC.35).
+    // ledger with its query and command ids (LC.35); its queued packets are answered closed (LCB6b).
     bool Close(WorldTicket const& ticket);
     // World tick. Typed effects run only with the post-map-join phase, which is used during this call only;
     // without a phase every command gets the fixed refusal.
@@ -240,9 +266,9 @@ public:
     // J6e-c: the bots' watches, armed through Update and scanned by the post-map-join dispatcher; world only.
     WatchTable& Watches() { return _watches; }
     WatchTable const& Watches() const { return _watches; }
-    // Unbound, both answer Inactive; the listener checked the bearer before it calls them (LCB6a).
-    ChannelError Receive(std::string_view route, std::string_view body, uint64_t& receipt);
-    ChannelError Take(uint64_t receipt, std::unique_ptr<ChannelPacket>& packet);
+    // Unbound, it answers Inactive; the listener checked the bearer before it calls it (LCB6a). A route with no open
+    // generation is answered Closed at once, a full mailbox Capacity (overload). None: the world answers later.
+    ChannelError Receive(std::string_view route, std::string_view body, std::shared_ptr<ChannelAnswer> const& answer);
 
 private:
     struct Binding
@@ -251,7 +277,15 @@ private:
         DispatchGuard guard;
         bool acted = false;  // An authorized effect attempt on this route, its receipt published or not (DS.14).
     };
-    bool Fresh(Binding const& binding, Clock now) const;
+    // LCB6b: the one check before a read or an effect: the adapter's fresh capture, then WorldPolicy.
+    bool Live(Binding const& binding) const;
+    // The packet's answer word; its result body in packet.body.
+    ChannelError Handle(ChannelPacket& packet, EffectPhase const* phase);
+    ChannelError Read(Binding const& binding, ChannelEnvelope const& envelope, ChannelQuery const& query,
+                      std::string& body);
+    // Forgets an open route under the mutex and answers its queued packets with error.
+    void Forget(std::string const& route, ChannelError error);
+    static void Answer(std::unique_ptr<ChannelPacket> packet, ChannelError error);
     // Finishes one admitted command exactly once; attempted reports an authorized effect attempt.
     ChannelError Command(Binding const& binding, ChannelEnvelope const& envelope, ChannelCommand const& command,
                          EffectPhase const* phase, Deadline until, bool& attempted, std::string& body);
@@ -262,7 +296,8 @@ private:
                         WorldScope const& scope, Clock now, std::string& body,
                         CommandRefusal refusal = CommandRefusal::None, std::span<ChannelStep const> steps = {},
                         std::span<ChannelStepResult const> ran = {});
-    bool ReceiptCurrent(WorldTicket const& ticket, Clock now) const;
+    // LCB6b: the one check after the executor.
+    bool ReceiptCurrent(WorldTicket const& ticket) const;
     WorldPolicy& _world;
     QueryWorldSource* const _source;   // WORLD ONLY; never copied into a packet or worker task.
     CommandExecutor* const _executor;  // WORLD ONLY; invoked synchronously from Update with a world phase.
@@ -278,10 +313,8 @@ private:
     std::shared_ptr<std::atomic<std::size_t>> _used = std::make_shared<std::atomic<std::size_t>>(0);
     mutable std::mutex _mutex;
     bool _bound = false;  // Bound to the selected epoch; guarded by _mutex.
-    uint64_t _serial = 0;
-    uint64_t _sequence = 0;
+    std::unordered_set<std::string> _open;  // The bound routes, for Receive's closed answer; guarded by _mutex.
     std::deque<std::unique_ptr<ChannelPacket>> _receive;
-    std::unordered_map<uint64_t, std::unique_ptr<ChannelPacket>> _done;
 };
 }  // namespace OllamaBridge
 

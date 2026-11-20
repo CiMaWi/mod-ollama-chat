@@ -16,15 +16,6 @@ namespace OllamaBridge
 namespace
 {
 using Json = nlohmann::json;
-constexpr int64_t ScopeLifetimeMs = 5000;
-
-bool SameScope(WorldScope const& a, WorldScope const& b)
-{
-    return std::tie(a.version, a.instance, a.provider, a.epoch, a.botGuid, a.controllerGuid, a.contextId, a.channel,
-                    a.perceptionScope, a.contextRevision, a.membershipRevision) ==
-           std::tie(b.version, b.instance, b.provider, b.epoch, b.botGuid, b.controllerGuid, b.contextId, b.channel,
-                    b.perceptionScope, b.contextRevision, b.membershipRevision);
-}
 
 bool ValidDeadline(Deadline deadline, Clock now)
 {
@@ -505,7 +496,7 @@ char const* ChannelErrorName(ChannelError error)
         case ChannelError::Duplicate:
             return "duplicate";
         case ChannelError::Capacity:
-            return "capacity";
+            return "overload";  // LC.38: a bound left for a real resource; the bridge reads the status (429).
         case ChannelError::Closed:
             return "closed";
         case ChannelError::Unknown:
@@ -514,11 +505,8 @@ char const* ChannelErrorName(ChannelError error)
     return "invalid_input";
 }
 
-ChannelPolicy::ChannelPolicy(std::size_t maxRouteIds, std::size_t maxPending)
-    : _validLimits(maxRouteIds > 0 && maxRouteIds <= ChannelMaxRouteIds && maxPending > 0 &&
-                   maxPending <= ChannelMaxPending),
-      _maxRouteIds(maxRouteIds),
-      _maxPending(maxPending)
+ChannelPolicy::ChannelPolicy(std::size_t maxRouteIds)
+    : _validLimits(maxRouteIds > 0 && maxRouteIds <= ChannelMaxRouteIds), _maxRouteIds(maxRouteIds)
 {
 }
 
@@ -526,7 +514,6 @@ void ChannelPolicy::Retire()
 {
     _identity = {};
     _observed = {};
-    _scopes.clear();
     _requests.clear();
     _commands.clear();
 }
@@ -542,15 +529,6 @@ bool ChannelPolicy::Bind(Identity identity)
     return true;
 }
 
-void ChannelPolicy::RemoveScope(uint64_t botGuid, std::string const& contextId)
-{
-    std::erase_if(_scopes, [&](ScopeEntry const& entry)
-                  { return entry.scope.botGuid == botGuid && entry.scope.contextId == contextId; });
-    for (auto& [id, entry] : _requests)
-        if (entry.scope.botGuid == botGuid && entry.scope.contextId == contextId)
-            entry.invalid = true;
-}
-
 void ChannelPolicy::Expire(Clock now)
 {
     _observed = {std::max(_observed.unixMs, now.unixMs), std::max(_observed.steadyMs, now.steadyMs)};
@@ -564,11 +542,8 @@ void ChannelPolicy::Expire(Clock now)
             if (entry.work == ChannelWork::Generation)
                 expired.push_back(id);
         }
-        else if (!ScopeCurrent(entry.scope, now))
-            entry.invalid = true;
     for (auto const& route : expired)
         Drop(route);
-    std::erase_if(_scopes, [&](ScopeEntry const& entry) { return !Alive(entry.until, now); });
 }
 
 void ChannelPolicy::Drop(std::string const& route)
@@ -583,52 +558,6 @@ void ChannelPolicy::Drop(std::string const& route)
     _requests.erase(found);
 }
 
-bool ChannelPolicy::ObserveScope(WorldScope scope, Clock now)
-{
-    _observed = {std::max(_observed.unixMs, now.unixMs), std::max(_observed.steadyMs, now.steadyMs)};
-    // Heartbeats run on the world tick. Scan only the bounded scopes, not every retained replay reservation.
-    // A genuine observation gap still permanently invalidates work before a matching scope can be refreshed.
-    for (std::size_t i = 0; i < _scopes.size();)
-        if (!Alive(_scopes[i].until, now) || !Alive(_scopes[i].until, _observed))
-        {
-            auto const expired = _scopes[i].scope;
-            RemoveScope(expired.botGuid, expired.contextId);
-        }
-        else
-            ++i;
-    if (_identity.epoch.empty() || scope.version != 1 || scope.instance != _identity.instance ||
-        scope.provider != _identity.provider || scope.epoch != _identity.epoch || !scope.botGuid ||
-        !scope.controllerGuid || !ValidIdentifier(scope.contextId) || !ValidIdentifier(scope.perceptionScope) ||
-        !ValidIdentifier(scope.contextRevision) || !ValidIdentifier(scope.membershipRevision) ||
-        (scope.channel != "direct" && scope.channel != "party") || now.unixMs < 0 ||
-        now.unixMs > MaxSafeInteger - ScopeLifetimeMs || now.steadyMs < 0 ||
-        now.steadyMs > std::numeric_limits<int64_t>::max() - ScopeLifetimeMs)
-        return false;
-    auto found =
-        std::find_if(_scopes.begin(), _scopes.end(), [&](ScopeEntry const& entry)
-                     { return entry.scope.botGuid == scope.botGuid && entry.scope.contextId == scope.contextId; });
-    Deadline const until{now.unixMs + ScopeLifetimeMs, now.steadyMs + ScopeLifetimeMs};
-    if (found != _scopes.end() && SameScope(found->scope, scope))
-    {
-        found->until = until;
-        return true;
-    }
-    if (found != _scopes.end())
-        RemoveScope(scope.botGuid, scope.contextId);
-    if (_scopes.size() >= ChannelMaxScopes)
-        return false;
-    _scopes.push_back({std::move(scope), until});
-    return true;
-}
-
-bool ChannelPolicy::ScopeCurrent(WorldScope const& scope, Clock now) const
-{
-    return !_identity.epoch.empty() &&
-           std::any_of(
-               _scopes.begin(), _scopes.end(), [&](ScopeEntry const& entry)
-               { return SameScope(entry.scope, scope) && Alive(entry.until, now) && Alive(entry.until, _observed); });
-}
-
 std::size_t ChannelPolicy::Pending() const
 {
     return std::count_if(
@@ -640,7 +569,9 @@ ChannelError ChannelPolicy::Open(WorldScope const& scope, std::string requestId,
                                  Clock now, std::string const& route)
 {
     Expire(now);
-    if (!ScopeCurrent(scope, now))
+    // The scope is the trusted ticket's; whether it is still current is WorldPolicy's question (LCB6b).
+    if (_identity.epoch.empty() || scope.instance != _identity.instance || scope.provider != _identity.provider ||
+        scope.epoch != _identity.epoch || !scope.botGuid || !scope.controllerGuid)
         return ChannelError::Stale;
     if (!ValidIdentifier(requestId) || !ValidDeadline(deadline, now))
         return ChannelError::Invalid;
@@ -656,7 +587,7 @@ ChannelError ChannelPolicy::Open(WorldScope const& scope, std::string requestId,
     }
     if (!Alive(deadline, _observed))
         return ChannelError::Stale;
-    if (Pending() >= _maxPending || (parent && parent->queries.size() + parent->commands.size() >= _maxRouteIds))
+    if (parent && parent->queries.size() + parent->commands.size() >= _maxRouteIds)
         return ChannelError::Capacity;
     ChannelEnvelope envelope{_identity.instance, _identity.provider, _identity.epoch, requestId, deadline.unixMs};
     if (parent)
@@ -680,8 +611,9 @@ bool ChannelPolicy::Current(ChannelEnvelope const& envelope, WorldScope const& c
     auto const& entry = found->second;
     return !entry.invalid && (!requireOpen || !entry.terminal) && envelope.instance == _identity.instance &&
            envelope.provider == _identity.provider && envelope.epoch == _identity.epoch &&
-           envelope.deadlineUnixMs == entry.envelope.deadlineUnixMs && SameScope(entry.scope, current) &&
-           ScopeCurrent(current, now) && Alive(entry.until, now) && Alive(entry.until, _observed);
+           envelope.deadlineUnixMs == entry.envelope.deadlineUnixMs && entry.scope.botGuid == current.botGuid &&
+           entry.scope.controllerGuid == current.controllerGuid && entry.scope.contextId == current.contextId &&
+           Alive(entry.until, now) && Alive(entry.until, _observed);
 }
 
 ChannelError ChannelPolicy::Receive(std::string const& body, WorldScope const& current, Clock now,

@@ -125,18 +125,17 @@ void OllamaDispatch_Stop();
 
 // Explicit world-thread lifecycle notifications. Never called by native/CLI selection or queued callbacks.
 // Every publication retires old Bridge work, including bearer-only reloads. Legacy queues are untouched.
-void OllamaDispatch_BridgeConfigured(bool channelEnabled = false);
-// J5d, world thread on every config load: starts, keeps or stops the 127.0.0.1 channel listener. It runs only while
-// the channel is enabled for valid selected Bridge settings, and restarts only when the port or the token changed.
-void OllamaDispatch_BridgeListen(bool channelEnabled, uint32_t port);
+void OllamaDispatch_BridgeConfigured();
+// J5d, world thread on every config load: starts, keeps or stops the 127.0.0.1 channel listener. It runs whenever the
+// Bridge settings are valid (LCB6b: no ChannelEnabled), and restarts only when the port or the token changed.
+void OllamaDispatch_BridgeListen(uint32_t port);
 OllamaBridge::WorldPolicy& OllamaDispatch_BridgeWorld();
 
-// Shared native-adapter boundary; the listener checked the local game-link bearer before it calls these (LCB6a).
-// route is an existing game-issued generation request id, never a wire-authored world scope.
+// Shared native-adapter boundary; the listener checked the local game-link bearer before it calls this (LCB6a).
+// route is an existing game-issued generation request id, never a wire-authored world scope. None: the world thread
+// answers the packet through answer (LCB6b).
 OllamaBridge::ChannelError OllamaDispatch_ChannelReceive(std::string_view route, std::string_view body,
-                                                         uint64_t& receipt);
-OllamaBridge::ChannelError OllamaDispatch_ChannelTake(uint64_t receipt,
-                                                      std::unique_ptr<OllamaBridge::ChannelPacket>& packet);
+                                                         std::shared_ptr<OllamaBridge::ChannelAnswer> const& answer);
 
 struct OllamaDispatchStats
 {

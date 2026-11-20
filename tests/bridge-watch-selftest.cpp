@@ -135,20 +135,17 @@ void Admission()
     Check(table.Clear(1) && !table.Find(1) && !table.Clear(1) && table.Counters() == counters,
           "admit: none clears the bot's watch without counting");
 
-    WatchTable full;
-    for (uint64_t bot = 1; bot <= MaxWatches; ++bot)
+    // LC.38: one watch per bot and no fixed count: 200 bots arm, and a second arm replaces the bot's watch.
+    WatchTable many;
+    for (uint64_t bot = 1; bot <= 200; ++bot)
         Check(
-            full.Arm(Make(bot, WatchCondition::Time), line, idle, start.unixMs + 60000, start) == CommandRefusal::None,
-            "full: fill the table");
-    Check(full.Size() == MaxWatches &&
-              full.Arm(Make(MaxWatches + 1, WatchCondition::Time), line, idle, start.unixMs + 60000, start) ==
-                  CommandRefusal::CannotNow &&
-              full.Size() == MaxWatches,
-          "full: a full table refuses a new bot");
-    Check(full.Arm(Make(MaxWatches, WatchCondition::CombatEnd), line, fighting, start.unixMs + 60000, start) ==
+            many.Arm(Make(bot, WatchCondition::Time), line, idle, start.unixMs + 60000, start) == CommandRefusal::None,
+            "many: 200 bots arm");
+    Check(many.Size() == 200, "many: one watch per bot, no fixed count");
+    Check(many.Arm(Make(200, WatchCondition::CombatEnd), line, fighting, start.unixMs + 60000, start) ==
                   CommandRefusal::None &&
-              full.Size() == MaxWatches && full.Find(MaxWatches)->condition == WatchCondition::CombatEnd,
-          "full: a full table still replaces a bot's watch");
+              many.Size() == 200 && many.Find(200)->condition == WatchCondition::CombatEnd,
+          "many: a second arm replaces the bot's watch");
 }
 
 void Firing()

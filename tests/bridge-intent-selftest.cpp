@@ -42,7 +42,6 @@ struct Fixture
     Fixture()
     {
         Check(policy.Bind({scope.instance, scope.provider, "", scope.epoch}), "bind game epoch");
-        Check(policy.ObserveScope(scope, Now), "register scope");
         Check(policy.OpenGeneration(scope, "work", Until, Now) == ChannelError::None, "open generation");
     }
 
@@ -296,7 +295,11 @@ void StagedCommandCurrentness()
           "steady equality invalidates staged order during wall clock rollback");
     auto changed = fixture.scope;
     changed.membershipRevision = "members-2";
-    Check(!fixture.policy.Current(envelope, changed, Now), "changed group revision invalidates staged order");
+    // LCB6b: the ledger compares bot, controller and context only. A group revision is WorldPolicy's to refuse, in
+    // the one check before the effect (bridge-world-selftest "group revision revokes old reservation").
+    Check(fixture.policy.Current(envelope, changed, Now), "a group revision is not the ledger's to refuse");
+    changed.contextId = "context-2";
+    Check(!fixture.policy.Current(envelope, changed, Now), "a changed context invalidates staged order");
     std::string body;
     Check(fixture.policy.FinishCommand(envelope, command.commandId, ChannelOutcome::Rejected, fixture.scope, Now,
                                        body) == ChannelError::None,

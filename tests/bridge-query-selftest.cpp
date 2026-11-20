@@ -1,6 +1,7 @@
 // Exact production filtered adapter with controlled current world objects, policy and physical mailboxes.
 // This proves the helper contract, not the future Player/Group glue or live/native integration.
 #include <array>
+#include <chrono>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -55,7 +56,7 @@ struct Source : QueryWorldSource
     bool authority = true;
     std::function<void()> afterResolve;
     unsigned resolves = 0;
-    bool Observe(WorldTicket const&, DispatchGuard& current) override
+    bool Observe(WorldTicket const&, DispatchGuard& current)
     {
         current = guard;
         return authority;
@@ -120,7 +121,7 @@ struct Fixture
     Settings settings{"fixture", "codex", "http://127.0.0.1:47800", "synthetic-local-channel-token"};
     WorldPolicy world;
     Source source;
-    FilteredQueryAdapter adapter{world, source, [this] { return now; }};
+    FilteredQueryAdapter adapter{source};
     WorldChannel channel{world, [this](WorldTicket const& ticket, DispatchGuard& guard)
                          { return source.Observe(ticket, guard); }, [this] { return now; }};
     WorldTicket ticket;
@@ -161,11 +162,18 @@ struct Fixture
         source.objects[44].visible = false;
         source.objects.erase(55);  // Offline/missing group member.
     }
-    QueryObservation Capture()
+    std::vector<Participant> Capture()
     {
-        QueryObservation out;
-        Check(adapter.CaptureQuery(ticket, source.guard, out), "capture filtered production query");
+        std::vector<Participant> out;
+        Check(adapter.Units(ticket, source.guard, out), "capture filtered production query");
         return out;
+    }
+    std::string GroupQuery(std::string const& id) const
+    {
+        return Json{{"version", 1},    {"instance", "fixture"},      {"provider", "codex"}, {"epoch", "epoch-1"},
+                    {"requestId", id}, {"deadlineUnixMs", 104000},   {"type", "query"},     {"controllerGuid", "22"},
+                    {"botGuid", "11"}, {"query", "observable_group"}}
+            .dump();
     }
 };
 
@@ -173,14 +181,13 @@ void QueryEncoding()
 {
     Fixture f;
     auto observed = f.Capture();
-    Check(observed.units.size() == 2 && observed.units[0].guid == 11 && observed.units[1].guid == 22,
+    Check(observed.size() == 2 && observed[0].guid == 11 && observed[1].guid == 22,
           "only current visible group members survive");
     f.source.objects[22].health = -1;
     observed = f.Capture();
-    Check(observed.units[0].role.empty() && !observed.units[0].visibleTargetGuid,
-          "no AI role or selected-target provenance leak");
+    Check(observed[0].role.empty() && !observed[0].visibleTargetGuid, "no AI role or selected-target provenance leak");
     ChannelPolicy policy;
-    Check(policy.Bind(f.world.Selected()) && policy.ObserveScope(f.ticket.scope, f.now) &&
+    Check(policy.Bind(f.world.Selected()) &&
               policy.OpenGeneration(f.ticket.scope, f.ticket.request.requestId, f.ticket.request.deadline, f.now) ==
                   ChannelError::None,
           "real query serializer policy binding");
@@ -192,8 +199,7 @@ void QueryEncoding()
     Check(policy.Receive(wire.dump(), f.ticket.scope, f.now, query, f.ticket.request.requestId) == ChannelError::None,
           "independent query id against registered scope");
     std::string body;
-    Check(f.adapter.Current(observed) &&
-              policy.FinishQuery(query.envelope, f.ticket.scope, observed.units, f.now, body) == ChannelError::None,
+    Check(policy.FinishQuery(query.envelope, f.ticket.scope, observed, f.now, body) == ChannelError::None,
           "filtered production values use actual query serializer");
     auto result = Json::parse(body);
     Check(result["type"] == "query.result" && result["units"].size() == 2, "typed query result");
@@ -206,10 +212,11 @@ void QueryEncoding()
 
 void Currentness()
 {
-    for (unsigned change = 0; change < 12; ++change)
+    // LCB6b: the read follows the channel's one check at once on the world thread, so the adapter has no currentness
+    // check of its own: a change before the read is what the read sees.
+    for (unsigned change = 0; change < 10; ++change)
     {
         Fixture f;
-        auto observed = f.Capture();
         auto& unit = f.source.objects[22];
         switch (change)
         {
@@ -241,73 +248,80 @@ void Currentness()
                 unit.name = "renamed";
                 break;
             case 9:
-                f.source.authority = false;
-                break;
-            case 10:
-                f.source.guard.audience = {11};
-                break;
-            case 11:
-                f.source.guard.scope.membershipRevision = "m2";
+                f.source.objects.erase(22);
                 break;
         }
-        Check(!f.adapter.Current(observed), "publication re-resolves changed world/provenance");
+        auto const units = f.Capture();
+        Check(change == 7   ? units.size() == 2 && units[1].healthPercent == 10
+              : change == 8 ? units.size() == 2 && units[1].name == "renamed"
+                            : units.size() == 1 && units[0].guid == 11,
+              "a change before the read is what the read sees");
     }
-    Fixture missing;
-    auto out = missing.Capture();
-    missing.source.objects.erase(22);
-    Check(!missing.adapter.Current(out), "publication rejects removed units");
-    Fixture expiry;
-    out = expiry.Capture();
-    expiry.now.steadyMs += 5000;
-    expiry.now.unixMs -= 1;
-    Check(!expiry.adapter.Current(out), "snapshot exact monotonic expiry survives wall rollback");
-    Fixture reload;
-    out = reload.Capture();
-    reload.world.Configured(true, reload.settings, "epoch-2");
-    Check(!reload.adapter.Current(out), "retirement/reconnect invalidates old snapshot");
-    Fixture cancelled;
-    out = cancelled.Capture();
-    cancelled.world.Cancel(cancelled.ticket);
-    Check(!cancelled.adapter.Current(out), "cancelled game ticket cannot publish");
-    Fixture during;
-    during.source.afterResolve = [&] { during.source.authority = false; };
-    out = missing.Capture();
-    Check(!during.adapter.CaptureQuery(during.ticket, during.source.guard, out) && out.units.empty() &&
-              !out.ticket.generation,
-          "mid-capture authority loss clears prior output");
+    // What the adapter no longer checks, the channel's one check before the read does: lost authority, a changed
+    // audience or scope revision, an expired packet and a cancelled ticket answer the queued query stale.
+    for (unsigned change = 0; change < 5; ++change)
+    {
+        Fixture f;
+        auto const answer = std::make_shared<ChannelAnswer>();
+        Check(f.channel.Receive(f.ticket.request.requestId, f.GroupQuery("q-" + std::to_string(change)), answer) ==
+                  ChannelError::None,
+              "queued query");
+        if (change == 0)
+            f.source.authority = false;
+        if (change == 1)
+            f.source.guard.audience = {11};
+        if (change == 2)
+            f.source.guard.scope.membershipRevision = "m2";
+        if (change == 3)
+        {
+            f.now.steadyMs += 5000;
+            f.now.unixMs -= 1;
+        }
+        if (change == 4)
+            f.world.Cancel(f.ticket);
+        std::unique_ptr<ChannelPacket> packet;
+        Check(f.channel.Update() == 1 && answer->Wait(std::chrono::steady_clock::now(), packet) && packet &&
+                  packet->error == ChannelError::Stale && packet->body.empty(),
+              "the channel's one check answers a lost conversation stale");
+    }
+    Fixture cleared;
+    auto out = cleared.Capture();
+    cleared.source.guard.groupGuid = 0;
+    Check(!cleared.adapter.Units(cleared.ticket, cleared.source.guard, out) && out.empty(),
+          "a refused read clears prior output");
     Fixture empty;
     for (auto& [guid, unit] : empty.source.objects)
     {
         (void)guid;
         unit.visible = false;
     }
-    Check(empty.Capture().units.empty(), "no visible units yields empty filtered result");
+    Check(empty.Capture().empty(), "no visible units yields empty filtered result");
 }
 
 void Bounds()
 {
     Fixture f;
-    QueryObservation query;
+    std::vector<Participant> query;
     f.source.members.push_back(11);
-    Check(!f.adapter.CaptureQuery(f.ticket, f.source.guard, query), "duplicate group roster rejected");
+    Check(!f.adapter.Units(f.ticket, f.source.guard, query), "duplicate group roster rejected");
     f.source.members = {0, 11};
-    Check(!f.adapter.CaptureQuery(f.ticket, f.source.guard, query), "zero roster identity rejected");
+    Check(!f.adapter.Units(f.ticket, f.source.guard, query), "zero roster identity rejected");
     f.source.members = {22};
-    Check(!f.adapter.CaptureQuery(f.ticket, f.source.guard, query), "bot must actually belong to group");
+    Check(!f.adapter.Units(f.ticket, f.source.guard, query), "bot must actually belong to group");
     f.source.members.assign(41, 11);
     auto const before = f.source.resolves;
-    Check(!f.adapter.CaptureQuery(f.ticket, f.source.guard, query) && f.source.resolves == before,
+    Check(!f.adapter.Units(f.ticket, f.source.guard, query) && f.source.resolves == before,
           "oversize roster refused before object resolution");
     f.source.members = {11, 22};
     f.source.objects[22].name.assign(129, 'x');
-    Check(!f.adapter.CaptureQuery(f.ticket, f.source.guard, query), "oversize observable name rejected");
+    Check(!f.adapter.Units(f.ticket, f.source.guard, query), "oversize observable name rejected");
     f.source.objects[22].name = std::string("x\0y", 3);
-    Check(!f.adapter.CaptureQuery(f.ticket, f.source.guard, query), "NUL observable name rejected");
+    Check(!f.adapter.Units(f.ticket, f.source.guard, query), "NUL observable name rejected");
     f.source.objects[22].name = "name";
     f.source.objects[22].health = 101;
-    Check(!f.adapter.CaptureQuery(f.ticket, f.source.guard, query), "invalid health rejected");
+    Check(!f.adapter.Units(f.ticket, f.source.guard, query), "invalid health rejected");
     f.source.guard.groupGuid = 0;
-    Check(!f.adapter.CaptureQuery(f.ticket, f.source.guard, query), "no group cannot invent group observations");
+    Check(!f.adapter.Units(f.ticket, f.source.guard, query), "no group cannot invent group observations");
 }
 
 }  // namespace
@@ -327,12 +341,12 @@ void TopicPublication()
                      {"botGuid", "11"}, {"query", "bot_state"},     {"topic", topic}};
         if (!place.empty())
             wire["place"] = place;  // WT18b: route names its place.
-        uint64_t receipt = 0;
+        auto const receipt = std::make_shared<ChannelAnswer>();
         Check(channel.Receive(f.ticket.request.requestId, wire.dump(), receipt) == ChannelError::None,
               "topic query received");
         channel.Update();
         std::unique_ptr<ChannelPacket> packet;
-        channel.Take(receipt, packet);
+        receipt->Wait(std::chrono::steady_clock::now(), packet);
         return packet;
     };
     f.source.topicEntries = {{"Hearthstone", "", 1800, 0}, {"Ready", "", 0, 0}};
@@ -368,7 +382,8 @@ void TopicPublication()
           "a route without its place is invalid_input without a read");
     f.source.authority = false;
     packet = ask("topic-4", "quests");
-    Check(!packet && f.source.topicReads == 3, "a stale route reads nothing and publishes nothing");
+    Check(packet && packet->error == ChannelError::Stale && packet->body.empty() && f.source.topicReads == 3,
+          "a stale route reads nothing and is answered stale");
 }
 
 // LC3: a catalogue query on the real channel answers the installed index on the world update and reads no unit;
@@ -385,12 +400,12 @@ void CataloguePublication()
         Json wire = {{"version", 1},    {"instance", "fixture"},    {"provider", "codex"}, {"epoch", "epoch-1"},
                      {"requestId", id}, {"deadlineUnixMs", 104000}, {"type", "query"},     {"controllerGuid", "22"},
                      {"botGuid", "11"}, {"query", "catalogue"}};
-        uint64_t receipt = 0;
+        auto const receipt = std::make_shared<ChannelAnswer>();
         Check(channel.Receive(f.ticket.request.requestId, wire.dump(), receipt) == ChannelError::None,
               "catalogue query received");
         channel.Update();
         std::unique_ptr<ChannelPacket> packet;
-        channel.Take(receipt, packet);
+        receipt->Wait(std::chrono::steady_clock::now(), packet);
         return packet;
     };
     auto packet = ask("catalogue-1");
@@ -406,7 +421,8 @@ void CataloguePublication()
     Check(InstallTestAbilities(), "the double installs again");
     f.source.authority = false;
     packet = ask("catalogue-3");
-    Check(!packet && f.source.topicReads == 0, "a stale route publishes no catalogue");
+    Check(packet && packet->error == ChannelError::Stale && packet->body.empty() && f.source.topicReads == 0,
+          "a stale route publishes no catalogue and is answered stale");
 }
 
 // J6e-c (DS.14 (c)): a watch on a real generation route: admitted on the world thread with the phase, from the
@@ -447,12 +463,12 @@ void WatchArming()
                      {"botGuid", "11"},
                      {"condition", condition},
                      {"untilUnixMs", f.now.unixMs + 60000}};
-        uint64_t receipt = 0;
+        auto const receipt = std::make_shared<ChannelAnswer>();
         if (channel.Receive(ticket.request.requestId, wire.dump(), receipt) != ChannelError::None)
             return Json();
         channel.Update(with);
         std::unique_ptr<ChannelPacket> packet;
-        channel.Take(receipt, packet);
+        receipt->Wait(std::chrono::steady_clock::now(), packet);
         return packet && packet->error == ChannelError::None ? Json::parse(packet->body) : Json();
     };
     auto ticket = open(0);

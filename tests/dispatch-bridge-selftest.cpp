@@ -460,11 +460,17 @@ void Reset()
     Check(OllamaBridge::DispatchSlot::Used() == 0, "all physical slots disposed");
     config = {};
     config.bridge = {"fixture", "codex", "http://127.0.0.1:47800", "synthetic-game-link-bearer-only"};
-    g_bridgeWorld.Configured(true, config.bridge, "epoch-1");
+    // LCB6b: the channel runs whenever the bridge does, so the fixture opens it as OllamaDispatch_BridgeConfigured
+    // does. ChannelPolicy never rebinds its previous epoch, so every fixture selects its own.
+    static unsigned fixtures = 0;
+    std::string const epoch = "epoch-r" + std::to_string(++fixtures);
+    g_bridgeWorld.Configured(true, config.bridge, epoch);
     Check(g_bridgeWorld.ObserveDrain(true), "selected");
+    g_bridgeChannel.Configure(true);
+    Check(g_bridgeChannel.Activate(), "channel open");
     g_bridgeGeneration = g_bridgeWorld.Generation();
     gameGuard = {};
-    gameGuard.scope = {1, "fixture", "codex", "epoch-1", 11, 22, "conversation", "party", "visible", "c1", "m1"};
+    gameGuard.scope = {1, "fixture", "codex", epoch, 11, 22, "conversation", "party", "visible", "c1", "m1"};
     gameGuard.source = OllamaBridge::DispatchSource::Party;
     gameGuard.speakerGuid = 33;
     gameGuard.groupGuid = 99;
@@ -599,17 +605,21 @@ void AdmissionTests()
 
 void CapacityTests()
 {
+    // LC.38: no fixed count of reservations or slots; the generation queue's depth is the bound, and a full queue
+    // stages its bounded terminal (the outage line) as before.
     Reset();
-    for (unsigned i = 0; i < OllamaBridge::MaxWorldPending; ++i)
-        Check(Submit(), "physical slot admitted");
+    g_MaxQueueDepth = 200;
+    for (unsigned i = 0; i < 200; ++i)
+        Check(Submit(), "LC.38: 200 generations admitted, no slot cap");
+    Check(g_queue.size() == 200 && g_done.empty() && OllamaBridge::DispatchSlot::Used() == 200,
+          "every queued task holds its physical slot");
     auto now = OllamaBridge::Now();
     now.unixMs += 1001;
     now.steadyMs += 1001;
     g_bridgeWorld.Expire(now);
-    Check(!g_bridgeWorld.Pending() && OllamaBridge::DispatchSlot::Used() == 64, "expiry retains physical queue slots");
-    Check(!Submit() && g_done.empty(), "full physical capacity cannot stage fallback");
+    Check(!g_bridgeWorld.Pending() && OllamaBridge::DispatchSlot::Used() == 200, "expiry retains physical queue slots");
     g_queue.pop_front();
-    Check(OllamaBridge::DispatchSlot::Used() == 63 && Submit(), "actual disposal releases exactly one slot");
+    Check(OllamaBridge::DispatchSlot::Used() == 199, "actual disposal releases exactly one slot");
     g_queue.clear();
     Check(!OllamaBridge::DispatchSlot::Used(), "queue disposal frees slots");
     Reset();
@@ -628,19 +638,17 @@ void CapacityTests()
 void PublicationTest()
 {
     Reset();
-    for (unsigned i = 0; i < OllamaBridge::MaxWorldPending; ++i)
-        Check(Submit(), "fill physical slots before publication");
+    Check(Submit() && Submit(), "two generations queued");
     Task task = std::move(g_queue.front());
     g_queue.pop_front();
     RunBridgeTask(task);
-    Check(OllamaBridge::DispatchSlot::Used() == 64 && g_done.size() == 1, "publication keeps capacity owned");
+    Check(OllamaBridge::DispatchSlot::Used() == 2 && g_done.size() == 1, "publication keeps its slot owned");
     Check(!task.bridgeSlot && !task.request.bridgeGeneration && task.request.bridgeSettings.bridge.token.empty() &&
               task.request.bridgeTicket.request.input.text.empty() && task.request.bridgeGuard.audience.empty(),
           "published completion leaves no worker request payload");
-    Check(!Submit(), "completion still occupies final physical slot");
     g_bridgeWorld.Cancel(g_done.front().request.bridgeTicket);
     g_done.clear();
-    Check(OllamaBridge::DispatchSlot::Used() == 63 && Submit(), "completion disposal admits exactly one replacement");
+    Check(OllamaBridge::DispatchSlot::Used() == 1, "completion disposal releases exactly its slot");
     Check(!task.request.bridgeGeneration && task.request.bridgeTicket.request.input.text.empty(),
           "old worker remains alive but empty after replacement admission");
 }
@@ -843,7 +851,7 @@ void SendAct(OllamaBridge::WorldTicket const& ticket, OllamaBridge::EffectResult
         {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
         {"botGuid", std::to_string(ticket.scope.botGuid)},
         {"steps", nlohmann::json::array({{{"act", "follow"}, {"params", nlohmann::json::object()}}})}};
-    uint64_t receipt = 0;
+    auto const receipt = std::make_shared<OllamaBridge::ChannelAnswer>();
     auto const before = g_bridgeChannel.Commands();
     Check(g_bridgeChannel.Receive(ticket.request.requestId, act.dump(), receipt) == OllamaBridge::ChannelError::None,
           "DS.14: the act was received on the generation route");
@@ -853,7 +861,7 @@ void SendAct(OllamaBridge::WorldTicket const& ticket, OllamaBridge::EffectResult
     char const* const outcome = result == OllamaBridge::EffectResult::Applied  ? "applied"
                                 : result == OllamaBridge::EffectResult::Failed ? "failed"
                                                                                : "rejected";
-    Check(g_bridgeChannel.Take(receipt, packet) == OllamaBridge::ChannelError::None && packet &&
+    Check(receipt->Wait(std::chrono::steady_clock::now(), packet) && packet &&
               packet->error == OllamaBridge::ChannelError::None &&
               nlohmann::json::parse(packet->body).at("outcome") == outcome,
           "DS.14: the bridge sees the act's outcome");
@@ -863,7 +871,6 @@ void SendAct(OllamaBridge::WorldTicket const& ticket, OllamaBridge::EffectResult
 // The channel binds an epoch once (ChannelPolicy never reuses one); Reset keeps the same selected identity.
 void OpenChannel()
 {
-    g_channelEnabled = true;
     if (!g_bridgeChannel.Activate())
         g_bridgeChannel.Configure(true);
     Check(g_bridgeChannel.Activate(), "DS.14: game link channel open");
@@ -956,7 +963,6 @@ void SilentTests()
               g_bridgeBindings[0].memory == "Earlier the same speaker said: Come here.\nYou answered without words.",
           "DS.14: the memory records a wordless answer");
     done = {};
-    g_channelEnabled = false;
     g_bridgeChannel.Configure(false);
     Reset();
 }
@@ -1219,6 +1225,8 @@ void AdapterTests()
             g_bridgeWorld.Configured(true, config.bridge, "new-epoch");
             Check(g_bridgeWorld.ObserveDrain(true), "reload selected");
             g_bridgeGeneration = g_bridgeWorld.Generation();
+            g_bridgeChannel.Configure(true);  // LCB6b: a reload reopens the channel on the new epoch, as production.
+            Check(g_bridgeChannel.Activate(), "reload channel open");
         }
         g_bridgeBindings[0].heartbeat.steadyMs = 1;  // LCB3c: the next capture is due.
         OllamaChat_BridgeRefresh();
@@ -1238,14 +1246,13 @@ void AdapterTests()
           "oversized combined exchange retains bounded human statement only");
     done = {};
     AdapterFixture();
-    for (unsigned i = 1; i <= MaxWorldScopes; ++i)
+    g_MaxQueueDepth = 0;  // Unbounded here: the bindings are under test, not the queue.
+    for (unsigned i = 1; i < std::size(players); ++i)
         Check(BridgeSubmit(&players[0], &players[i], SRC_WHISPER_LOCAL, "Question", true, "scope"),
-              "bounded distinct conversation admitted");
+              "LC.38: every distinct conversation admitted, no fixed count");
     g_queue.clear();
-    Check(!DispatchSlot::Used() && g_bridgeBindings.size() == MaxWorldScopes,
-          "bindings bounded independently of slots");
-    Check(!BridgeSubmit(&players[0], &players[65], SRC_WHISPER_LOCAL, "Question", true, "scope"),
-          "sixty-fifth binding refused even with free worker capacity");
+    Check(!DispatchSlot::Used() && g_bridgeBindings.size() == std::size(players) - 1,
+          "LC.38: 69 bindings, more than the old 64, held independently of slots");
     for (auto& binding : g_bridgeBindings)
         binding.idleUntil.steadyMs = 1;
     OllamaChat_BridgeRefresh();
@@ -1379,12 +1386,12 @@ nlohmann::json WakeAct(OllamaBridge::WorldTicket const& ticket, std::string cons
         {"issuerGuid", std::to_string(ticket.scope.controllerGuid)},
         {"botGuid", std::to_string(ticket.scope.botGuid)},
         {"steps", nlohmann::json::array({{{"act", "follow"}, {"params", nlohmann::json::object()}}})}};
-    uint64_t receipt = 0;
+    auto const receipt = std::make_shared<OllamaBridge::ChannelAnswer>();
     Check(g_bridgeChannel.Receive(ticket.request.requestId, act.dump(), receipt) == OllamaBridge::ChannelError::None,
           "wake: the act was received on the wake route");
     OllamaBotRandomChatter::Tick();  // One world tick takes the act.
     std::unique_ptr<OllamaBridge::ChannelPacket> packet;
-    Check(g_bridgeChannel.Take(receipt, packet) == OllamaBridge::ChannelError::None && packet &&
+    Check(receipt->Wait(std::chrono::steady_clock::now(), packet) && packet &&
               packet->error == OllamaBridge::ChannelError::None,
           "wake: the act's result is published");
     executorResult = OllamaBridge::EffectResult::Rejected;

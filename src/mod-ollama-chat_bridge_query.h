@@ -20,7 +20,6 @@ class QueryWorldSource
 {
 public:
     virtual ~QueryWorldSource() = default;
-    virtual bool Observe(WorldTicket const& ticket, DispatchGuard& guard) = 0;
     virtual bool GroupMembers(WorldTicket const& ticket, uint64_t groupGuid, std::vector<uint64_t>& members) = 0;
     virtual bool ResolveVisible(WorldTicket const& ticket, uint64_t guid, VisibleUnit& unit) = 0;
     // J5f-b: one bot_state topic of the ticket's own bot, raw (FinishTopic filters and bounds it); false when the
@@ -40,29 +39,16 @@ public:
     }
 };
 
-// These are owned observations, NOT authority. A publisher must call Current immediately before exposing
-// any serialized payload, and must separately validate its game-reserved route and selected channel epoch.
-struct QueryObservation
-{
-    WorldTicket ticket;
-    DispatchGuard guard;
-    Deadline until;
-    std::vector<Participant> units;
-};
-
+// The observable_group read: the ticket's group members the bot can perceive, with UI health only. LCB6b: no
+// currentness check of its own; the channel checks the conversation once just before it (WorldChannel::Live).
 class FilteredQueryAdapter
 {
 public:
-    FilteredQueryAdapter(WorldPolicy& world, QueryWorldSource& source, ReadClock clock = Now);
-    bool CaptureQuery(WorldTicket const& ticket, DispatchGuard const& guard, QueryObservation& result);
-    bool Current(QueryObservation const& observation);
+    explicit FilteredQueryAdapter(QueryWorldSource& source) : _source(source) {}
+    bool Units(WorldTicket const& ticket, DispatchGuard const& guard, std::vector<Participant>& result);
 
 private:
-    bool Fresh(WorldTicket const& ticket, DispatchGuard const& guard);
-    bool Units(WorldTicket const& ticket, DispatchGuard const& guard, std::vector<Participant>& result);
-    WorldPolicy& _world;
     QueryWorldSource& _source;
-    ReadClock const _clock;
 };
 
 // J5g: OllamaChat.DisableRepliesInCombat spares a local model in combat. A bridge reply to a human's line is exempt

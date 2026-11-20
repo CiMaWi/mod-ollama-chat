@@ -8,11 +8,13 @@ listener, acknowledge game activation, read game objects, queue work, execute co
 The shared runtime installs bounded physical mailboxes and filtered query assembly.
 J6 owns execution; J9C/X owns live proof. The transport is J5d's `src/mod-ollama-chat_bridge_listener.{h,cpp}`: a
 127.0.0.1 HTTP listener (`OllamaChat.Bridge.ChannelPort`) that authenticates the link token before reading a body,
-bounds bytes and hands each envelope to `Receive`/`Take` (wire: HUB `bridge/game/README.md`). J11C/X owns the tools.
+bounds bytes and hands each envelope to `WorldChannel::Receive` with its own `ChannelAnswer`, on which the handler
+waits (wire: HUB `bridge/game/README.md`). J11C/X owns the tools. The channel runs whenever the Bridge settings are
+valid and the provider is the bridge; it has no switch of its own (LCB6b: `ChannelEnabled` is gone).
 
 The semantic source is HUB `bridge/game/README.md`, `boundary.js` and `examples.json` (frozen J2 v1).
 The listener's `BearerMatches` is the one check of the local game-link bearer, made before any body byte is read;
-`Receive`/`Take` take no bearer. A channel that is not bound (never bound, retired, or after a refused rebind)
+`Receive` takes no bearer. A channel that is not bound (never bound, retired, or after a refused rebind)
 answers `inactive` (503) before checking body size or parsing JSON. Subscription credentials never belong here.
 `src/mod-ollama-chat_bridge_json.h` is the one home of the wire checks the bridge files share: the strict parse,
 identifiers, received and sent text, the envelope and the bearer compare (LCB6a). The helper returns fixed `ChannelErrorName` strings, never payloads, tokens or
@@ -114,11 +116,11 @@ it cannot revive terminal/failed work. Only the previous binding's epoch is refu
 kept); this is not an RNG: the activation owner supplies 128-bit cryptographically fresh epochs on process restart.
 Do not destroy/recreate this helper under a still-active epoch to reset replay state.
 
-`ObserveScope` accepts trusted game captures only: exact identity, controller/bot, context/channel, perception,
-context/membership revisions. At most 64 scopes, live for 5000 ms after a trusted observation. Scope removal,
-revision change or lapse invalidates existing work permanently, even if an identical scope is registered later.
-`current` arguments are fresh world captures, never native JSON. J5b must also consult the actual world's observer/
-activation/currentness guards before acceptance and publication; this in-process state cannot discover a logout.
+The ledger keeps no scope table (LCB6b). `OpenGeneration` checks the trusted scope against the bound identity
+(instance, provider, epoch, guids); `Current` compares only the bot, the controller and the context fields. Whether a
+conversation is still current (its liveness, group and membership revisions, perception, a logout) has one owner,
+`WorldPolicy`, asked by `WorldChannel` once before each read or effect and once after the executor. `current`
+arguments are fresh world captures, never native JSON.
 
 Generations must be registered by the game. Inbound queries may create a new request reservation only under a live
 generation route, against an already registered current scope and matching controller/bot. Queries share the
@@ -127,8 +129,8 @@ controller/bot/deadline. The route ends by the game (`Close`/`Cancel`) or at its
 `generation.result` or `failure` (like any other type) is `invalid_input` and closes nothing (LCB6a). A
 command's result is terminal once and is reported only while its route is open: `WorldChannel` finishes every
 command in the tick that received it, and the route's terminal drops its ids (LC.35). `Current(...,
-requireOpen=true)` rejects closed requests. Duplicate/stale/malformed input yields no output message; output bodies
-clear before refused operations.
+requireOpen=true)` rejects closed requests. The ledger itself returns only its error word for duplicate, stale or
+malformed input and clears output bodies before refused operations; `WorldChannel` answers that word to the caller.
 
 The ledger holds live routes only (LC.35). A generation route keeps its own id and the query and command ids opened
 under it, at most 64 of those per route, until its terminal (the game's Close or failure), its
@@ -141,16 +143,16 @@ received it. What the ledger no longer refuses is a new message on another live 
 query or command id: it is a new request of that route (the hub bridge derives every id from its route's request
 id, so it never does this). Generation ids come from the world policy's counter and are never reissued in a
 process, and `WorldChannel::Register` refuses a ticket whose route is still bound; nothing else may open a route a
-second time, because a reopened route would not remember the command ids it consumed. Logical pending requests are
-limited to 64; limits can only be reduced in the constructor. Retiring clears maps because the old epoch is
+second time, because a reopened route would not remember the command ids it consumed. Pending requests are counted, not capped
+(LC.38); the per-route 64 ids are the ledger's only count limit and can only be reduced in the constructor. Retiring clears maps because the old epoch is
 unusable. These limits DO NOT account physical receive/worker/completion payload slots:
 J5b must hold a bounded slot until actual disposal, independently of logical terminal/cancel/expiry and worker drain.
 Reservation expiry/invalidations run on explicit work/scope operations; do not install an all-reservations scan
 on every game tick. The helper has no autonomous timer or background thread.
 
 Offline proof compiles this exact production cpp with `tests/bridge-channel-selftest.cpp`. It covers authentication,
-strict decode, epoch retirement/reconnect, exact expiry/rollback, removed/revised/lapsed scope, terminal/replay state,
-typed command staging, bounded query shapes, route drop and capacity fail-closed. It is no full module/world/native
+strict decode, epoch retirement/reconnect, exact expiry/rollback, changed bot/controller/context, terminal/replay
+state, typed command staging, bounded query shapes, route drop and 200 open routes without a cap. It is no full module/world/native
 proof.
 
 
@@ -165,17 +167,23 @@ Only guid/name and observed UI health are emitted; role and visibleTargetGuid st
 reviewed observable provenance source exists. Missing/hidden group units are omitted. Malformed or more than 40
 roster entries fail closed; a non-group scope returns unavailable, not invented party members.
 
-`QueryObservation` contains owned values and a captured 5-second wall/monotonic deadline.
-They confer no authority. `Current` resolves the world and observations again, compares the current values and
-rejects equality expiry, authority/group/perception/revision changes and removed units. Call it
-immediately before publication; never queue the source, a game pointer, or a world-reading closure to a worker.
-The runtime source uses real Player/Group reads and wires the query branch of `WorldChannel::Update` to these
-observations. It revalidates provenance after serialization and immediately before inserting the packet into the
-completion map. Observer callbacks stay synchronous and bounded on the world thread; publication does not rely
-on later receipt retraction.
+`FilteredQueryAdapter::Units` reads the units in the same world tick, right after the channel's one currentness
+check (LCB6b); it checks nothing again, so a query packet costs one `WorldPolicy::Current` call (`Checks()` counts
+them). Never queue the source, a game pointer, or a world-reading closure to a worker. Observer callbacks stay
+synchronous and bounded on the world thread.
 
-Inbound queries and commands share 64 physical packet slots and dequeue remains 8 per tick. Healthy heartbeat
-refresh remains bounded by 64 scopes and must not scan the replay ledger.
+## The transport (LCB6b)
+
+Every packet is answered; none is left to time out. `Receive` answers at once `inactive` (no bound epoch),
+`too_large`, `closed` (the route is not open) or `overload` (429: all 64 packet slots taken, one waiting listener
+thread each). A queued packet is answered by `Update` (8 per tick) with its result or its word: `closed` when the
+route closed before or during its turn (`Close` answers the route's queued packets at once), `stale` when it is
+older than 5 s, its binding lapsed, or the world check before the read or effect or after the executor fails, the
+ledger's word for a refused envelope. `Retire` answers every queued packet `inactive`; stopping the listener answers
+every waiting handler `inactive`. The handler waits on its answer's signal (capped at 5 s), not on a poll. A command
+outcome that is not published counts as `withheld`. The listener logs a warning at the 1st, 2nd, 4th, ... overload.
+The channel accepts only query, command and watch. Its tables (world scopes, bindings, watches, command intervals)
+hold one entry per bot in talk and have no fixed count (LC.38).
 
 The standalone `tests/bridge-query-selftest.cpp` links the actual helper, world policy, channel policy and physical
 mailbox with controlled current world objects. It checks visibility/missing units, omitted provenance, real query

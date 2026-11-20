@@ -355,17 +355,18 @@ struct Fixture
                     {"query", "observable_group"}}
             .dump();
     }
-    uint64_t Receive()
+    // LCB6b: the answer a listener thread waits on.
+    std::shared_ptr<ChannelAnswer> Receive()
     {
-        uint64_t receipt = 0;
+        auto receipt = std::make_shared<ChannelAnswer>();
         Check(OllamaDispatch_ChannelReceive(ticket.request.requestId, Query(), receipt) == ChannelError::None,
               "actual dispatcher receive");
         return receipt;
     }
-    std::unique_ptr<ChannelPacket> Take(uint64_t receipt)
+    static std::unique_ptr<ChannelPacket> Take(std::shared_ptr<ChannelAnswer> const& receipt)
     {
         std::unique_ptr<ChannelPacket> packet;
-        Check(OllamaDispatch_ChannelTake(receipt, packet) == ChannelError::None && packet, "actual dispatcher take");
+        Check(receipt->Wait(std::chrono::steady_clock::now(), packet) && packet, "actual dispatcher answer");
         return packet;
     }
 };
@@ -376,7 +377,10 @@ void Queries()
         Fixture f;
         players[2].visible = false;
         auto receipt = f.Receive();
+        uint64_t const checked = g_bridgeWorld.Checks();
         Check(g_bridgeChannel.Update() == 1, "dequeue actual query");
+        Check(g_bridgeWorld.Checks() - checked == 1,
+              "LCB6b: one WorldPolicy check for an observable_group packet through the production adapter");
         auto packet = f.Take(receipt);
         auto value = Json::parse(packet->body);
         Check(value["type"] == "query.result" && value["units"].size() == 2, "production visible query result");
@@ -388,51 +392,33 @@ void Queries()
         packet.reset();
         Check(g_bridgeChannel.Drained(), "payload disposal releases slot");
     }
-    for (unsigned change = 0; change < 8; ++change)
+    // LCB6b: the read follows the one check at once on the world thread, so a change before the tick is what the
+    // read sees (the unit filtered, or its fresh name), and a partner lost before it answers the packet stale.
+    for (unsigned change = 0; change < 4; ++change)
     {
         Fixture f;
         auto receipt = f.Receive();
-        // CaptureQuery resolves three initial units and three validation units; after FinishQuery serialization,
-        // Current lists the group again and resolves its units (lookups 7 to 9) before mailbox publication. A unit's
-        // change lands at lookup 7, before its own resolve; the membership change at lookup 6, the last read before
-        // serialization, since the recheck lists the members before its first lookup.
-        onResolve = [change](unsigned count)
+        if (change == 0)
+            players[2].visible = false;
+        if (change == 1)
+            players[2].group = nullptr;
+        if (change == 2)
+            players[2].name = "Changed";
+        if (change == 3)
+            players[1].online = false;
+        Check(g_bridgeChannel.Update() == 1, "dequeue actual query");
+        auto packet = f.Take(receipt);
+        if (change == 3)
+            Check(packet->error == ChannelError::Stale && packet->body.empty(), "a partner lost before the read");
+        else
         {
-            if (count != (change == 7 ? 6u : 7u))
-                return;
-            switch (change)
-            {
-                case 0:
-                    players[2].visible = false;
-                    break;
-                case 1:
-                    players[2].online = false;
-                    break;
-                case 2:
-                    players[2].health = 20;
-                    break;
-                case 3:
-                    players[2].name = "Changed";
-                    break;
-                case 4:
-                    players[2].map = 2;
-                    break;
-                case 5:
-                    players[2].phase = 2;
-                    break;
-                case 6:
-                    players[2].group = nullptr;
-                    break;
-                case 7:
-                    party.members.pop_back();
-                    break;
-            }
-        };
-        Check(g_bridgeChannel.Update() == 1 && resolutions >= 7, "reach post-serialization world validation");
-        std::unique_ptr<ChannelPacket> packet;
-        Check(OllamaDispatch_ChannelTake(receipt, packet) == ChannelError::Unknown && !packet &&
-                  g_bridgeChannel.Drained(),
-              "stale serialized query never becomes consumable");
+            auto const units = Json::parse(packet->body)["units"];
+            Check(change == 2 ? units.size() == 3 && packet->body.find("Changed") != std::string::npos
+                              : units.size() == 2,
+                  "a change before the tick is what the read sees");
+        }
+        packet.reset();
+        Check(g_bridgeChannel.Drained(), "every answered query releases its slot");
     }
     for (unsigned change = 0; change < 5; ++change)
     {
@@ -492,7 +478,7 @@ void Lifetimes()
             g_bridgeWorld, OllamaChat_BridgeObserve, [] { return clockNow; }, &OllamaChat_BridgeQuerySource());
         channel.Configure(true);
         Check(channel.Activate() && channel.Register(f.ticket, f.guard), "controlled-clock production channel");
-        uint64_t receipt = 0;
+        auto const receipt = std::make_shared<ChannelAnswer>();
         Check(channel.Receive(f.ticket.request.requestId, f.Query(), receipt) == ChannelError::None,
               "capture bounded query packet age");
         if (clock == 0)
@@ -504,26 +490,31 @@ void Lifetimes()
                 clockNow.unixMs -= 10000;
         }
         Check(g_bridgeWorld.ObserveScope(f.guard.scope, clockNow), "heartbeat cannot renew packet age");
-        Check(channel.Update() == 1 && channel.Drained(), "either clock expires at equality, including rollback");
-        std::unique_ptr<ChannelPacket> packet;
-        Check(channel.Take(receipt, packet) == ChannelError::Unknown && !packet,
-              "expired query never enters publication map");
+        Check(channel.Update() == 1, "either clock expires at equality, including rollback");
+        Check(Fixture::Take(receipt)->error == ChannelError::Stale, "LCB6b: an expired query is answered stale");
+        Check(channel.Drained(), "expired query never enters publication map");
     }
     {
         Fixture f;
+        std::vector<std::shared_ptr<ChannelAnswer>> answers;
         for (unsigned i = 0; i < 12; ++i)
         {
-            uint64_t receipt = 0;
+            answers.push_back(std::make_shared<ChannelAnswer>());
             Check(OllamaDispatch_ChannelReceive(f.ticket.request.requestId, f.Query("query-" + std::to_string(i)),
-                                                receipt) == ChannelError::None,
+                                                answers.back()) == ChannelError::None,
                   "admit bounded receive batch");
         }
         Check(g_bridgeChannel.Update() == WorldChannel::TickBudget, "eight dequeues per world tick");
         Check(g_bridgeChannel.Used() == 12, "completions and remaining receives share physical slots");
         g_bridgeChannel.Retire();
+        unsigned inactive = 0;
+        for (auto const& answer : answers)
+            inactive += Fixture::Take(answer)->error == ChannelError::Inactive ? 1 : 0;
+        Check(inactive == 12 - WorldChannel::TickBudget, "LCB6b: a reload answers every queued packet inactive");
+        answers.clear();
         Check(g_bridgeChannel.Drained(), "reload disposes both receive and completion payloads");
         Check(!g_bridgeChannel.Activate(), "reconnect cannot reuse retired epoch");
-        uint64_t receipt = 0;
+        auto const receipt = std::make_shared<ChannelAnswer>();
         Check(OllamaDispatch_ChannelReceive(f.ticket.request.requestId, f.Query(), receipt) == ChannelError::Inactive,
               "a retired channel cannot admit old routes");
     }
@@ -533,9 +524,8 @@ void Lifetimes()
         g_bridgeWorld.Configured(true, settings, "replacement-epoch");
         Check(g_bridgeChannel.Update() == 0, "reload invalidates selection before world work");
         g_bridgeChannel.Retire();
-        std::unique_ptr<ChannelPacket> packet;
-        Check(OllamaDispatch_ChannelTake(receipt, packet) == ChannelError::Inactive && g_bridgeChannel.Drained(),
-              "reload failure disposes old queued payload");
+        Check(Fixture::Take(receipt)->error == ChannelError::Inactive, "LCB6b: a reload answers the queued packet");
+        Check(g_bridgeChannel.Drained(), "reload failure disposes old queued payload");
     }
 }
 }  // namespace
