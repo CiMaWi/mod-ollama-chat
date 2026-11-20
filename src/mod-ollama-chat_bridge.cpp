@@ -340,6 +340,7 @@ nlohmann::json StateJson(PlayerbotBridge::BotStateFacts const& state)
     {
         nlohmann::json target = nlohmann::json::object();
         PutFact(target, "name", state.victimName);
+        PutFact(target, "type", state.victimType);
         if (state.victimLevel)
             target["level"] = std::min<uint32_t>(state.victimLevel, 255);
         target["health"] = StatePercent(state.victimHealthPct);

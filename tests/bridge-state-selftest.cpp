@@ -81,6 +81,7 @@ PlayerbotBridge::BotStateFacts FullState()
     state.victimVisible = true;
     state.victimName = "Defias Pillager";
     state.victimLevel = 41;
+    state.victimType = "humanoid";
     state.victimHealthPct = 35.0f;
     state.travelling = true;
     state.questTitle = "The Defias Brotherhood";
@@ -133,7 +134,7 @@ void StateChecks()
     Check(StateWire(std::nullopt).is_null(), "state: absent unless read");
 
     Check(StateWire(FullState()) == nlohmann::json::parse(R"({"health":73,"power":{"kind":"mana","pct":50},"level":42,
-        "alive":"alive","combat":{"target":{"name":"Defias Pillager","level":41,"health":35}},
+        "alive":"alive","combat":{"target":{"name":"Defias Pillager","type":"humanoid","level":41,"health":35}},
         "activity":{"kind":"fighting"},"where":{"zone":"Westfall","area":"Moonbrook","mapId":0,"x":-11018,"y":1514,
         "z":43},"partner":{"zone":"Westfall","yards":19,"x":-11001,"y":1520,"z":44},"mounted":true,"swimming":true,
         "group":{"size":2,"leads":false,"follows":"Aldric"},"movement":"follow",
@@ -175,6 +176,9 @@ void StateChecks()
     state.victimLevel = 0;
     wire = StateWire(state);
     Check(!wire.contains("level") && !wire["combat"]["target"].contains("level"), "state: an unknown level is omitted");
+    state = FullState();
+    state.victimType = "";
+    Check(!StateWire(state)["combat"]["target"].contains("type"), "state: a target without a type word omits the key");
     state = FullState();
     state.victimName = std::string(63, 'a') + "\xC3\xA9" + std::string(10, 'b');
     state.zone = std::string(70, 'z');
